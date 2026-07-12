@@ -534,6 +534,7 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
     seen_totals: set[tuple[str, int, int, int, int]] = set()
     for path in iter_recent_jsonl(root, start):
         last_total = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        current_model = CODEX_DEFAULT_MODEL
         seen: set[tuple[int, int, int, int]] = set()
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -556,9 +557,15 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("type") != "event_msg":
-                continue
+            row_type = row.get("type")
             payload = row.get("payload") or {}
+            if row_type == "turn_context":
+                context_model = str(row.get("model") or payload.get("model") or "").strip()
+                if context_model:
+                    current_model = codex_model_name(context_model)
+                continue
+            if row_type != "event_msg":
+                continue
             if payload.get("type") != "token_count":
                 continue
             info = payload.get("info") or {}
@@ -583,7 +590,8 @@ def scan_codex_events(root: Path, start: datetime, end: datetime) -> list[UsageE
                 continue
             if ts >= end:
                 continue
-            model = codex_model_name(str(row.get("model") or payload.get("model") or "codex"))
+            explicit_model = str(row.get("model") or payload.get("model") or "").strip()
+            model = codex_model_name(explicit_model) if explicit_model else current_model
             total_key = (
                 model,
                 current["input_tokens"],
