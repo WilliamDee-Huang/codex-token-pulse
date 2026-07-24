@@ -2448,6 +2448,22 @@ def _live_token_usage(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _live_request_boundary_at(row: dict[str, Any]) -> datetime | None:
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    row_type = str(row.get("type") or "")
+    payload_type = str(payload.get("type") or "")
+    is_boundary = (
+        row_type == "event_msg" and payload_type == "task_started"
+    ) or (
+        row_type == "response_item" and payload_type.endswith("_call_output")
+    )
+    if not is_boundary:
+        return None
+    return _parse_time(str(row.get("timestamp") or ""))
+
+
 def _cockpit_account_label(account_id: Any, email: Any, api_key_label: Any) -> str:
     identity = str(email or "").strip() or str(api_key_label or "").strip() or str(account_id or "").strip()
     return f"Codex local - {identity}" if identity else ""
@@ -2587,6 +2603,15 @@ def _parse_live_cockpit_route_event(line: str) -> dict[str, Any] | None:
             "model": "",
             "source": "request-started",
         }
+    if event_type in {"request_completed", "request_failed", "request_cancelled"}:
+        return {
+            "when": when,
+            "request_id": request_id,
+            "kind": "completed",
+            "account_id": "",
+            "model": str(payload.get("model") or "").strip(),
+            "source": event_type.replace("_", "-"),
+        }
     if event_type != "auth_result":
         return None
     account_id = _normalize_live_cockpit_account_id(
@@ -2666,7 +2691,7 @@ def _load_live_cockpit_route_events(
 
 
 def _match_live_cockpit_route_hints(
-    turn_started_at: list[datetime | None],
+    request_boundary_at: list[datetime | None],
     events: list[dict[str, Any]],
 ) -> dict[int, dict[str, Any]]:
     events_by_request: dict[str, list[dict[str, Any]]] = {}
@@ -2679,14 +2704,14 @@ def _match_live_cockpit_route_hints(
     assigned_requests: dict[int, list[tuple[str, datetime]]] = {}
     for request_id, request_events in events_by_request.items():
         candidates: list[tuple[float, int, datetime]] = []
-        for index, started_at in enumerate(turn_started_at):
-            if started_at is None:
+        for index, boundary_at in enumerate(request_boundary_at):
+            if boundary_at is None:
                 continue
             nearest = min(
                 request_events,
-                key=lambda event: abs((event["when"] - started_at).total_seconds()),
+                key=lambda event: abs((event["when"] - boundary_at).total_seconds()),
             )
-            delta = abs((nearest["when"] - started_at).total_seconds())
+            delta = abs((nearest["when"] - boundary_at).total_seconds())
             if delta <= LIVE_ROUTE_HINT_MATCH_SECONDS:
                 candidates.append((delta, index, nearest["when"]))
         candidates.sort(key=lambda item: item[0])
@@ -2697,20 +2722,29 @@ def _match_live_cockpit_route_hints(
             and candidates[1][0] - candidates[0][0]
             < LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS
         ):
+            for _delta, index, anchor_at in candidates:
+                assigned_requests.setdefault(index, []).append(("", anchor_at))
             continue
         _delta, turn_index, anchor_at = candidates[0]
         assigned_requests.setdefault(turn_index, []).append((request_id, anchor_at))
 
     hints: dict[int, dict[str, Any]] = {}
     for turn_index, assigned in assigned_requests.items():
-        started_at = turn_started_at[turn_index]
-        if started_at is None:
+        boundary_at = request_boundary_at[turn_index]
+        if boundary_at is None:
+            continue
+        if any(not request_id for request_id, _anchor_at in assigned):
+            hints[turn_index] = {
+                "label": "",
+                "source": "active_route_ambiguous",
+                "resolved": True,
+            }
             continue
         request_states: list[dict[str, Any]] = []
         for request_id, anchor_at in assigned:
             current: dict[str, Any] | None = None
             for event in events_by_request.get(request_id, []):
-                if event["when"] < started_at - timedelta(seconds=LIVE_ROUTE_HINT_MATCH_SECONDS):
+                if event["when"] < boundary_at - timedelta(seconds=LIVE_ROUTE_HINT_MATCH_SECONDS):
                     continue
                 if event["kind"] == "route":
                     if event.get("label"):
@@ -2721,6 +2755,8 @@ def _match_live_cockpit_route_hints(
                     or event.get("account_id") == current.get("account_id")
                 ):
                     current = None
+                elif event["kind"] == "completed":
+                    current = None
             if current is not None:
                 state = dict(current)
                 state["anchor_at"] = anchor_at
@@ -2728,6 +2764,15 @@ def _match_live_cockpit_route_hints(
         labels = {str(state.get("label") or "") for state in request_states}
         labels.discard("")
         if len(labels) != 1:
+            hints[turn_index] = {
+                "label": "",
+                "source": (
+                    "active_route_ended"
+                    if not labels
+                    else "active_route_ambiguous"
+                ),
+                "resolved": True,
+            }
             continue
         label = labels.pop()
         selected = max(
@@ -2741,6 +2786,7 @@ def _match_live_cockpit_route_hints(
             "account_id": str(selected.get("account_id") or ""),
             "when": selected.get("when"),
             "source": "active_route_hint",
+            "resolved": True,
         }
     return hints
 
@@ -3062,11 +3108,13 @@ def scan_live_codex_active_sessions(
             lifecycle_state = str(tail_state.get("lifecycle_state") or "")
             lifecycle_at = str(tail_state.get("lifecycle_at") or "")
             started_at = str(tail_state.get("started_at") or "")
+            request_boundary_at = str(tail_state.get("request_boundary_at") or "")
             latest_usage = tail_state.get("latest_usage")
         else:
             lifecycle_state = ""
             lifecycle_at = ""
             started_at = ""
+            request_boundary_at = ""
             latest_usage: dict[str, Any] | None = None
             for line in reversed(_read_jsonl_tail(path)):
                 try:
@@ -3075,7 +3123,11 @@ def scan_live_codex_active_sessions(
                     continue
                 if latest_usage is None:
                     latest_usage = _live_token_usage(row)
-                if lifecycle_state and latest_usage is not None:
+                if not request_boundary_at:
+                    boundary = _live_request_boundary_at(row)
+                    if boundary is not None:
+                        request_boundary_at = boundary.isoformat()
+                if lifecycle_state and latest_usage is not None and request_boundary_at:
                     break
                 if row.get("type") != "event_msg":
                     continue
@@ -3096,6 +3148,7 @@ def scan_live_codex_active_sessions(
                         "lifecycle_state": lifecycle_state,
                         "lifecycle_at": lifecycle_at,
                         "started_at": started_at,
+                        "request_boundary_at": request_boundary_at,
                         "latest_usage": latest_usage,
                     },
                 )
@@ -3106,7 +3159,12 @@ def scan_live_codex_active_sessions(
         if lifecycle_state != "task_started" and not recently_written:
             continue
         started_dt = _parse_time(started_at)
-        if started_dt is not None and latest_usage is not None and latest_usage["when"] < started_dt:
+        request_boundary_dt = _parse_time(request_boundary_at) or started_dt
+        if (
+            request_boundary_dt is not None
+            and latest_usage is not None
+            and latest_usage["when"] < request_boundary_dt
+        ):
             latest_usage = None
         if latest_usage is not None:
             latest_usage = dict(latest_usage)
@@ -3128,6 +3186,8 @@ def scan_live_codex_active_sessions(
                 "lifecycle_at": lifecycle_at,
                 "started_at": started_at,
                 "started_dt": started_dt,
+                "request_boundary_at": request_boundary_at,
+                "request_boundary_dt": request_boundary_dt,
                 "latest_usage": latest_usage,
             }
         )
@@ -3138,7 +3198,7 @@ def scan_live_codex_active_sessions(
     )
     route_hints = (
         _match_live_cockpit_route_hints(
-            [row.get("started_dt") for row in parsed_rows],
+            [row.get("request_boundary_dt") for row in parsed_rows],
             _load_live_cockpit_route_events(
                 cockpit_db_path or COCKPIT_REQUEST_LOG_DB,
                 now_utc,
@@ -3160,6 +3220,7 @@ def scan_live_codex_active_sessions(
         matched_marker = live_matches.get(row_index)
         matched_label = str((matched_marker or {}).get("label") or "")
         route_hint = route_hints.get(row_index) or {}
+        route_hint_resolved = row_index in route_hints
         route_hint_label = str(route_hint.get("label") or "")
         cached_provider = _concrete_live_provider(cached.get("provider"))
         cached_turn_started = _parse_time(
@@ -3185,11 +3246,14 @@ def scan_live_codex_active_sessions(
             and started_dt is not None
             and cached_turn_started is not None
             and abs((started_dt - cached_turn_started).total_seconds()) <= 1
+            and not route_hint_resolved
         )
         if api_service_route:
-            provider = matched_label or (
-                cached_provider if same_turn_confirmed_provider else ""
-            ) or route_hint_label or (
+            provider = matched_label or route_hint_label or (
+                cached_provider
+                if same_turn_confirmed_provider and not route_hint_resolved
+                else ""
+            ) or (
                 cached_provider if same_turn_provisional_provider else ""
             )
         else:
@@ -3210,33 +3274,38 @@ def scan_live_codex_active_sessions(
                 "session_id": session_id,
                 "provider": provider,
                 "model": (
-                    cached.get("model")
-                    or (matched_marker or {}).get("model")
+                    (matched_marker or {}).get("model")
                     or route_hint.get("model")
+                    or cached.get("model")
                     or "-"
                 ),
                 "latest_at": latest_at,
                 "started_at": started_at or cached.get("started_at") or lifecycle_at,
                 "turn_started_at": started_at,
+                "request_boundary_at": str(parsed_row.get("request_boundary_at") or ""),
                 "active": True,
                 "activity_source": "live-session-tail",
                 "usage_event_id": str((current_latest_usage or {}).get("event_id") or ""),
                 "provider_confirmed": bool(
-                    matched_label or same_turn_confirmed_provider
+                    matched_label
+                    or (same_turn_confirmed_provider and not route_hint_resolved)
                 ),
                 "provider_provisional": bool(
-                    not (matched_label or same_turn_confirmed_provider)
+                    not (
+                        matched_label
+                        or (same_turn_confirmed_provider and not route_hint_resolved)
+                    )
                     and (route_hint_label or same_turn_provisional_provider)
                 ),
                 "provider_confirmation_source": (
                     "final_usage_marker"
                     if matched_label
                     else (
-                        "same_turn_final_anchor"
-                        if same_turn_confirmed_provider
+                        "active_route_hint"
+                        if route_hint_label
                         else (
-                            "active_route_hint"
-                            if route_hint_label
+                            "same_turn_final_anchor"
+                            if same_turn_confirmed_provider and not route_hint_resolved
                             else (
                                 "same_turn_route_hint"
                                 if same_turn_provisional_provider

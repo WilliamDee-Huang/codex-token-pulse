@@ -6126,7 +6126,140 @@ class LiveActiveSessionScanTests(unittest.TestCase):
             events,
         )
 
-        self.assertEqual(hints, {})
+        self.assertEqual(hints[0]["source"], "active_route_ambiguous")
+        self.assertEqual(hints[1]["source"], "active_route_ambiguous")
+        self.assertTrue(hints[0]["resolved"])
+        self.assertFalse(hints[0]["label"])
+
+    def test_live_route_hint_is_cleared_when_request_completes(self) -> None:
+        boundary_at = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
+        events = [
+            {
+                "when": boundary_at,
+                "request_id": "completed-request",
+                "kind": "started",
+                "account_id": "",
+                "label": "",
+                "model": "gpt-test",
+            },
+            {
+                "when": boundary_at + timedelta(milliseconds=100),
+                "request_id": "completed-request",
+                "kind": "route",
+                "account_id": "old-account",
+                "label": "Codex local - old@example.com",
+                "model": "gpt-test",
+            },
+            {
+                "when": boundary_at + timedelta(seconds=1),
+                "request_id": "completed-request",
+                "kind": "completed",
+                "account_id": "",
+                "label": "",
+                "model": "gpt-test",
+            },
+        ]
+
+        hints = monitor._match_live_cockpit_route_hints([boundary_at], events)
+
+        self.assertEqual(hints[0]["source"], "active_route_ended")
+        self.assertTrue(hints[0]["resolved"])
+        self.assertFalse(hints[0]["label"])
+
+    def test_api_service_long_turn_uses_route_after_latest_tool_output(self) -> None:
+        now = datetime.now(timezone.utc)
+        started_at = now - timedelta(minutes=10)
+        boundary_at = now - timedelta(seconds=2)
+        token_at = now - timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            self.write_live_rows(
+                sessions,
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "long-turn"},
+                    },
+                    {
+                        "timestamp": boundary_at.isoformat(),
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "call-1",
+                            "output": "done",
+                        },
+                    },
+                    {
+                        "timestamp": token_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 20_000,
+                                    "cached_input_tokens": 18_000,
+                                    "output_tokens": 700,
+                                    "total_tokens": 20_700,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+            (root / "codex_accounts.json").write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {"id": "old-account", "email": "old@example.com"},
+                            {"id": "new-account", "email": "new@example.com"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "codex-api.log.test").write_text(
+                (
+                    f'{(started_at + timedelta(milliseconds=100)).isoformat()} WARN '
+                    'msg="session-affinity: cache hit | session=test '
+                    'auth=old-account.json provider=mixed model=gpt-test" '
+                    'request_id=old-request\n'
+                    f'{(boundary_at + timedelta(milliseconds=100)).isoformat()} WARN '
+                    'msg="session-affinity: cache hit | session=test '
+                    'auth=new-account.json provider=mixed model=gpt-test" '
+                    'request_id=new-request\n'
+                ),
+                encoding="utf-8",
+            )
+            cached = [
+                {
+                    "session_id": self.SESSION_ID,
+                    "provider": "Codex local - old@example.com",
+                    "provider_confirmed": True,
+                    "turn_started_at": started_at.isoformat(),
+                }
+            ]
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    cached,
+                    now=now,
+                    cockpit_db_path=root / "requests.sqlite",
+                )
+
+        self.assertEqual(rows[0]["provider"], "Codex local - new@example.com")
+        self.assertEqual(rows[0]["provider_route_request_id"], "new-request")
+        self.assertEqual(rows[0]["request_boundary_at"], boundary_at.isoformat())
+        self.assertFalse(rows[0]["provider_confirmed"])
+        self.assertTrue(rows[0]["provider_provisional"])
 
     def test_api_service_session_keeps_confirmed_provider_within_same_turn(self) -> None:
         now = datetime.now(timezone.utc)
