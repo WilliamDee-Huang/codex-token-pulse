@@ -5,6 +5,7 @@ import atexit
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -14,9 +15,10 @@ from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from urllib import request
+from urllib import parse, request
 
 
 def env_float(name: str, default: float) -> float:
@@ -78,6 +80,82 @@ if IS_FROZEN:
     APP_DIR.mkdir(parents=True, exist_ok=True)
 else:
     APP_DIR = SOURCE_DIR
+LOG_PATH = APP_DIR / "tokenpulse-export.log"
+logger = logging.getLogger("tokenpulse.export")
+if not logger.handlers:
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    try:
+        _log_handler = RotatingFileHandler(
+            LOG_PATH,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=2,
+            encoding="utf-8",
+            delay=True,
+        )
+        _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(_log_handler)
+    except OSError:
+        logger.addHandler(logging.NullHandler())
+
+
+def recover_corrupt_json(path: Path) -> Any:
+    """Quarantine a corrupt json file and fall back to its .bak copy."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    corrupt = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        os.replace(path, corrupt)
+        logger.warning("corrupt json quarantined: %s -> %s", path.name, corrupt.name)
+    except OSError as exc:
+        logger.warning("failed to quarantine corrupt json %s: %s", path.name, exc)
+    backup = path.with_name(f"{path.name}.bak")
+    try:
+        data = json.loads(backup.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        logger.warning("no usable backup for corrupt json %s", path.name)
+        return None
+    logger.warning("recovered %s from %s", path.name, backup.name)
+    return data
+
+
+def refresh_json_backup(path: Path, max_age_seconds: float = 3600.0) -> None:
+    """Copy path to <name>.bak when the backup is missing or older than an hour."""
+    backup = path.with_name(f"{path.name}.bak")
+    try:
+        if backup.exists() and datetime.now().timestamp() - backup.stat().st_mtime < max_age_seconds:
+            return
+        payload = path.read_bytes()
+        temporary = backup.with_name(f".{backup.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_bytes(payload)
+            os.replace(temporary, backup)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError as exc:
+        logger.warning("failed to refresh backup for %s: %s", path.name, exc)
+
+
+_COCKPIT_SQLITE_WARNED: set[str] = set()
+
+
+def connect_cockpit_sqlite_readonly(db_path: Path) -> sqlite3.Connection:
+    # timeout matches the old default-mode connect (5s) so lock contention is
+    # not more likely to produce a transient empty scan than before.
+    quoted = parse.quote(Path(db_path).as_posix())
+    return sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=5.0)
+
+
+def warn_cockpit_sqlite_error(context: str, exc: Exception) -> None:
+    key = f"{context}:{type(exc).__name__}"
+    if key in _COCKPIT_SQLITE_WARNED:
+        return
+    _COCKPIT_SQLITE_WARNED.add(key)
+    logger.warning("%s: cockpit sqlite read failed: %s", context, exc)
+
+
 DEFAULT_OUTPUT = APP_DIR / "client_usage_today.json"
 CONFIG_PATH = Path(os.environ.get("CLIENT_USAGE_CONFIG") or APP_DIR / "client_usage_config.json")
 SPEED_HISTORY_PATH = Path(os.environ.get("CLIENT_USAGE_SPEED_HISTORY") or APP_DIR / "client_usage_speed_history.json")
@@ -221,6 +299,26 @@ API_SERVICE_MIRROR_LABELS = {
 if "CLIENT_USAGE_HIGH_WATER_UNATTRIBUTED_LABEL" not in os.environ:
     HIGH_WATER_UNATTRIBUTED_LABEL = "Codex local - \u5386\u53f2\u7f3a\u53e3\u672a\u5f52\u5c5e"
 API_SERVICE_AGGREGATE_LABEL = "Codex local - api-service-local"
+# Evidence strength behind a resolved api-service account. Only verdicts at or
+# above the archive floor are persisted, so a pure time-window guess can never
+# be frozen into the ledger.
+API_SERVICE_VERDICT_TIER_RANKS = {
+    "temporal": 1,
+    "affinity_confirmed": 2,
+    "cockpit_usage_row": 3,
+}
+API_SERVICE_VERDICT_ARCHIVE_MIN_TIER = max(
+    2,
+    int(os.environ.get("CLIENT_USAGE_VERDICT_ARCHIVE_MIN_TIER", "2")),
+)
+API_SERVICE_VERDICT_RETENTION_DAYS = max(
+    1,
+    int(os.environ.get("CLIENT_USAGE_VERDICT_RETENTION_DAYS", "45")),
+)
+API_SERVICE_VERDICT_ARCHIVE_LIMIT = max(
+    1,
+    int(os.environ.get("CLIENT_USAGE_VERDICT_ARCHIVE_LIMIT", "20000")),
+)
 COCKPIT_CONFIRMED_AFFINITY_ACTIONS = {
     "binding confirmed",
     "spillover binding confirmed",
@@ -1376,22 +1474,51 @@ def codex_token_count_signature(payload: dict[str, Any]) -> tuple[int, ...]:
     info = payload.get("info") or {}
     total = info.get("total_token_usage") or {}
     last = info.get("last_token_usage") or {}
+    # Field order stays CODEX_TOKEN_USAGE_FIELDS; the calls are spelled out
+    # because this runs once per token_count row of every scanned session.
     return (
         int(bool(info.get("last_token_usage"))),
-        *(usage_int(total, field) for field in CODEX_TOKEN_USAGE_FIELDS),
-        *(usage_int(last, field) for field in CODEX_TOKEN_USAGE_FIELDS),
+        usage_int(total, "input_tokens"),
+        usage_int(total, "cached_input_tokens"),
+        usage_int(total, "output_tokens"),
+        usage_int(total, "reasoning_output_tokens"),
+        usage_int(total, "total_tokens"),
+        usage_int(last, "input_tokens"),
+        usage_int(last, "cached_input_tokens"),
+        usage_int(last, "output_tokens"),
+        usage_int(last, "reasoning_output_tokens"),
+        usage_int(last, "total_tokens"),
     )
 
 
-def codex_token_count_signatures_from_path(path: Path) -> list[tuple[int, ...]]:
+_CODEX_SIGNATURE_CACHE: dict[
+    int,
+    tuple[list[dict[str, Any]], int, list[tuple[int, ...]]],
+] = {}
+
+
+def codex_token_count_signatures_for_rows(
+    rows: list[dict[str, Any]],
+) -> list[tuple[int, ...]]:
+    """Signatures only depend on row content, so build them once per row list."""
+    key = id(rows)
+    cached = _CODEX_SIGNATURE_CACHE.get(key)
+    if cached is not None and cached[0] is rows and cached[1] == len(rows):
+        return cached[2]
     signatures: list[tuple[int, ...]] = []
-    for row in codex_relevant_rows_from_path(path):
+    for row in rows:
         if row.get("type") != "event_msg":
             continue
         payload = row.get("payload") or {}
         if payload.get("type") == "token_count":
             signatures.append(codex_token_count_signature(payload))
+    # The row list is kept alive so id() cannot be recycled behind the cache.
+    _CODEX_SIGNATURE_CACHE[key] = (rows, len(rows), signatures)
     return signatures
+
+
+def codex_token_count_signatures_from_path(path: Path) -> list[tuple[int, ...]]:
+    return codex_token_count_signatures_for_rows(codex_relevant_rows_from_path(path))
 
 
 def codex_state_rollout_paths(
@@ -1764,7 +1891,8 @@ def scan_codex_events(
                 if parent_path is not None:
                     parent_signatures = codex_token_count_signatures_from_path(parent_path)
                     signature_cache[parent_id.lower()] = parent_signatures
-        session_signatures: list[tuple[int, ...]] = []
+        session_signatures = codex_token_count_signatures_for_rows(rows)
+        signature_index = 0
         parent_prefix_index = 0
         parent_prefix_open = bool(parent_signatures)
         fork_replay_cutoff = codex_fork_replay_cutoff_from_rows(rows)
@@ -1788,7 +1916,7 @@ def scan_codex_events(
                 and session_id
                 and payload_type in {"task_started", "task_complete", "turn_aborted"}
             ):
-                lifecycle_at = parse_dt(row.get("timestamp"))
+                lifecycle_at = event_ts
                 if lifecycle_at is not None and lifecycle_at < end:
                     candidate = SessionLifecycle(
                         session_id=session_id,
@@ -1847,11 +1975,15 @@ def scan_codex_events(
                 continue
             if payload_type != "token_count":
                 continue
-            info = payload.get("info") or {}
-            total = info.get("total_token_usage") or {}
             ts = event_ts
-            signature = codex_token_count_signature(payload)
-            session_signatures.append(signature)
+            if signature_index < len(session_signatures):
+                signature = session_signatures[signature_index]
+            else:
+                signature = codex_token_count_signature(payload)
+            signature_index += 1
+            # signature already holds every CODEX_TOKEN_USAGE_FIELDS value for
+            # total_token_usage (1..5) and last_token_usage (6..10).
+            reasoning_total = signature[4]
             inherited_replay = False
             if parent_prefix_open:
                 if (
@@ -1863,15 +1995,15 @@ def scan_codex_events(
                 else:
                     parent_prefix_open = False
             current = {
-                "input_tokens": usage_int(total, "input_tokens"),
-                "cached_input_tokens": usage_int(total, "cached_input_tokens"),
-                "output_tokens": usage_int(total, "output_tokens"),
+                "input_tokens": signature[1],
+                "cached_input_tokens": signature[2],
+                "output_tokens": signature[3],
             }
             key = (
-                current["input_tokens"],
-                current["cached_input_tokens"],
-                current["output_tokens"],
-                usage_int(total, "reasoning_output_tokens"),
+                signature[1],
+                signature[2],
+                signature[3],
+                reasoning_total,
             )
             if key in seen:
                 if inherited_replay:
@@ -1890,10 +2022,10 @@ def scan_codex_events(
             model = codex_model_name(explicit_model) if explicit_model else current_model
             total_key = (
                 model,
-                current["input_tokens"],
-                current["cached_input_tokens"],
-                current["output_tokens"],
-                usage_int(total, "reasoning_output_tokens"),
+                signature[1],
+                signature[2],
+                signature[3],
+                reasoning_total,
             )
             if (
                 parent_prefix_index == 0
@@ -1913,18 +2045,17 @@ def scan_codex_events(
             else:
                 seen_totals.add(total_key)
             signatures_by_total.setdefault(total_key, set()).add(signature)
-            last_usage = info.get("last_token_usage") or {}
-            if last_usage:
-                input_tokens = usage_int(last_usage, "input_tokens")
-                cached_tokens = usage_int(last_usage, "cached_input_tokens")
-                output_tokens = usage_int(last_usage, "output_tokens")
+            if signature[0]:
+                input_tokens = signature[6]
+                cached_tokens = signature[7]
+                output_tokens = signature[8]
                 event_key = (
                     str(row.get("timestamp") or ""),
                     model,
                     input_tokens,
                     cached_tokens,
                     output_tokens,
-                    usage_int(last_usage, "reasoning_output_tokens"),
+                    signature[9],
                 )
                 if event_key not in seen_events:
                     seen_events.add(event_key)
@@ -1957,7 +2088,7 @@ def scan_codex_events(
                 delta_input,
                 delta_cached,
                 delta_output,
-                usage_int(total, "reasoning_output_tokens"),
+                reasoning_total,
             )
             if event_key not in seen_events:
                 seen_events.add(event_key)
@@ -2240,6 +2371,21 @@ def legacy_codex_event_id(event: UsageEvent) -> str:
     return "|".join(parts)
 
 
+_LEDGER_DIRTY = False
+_VERDICT_ARCHIVE_DIRTY = False
+# Event ids this run decided from live evidence. They win over the copy on disk
+# when the archive is merged at save time; every other key keeps whatever a
+# concurrent exporter wrote, so parallel runs cannot drop each other's verdicts.
+_VERDICT_ARCHIVE_WRITES: set[str] = set()
+
+
+def ledger_assign(ledger: dict[str, str], event_id: str, label: str) -> None:
+    global _LEDGER_DIRTY
+    if ledger.get(event_id) != label:
+        ledger[event_id] = label
+        _LEDGER_DIRTY = True
+
+
 def ledger_label_for_event(
     event: UsageEvent,
     ledger: dict[str, str] | None,
@@ -2257,7 +2403,7 @@ def ledger_label_for_event(
     if label in {UNASSIGNED_CODEX_LABEL, "Codex local"}:
         label = ""
     if label and stable_id:
-        ledger[stable_id] = label
+        ledger_assign(ledger, stable_id, label)
     return label, stable_id
 
 
@@ -2615,8 +2761,27 @@ def account_label_for_event(
     return label
 
 
+_ATTRIBUTION_LEDGER_DOCUMENT_CACHE: tuple[tuple[Any, ...], dict[str, Any]] | None = None
+
+
+def attribution_ledger_document(refresh: bool = False) -> dict[str, Any]:
+    """Parse the ledger file once per run; it carries both events and verdicts."""
+    global _ATTRIBUTION_LEDGER_DOCUMENT_CACHE
+    try:
+        stat = ATTRIBUTION_LEDGER_PATH.stat()
+        stamp: tuple[Any, ...] = (str(ATTRIBUTION_LEDGER_PATH), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = (str(ATTRIBUTION_LEDGER_PATH),)
+    cached = _ATTRIBUTION_LEDGER_DOCUMENT_CACHE
+    if not refresh and cached is not None and cached[0] == stamp:
+        return cached[1]
+    document = load_json_object(ATTRIBUTION_LEDGER_PATH)
+    _ATTRIBUTION_LEDGER_DOCUMENT_CACHE = (stamp, document)
+    return document
+
+
 def load_attribution_ledger() -> dict[str, str]:
-    data = load_json_object(ATTRIBUTION_LEDGER_PATH)
+    data = attribution_ledger_document()
     ledger = data.get("events")
     if not isinstance(ledger, dict):
         return {}
@@ -2628,15 +2793,216 @@ def load_attribution_ledger() -> dict[str, str]:
     return result
 
 
-def save_attribution_ledger(ledger: dict[str, str], now: datetime) -> None:
-    write_json_object(
-        ATTRIBUTION_LEDGER_PATH,
-        {
-            "schema": 1,
-            "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-            "events": dict(sorted(ledger.items())),
-        },
+def api_service_verdict_tier_rank(tier: str) -> int:
+    return API_SERVICE_VERDICT_TIER_RANKS.get(str(tier or "").strip(), 0)
+
+
+def load_attribution_verdicts() -> dict[str, dict[str, str]]:
+    """Read the archived account verdicts stored beside the legacy label map."""
+    data = attribution_ledger_document().get("verdicts")
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for key, value in data.items():
+        if not key or not isinstance(value, dict):
+            continue
+        label = str(value.get("label") or "").strip()
+        tier = str(value.get("tier") or "").strip()
+        if not label or is_api_service_mirror_label(label):
+            continue
+        if api_service_verdict_tier_rank(tier) < API_SERVICE_VERDICT_ARCHIVE_MIN_TIER:
+            continue
+        result[str(key)] = {
+            "label": label,
+            "tier": tier,
+            "at": str(value.get("at") or "").strip(),
+        }
+    return result
+
+
+def record_attribution_verdict(
+    verdicts: dict[str, dict[str, str]],
+    event_id: str,
+    label: str,
+    tier: str,
+    event_at: datetime,
+) -> bool:
+    """Archive a high-evidence account verdict so it survives evidence rotation.
+
+    "at" carries the event's own time, not the run time, so retention prunes by
+    how old the decided event is instead of re-stamping the archive every run.
+
+    Live evidence wins: a verdict decided this run replaces an archived entry
+    that names a different account, even from a lower tier. The archive must
+    agree with the number this run just produced, otherwise a stale wrong entry
+    would silently outlive the evidence that contradicts it. Within one account
+    the tier only ever climbs, so a weaker re-confirmation cannot downgrade it.
+    """
+    global _VERDICT_ARCHIVE_DIRTY
+    rank = api_service_verdict_tier_rank(tier)
+    if rank < API_SERVICE_VERDICT_ARCHIVE_MIN_TIER:
+        return False
+    if not event_id or not label or is_api_service_mirror_label(label):
+        return False
+    stamp = event_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+    _VERDICT_ARCHIVE_WRITES.add(event_id)
+    previous = verdicts.get(event_id)
+    if previous is not None and previous.get("label") == label:
+        previous_rank = api_service_verdict_tier_rank(previous.get("tier", ""))
+        if previous_rank > rank:
+            return True
+        if (
+            previous_rank == rank
+            and str(previous.get("at") or "")[:10] == stamp[:10]
+        ):
+            return True
+    verdicts[event_id] = {"label": label, "tier": tier, "at": stamp}
+    _VERDICT_ARCHIVE_DIRTY = True
+    return True
+
+
+def archived_attribution_verdict(
+    verdicts: dict[str, dict[str, str]],
+    event_id: str,
+) -> str:
+    entry = verdicts.get(event_id) if event_id else None
+    if not isinstance(entry, dict):
+        return ""
+    label = str(entry.get("label") or "").strip()
+    if not label or is_api_service_mirror_label(label):
+        return ""
+    if api_service_verdict_tier_rank(entry.get("tier", "")) < API_SERVICE_VERDICT_ARCHIVE_MIN_TIER:
+        return ""
+    return label
+
+
+def merge_attribution_verdicts(
+    stored: dict[str, Any] | None,
+    verdicts: dict[str, dict[str, str]],
+    decided_now: set[str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Fold this run's archive into whatever sits on disk at save time.
+
+    The floating monitor spawns its own exporter, so two runs can archive
+    verdicts at the same time; writing only the in-memory snapshot would drop
+    the other run's entries. Keys this run decided from live evidence win, every
+    other key keeps the stronger tier - and, at equal tiers, the newer stamp.
+    """
+    decided = decided_now or set()
+    merged: dict[str, dict[str, str]] = {}
+    for source in (stored, verdicts):
+        if not isinstance(source, dict):
+            continue
+        for key, entry in source.items():
+            event_id = str(key or "")
+            if not event_id or not isinstance(entry, dict):
+                continue
+            label = str(entry.get("label") or "").strip()
+            tier = str(entry.get("tier") or "").strip()
+            if not label or not tier:
+                continue
+            candidate = {"label": label, "tier": tier, "at": str(entry.get("at") or "").strip()}
+            previous = merged.get(event_id)
+            if previous is not None and not (source is verdicts and event_id in decided):
+                previous_rank = api_service_verdict_tier_rank(previous.get("tier", ""))
+                rank = api_service_verdict_tier_rank(tier)
+                if previous_rank > rank:
+                    continue
+                if previous_rank == rank and str(previous.get("at") or "") >= candidate["at"]:
+                    continue
+            merged[event_id] = candidate
+    return merged
+
+
+def prune_attribution_verdicts(
+    verdicts: dict[str, dict[str, str]],
+    now: datetime,
+) -> dict[str, dict[str, str]]:
+    """Bound the archive by retention window first, then by entry count."""
+    cutoff = (
+        (now - timedelta(days=API_SERVICE_VERDICT_RETENTION_DAYS))
+        .replace(tzinfo=LOCAL_TZ)
+        .isoformat(timespec="seconds")
     )
+    kept = {
+        event_id: entry
+        for event_id, entry in verdicts.items()
+        if str(entry.get("at") or "") >= cutoff
+    }
+    if len(kept) > API_SERVICE_VERDICT_ARCHIVE_LIMIT:
+        newest = sorted(
+            kept.items(),
+            key=lambda item: (str(item[1].get("at") or ""), item[0]),
+            reverse=True,
+        )
+        kept = dict(newest[:API_SERVICE_VERDICT_ARCHIVE_LIMIT])
+    return kept
+
+
+def save_attribution_ledger(
+    ledger: dict[str, str],
+    now: datetime,
+    verdicts: dict[str, dict[str, str]] | None = None,
+) -> None:
+    global _LEDGER_DIRTY, _VERDICT_ARCHIVE_DIRTY, _VERDICT_ARCHIVE_WRITES
+    verdicts_dirty = verdicts is not None and _VERDICT_ARCHIVE_DIRTY
+    if not _LEDGER_DIRTY and not verdicts_dirty:
+        logger.debug("attribution ledger unchanged; skipped save")
+        return
+    # This re-stats the file, so it carries whatever a concurrent exporter wrote
+    # after this run loaded the ledger.
+    document = attribution_ledger_document()
+    previous_events = document.get("events")
+    events = dict(ledger)
+    refused_events = (
+        isinstance(previous_events, dict)
+        and len(previous_events) > 1000
+        and len(ledger) < len(previous_events) * 0.5
+    )
+    if refused_events:
+        logger.warning(
+            "refused attribution ledger save: %d entries would replace %d",
+            len(ledger),
+            len(previous_events),
+        )
+        if not verdicts_dirty:
+            return
+        # The shrink guard only protects the event labels. The archive still has
+        # to land, otherwise a truncated scan would also cost every verdict this
+        # run decided, and those accounts would decay back to unattributed.
+        events = {
+            str(key): str(value or "").strip()
+            for key, value in previous_events.items()
+            if key and str(value or "").strip()
+        }
+    if verdicts is None:
+        stored = document.get("verdicts")
+        archived = stored if isinstance(stored, dict) else {}
+    else:
+        archived = prune_attribution_verdicts(
+            merge_attribution_verdicts(
+                document.get("verdicts"),
+                verdicts,
+                _VERDICT_ARCHIVE_WRITES,
+            ),
+            now,
+        )
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+        "events": dict(sorted(events.items())),
+    }
+    if archived:
+        payload["verdicts"] = dict(sorted(archived.items()))
+    saved = write_json_object(ATTRIBUTION_LEDGER_PATH, payload)
+    if saved:
+        if not refused_events:
+            _LEDGER_DIRTY = False
+        if verdicts is not None:
+            _VERDICT_ARCHIVE_DIRTY = False
+            _VERDICT_ARCHIVE_WRITES = set()
+        attribution_ledger_document(refresh=True)
+        refresh_json_backup(ATTRIBUTION_LEDGER_PATH)
 
 
 def all_cockpit_codex_account_labels(home: Path) -> list[str]:
@@ -2664,7 +3030,41 @@ def all_cockpit_codex_account_labels(home: Path) -> list[str]:
     return labels
 
 
+_COCKPIT_ACCOUNT_LABEL_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, str]]] = {}
+
+
+def cockpit_codex_account_manifest_stamp(home: Path) -> tuple[Any, ...]:
+    """Identify the account manifest files so labels are parsed once per run."""
+    stamps: list[Any] = []
+    manifest = home / ".antigravity_cockpit" / "codex_accounts.json"
+    accounts_dir = home / ".antigravity_cockpit" / "codex_accounts"
+    candidates = [manifest]
+    try:
+        candidates.extend(sorted(accounts_dir.glob("*.json*")))
+    except OSError:
+        pass
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            stamps.append((path.name, 0, -1))
+            continue
+        stamps.append((path.name, int(stat.st_mtime_ns), int(stat.st_size)))
+    return tuple(stamps)
+
+
 def cockpit_codex_account_label_by_id(home: Path) -> dict[str, str]:
+    stamp = cockpit_codex_account_manifest_stamp(home)
+    cache_key = os.path.normcase(str(home))
+    cached = _COCKPIT_ACCOUNT_LABEL_CACHE.get(cache_key)
+    if cached is not None and cached[0] == stamp:
+        return dict(cached[1])
+    labels = cockpit_codex_account_labels_from_disk(home)
+    _COCKPIT_ACCOUNT_LABEL_CACHE[cache_key] = (stamp, dict(labels))
+    return labels
+
+
+def cockpit_codex_account_labels_from_disk(home: Path) -> dict[str, str]:
     path = home / ".antigravity_cockpit" / "codex_accounts.json"
     labels: dict[str, str] = {}
     if path.exists():
@@ -2738,7 +3138,7 @@ def cockpit_affinity_account_label_by_id(
     if not db_path.exists():
         return labels
     try:
-        connection = sqlite3.connect(db_path)
+        connection = connect_cockpit_sqlite_readonly(db_path)
         rows = connection.execute(
             """
             SELECT logs.account_id, logs.email, logs.api_key_label
@@ -2753,7 +3153,8 @@ def cockpit_affinity_account_label_by_id(
             """
         ).fetchall()
         connection.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        warn_cockpit_sqlite_error("cockpit_affinity_account_label_by_id", exc)
         return labels
     for account_id, email, api_key_label in rows:
         normalized = normalize_cockpit_auth_id(account_id)
@@ -2806,16 +3207,20 @@ def load_json_object(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except json.JSONDecodeError:
+        data = recover_corrupt_json(path)
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def write_json_object(path: Path, data: dict[str, Any]) -> None:
+def write_json_object(path: Path, data: dict[str, Any]) -> bool:
     try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        write_json_atomic(path, data)
+        return True
+    except Exception as exc:
+        logger.warning("failed to write %s: %s", path.name, exc)
+        return False
 
 
 def parse_speed_overrides(value: str) -> dict[str, str]:
@@ -3869,7 +4274,7 @@ def scan_cockpit_codex_accounts(root: Path, start: datetime, end: datetime) -> d
     speed_markers = codex_speed_history(root, start, end)
     buckets: dict[str, UsageBucket] = {}
     try:
-        con = sqlite3.connect(db_path)
+        con = connect_cockpit_sqlite_readonly(db_path)
         rows = con.execute(
             f"""
             SELECT
@@ -3890,7 +4295,8 @@ def scan_cockpit_codex_accounts(root: Path, start: datetime, end: datetime) -> d
             (start_ms, end_ms),
         ).fetchall()
         con.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        warn_cockpit_sqlite_error("scan_cockpit_codex_accounts", exc)
         return {}
 
     for row in rows:
@@ -3998,7 +4404,7 @@ def scan_cockpit_codex_quota_windows(
     buckets_cycle = {label: UsageBucket() for label in starts_cycle}
     latest_by_label: dict[str, datetime] = {}
     try:
-        con = sqlite3.connect(db_path)
+        con = connect_cockpit_sqlite_readonly(db_path)
         rows = con.execute(
             f"""
             SELECT
@@ -4019,7 +4425,8 @@ def scan_cockpit_codex_quota_windows(
             (local_epoch_ms(query_start), local_epoch_ms(end)),
         ).fetchall()
         con.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        warn_cockpit_sqlite_error("scan_cockpit_codex_quota_windows", exc)
         return {}, {}, {}, starts_5h, starts_7d, starts_cycle, {}
 
     for row in rows:
@@ -4100,7 +4507,7 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
     start_ms = local_epoch_ms(start)
     end_ms = local_epoch_ms(end)
     try:
-        con = sqlite3.connect(db_path)
+        con = connect_cockpit_sqlite_readonly(db_path)
         columns = {
             str(row[1])
             for row in con.execute("PRAGMA table_info(request_logs)").fetchall()
@@ -4130,7 +4537,8 @@ def scan_cockpit_codex_account_markers(root: Path, start: datetime, end: datetim
             (start_ms, end_ms),
         ).fetchall()
         con.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        warn_cockpit_sqlite_error("scan_cockpit_codex_account_markers", exc)
         return []
 
     labels_by_id = cockpit_codex_account_label_by_id(root)
@@ -4276,6 +4684,39 @@ def scan_cockpit_codex_affinity_events(
     return events
 
 
+_COCKPIT_SWITCH_LOG_CACHE: dict[tuple[str, int, int], list[tuple[datetime, str]]] = {}
+
+
+def cockpit_switch_log_entries(path: Path) -> list[tuple[datetime, str]]:
+    """Switch lines only depend on file content, so parse each log once per run."""
+    key: tuple[str, int, int] | None
+    try:
+        stat = path.stat()
+        key = (os.path.normcase(str(path)), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        key = None
+    if key is not None:
+        cached = _COCKPIT_SWITCH_LOG_CACHE.get(key)
+        if cached is not None:
+            return cached
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+    entries: list[tuple[datetime, str]] = []
+    for line in lines:
+        match = SWITCH_LOG_RE.search(line)
+        if not match:
+            continue
+        when = parse_local_log_dt(match.group("ts"))
+        if when is None:
+            continue
+        entries.append((when, match.group("account_id").strip()))
+    if key is not None:
+        _COCKPIT_SWITCH_LOG_CACHE[key] = entries
+    return entries
+
+
 def scan_cockpit_codex_switch_markers(root: Path, start: datetime, end: datetime) -> list[AccountMarker]:
     logs_dir = root / ".antigravity_cockpit" / "logs"
     if not logs_dir.exists():
@@ -4290,18 +4731,9 @@ def scan_cockpit_codex_switch_markers(root: Path, start: datetime, end: datetime
             continue
         if modified < scan_start:
             continue
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            match = SWITCH_LOG_RE.search(line)
-            if not match:
+        for when, account_id in cockpit_switch_log_entries(path):
+            if when >= end:
                 continue
-            when = parse_local_log_dt(match.group("ts"))
-            if when is None or when >= end:
-                continue
-            account_id = match.group("account_id").strip()
             label = labels.get(account_id) or cockpit_account_label(account_id, "", "")
             if not usable_cockpit_account_label(label):
                 continue
@@ -4329,6 +4761,7 @@ def attribute_codex_events_to_account_markers(
     attribution_ledger: dict[str, str] | None = None,
     current_label: str = "",
     now: datetime | None = None,
+    verdicts: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, UsageBucket]:
     attributed = attribute_codex_events_by_account(
         events,
@@ -4346,6 +4779,10 @@ def attribute_codex_events_to_account_markers(
         attributed, _session_accounts, _unresolved = resolve_api_service_event_accounts(
             attributed,
             request_markers,
+            None,
+            None,
+            verdicts,
+            record_verdicts=False,
         )
     return buckets_from_attributed_events(attributed, cost_multiplier_by_label)
 
@@ -4452,7 +4889,7 @@ def attribute_codex_events_by_account(
                 ):
                     label = current_label
                 if attribution_ledger is not None and event_id:
-                    attribution_ledger[event_id] = label
+                    ledger_assign(attribution_ledger, event_id, label)
             attributed.setdefault(label, []).append(event)
         return attributed
 
@@ -4474,7 +4911,7 @@ def attribute_codex_events_by_account(
             ):
                 label = current_label
             if ledger is not None and event_id:
-                ledger[event_id] = label
+                ledger_assign(ledger, event_id, label)
         attributed.setdefault(label, []).append(event)
     return attributed
 
@@ -4897,12 +5334,19 @@ def account_marker_covers_event_time(
     return latency_seconds > 0 and 0 <= delta_seconds <= latency_seconds
 
 
-def concrete_api_service_account_marker(
+def concrete_api_service_account_match(
     event: UsageEvent,
     markers: list[AccountMarker],
     marker_index: dict[int, list[AccountMarker]] | None = None,
     used_marker_ids: set[int] | None = None,
-) -> AccountMarker | None:
+) -> tuple[AccountMarker | None, bool]:
+    """Pair an event with its Cockpit usage row and report how it was matched.
+
+    The second element is True only for an exact match (identical token totals
+    inside the activity window). A fuzzy match is a token-count guess inside a
+    30 second window, so callers that persist a verdict must treat it as weak
+    evidence even though it still decides this run's label.
+    """
     # Cockpit writes request markers when the response finishes, matching the
     # Codex token_count timestamp rather than the task-start attribution edge.
     event_time = event.when
@@ -4927,7 +5371,10 @@ def concrete_api_service_account_marker(
         if account_marker_covers_event_time(marker, event_time)
     ]
     if nearby:
-        return min(nearby, key=lambda marker: abs((marker.when - event_time).total_seconds()))
+        return (
+            min(nearby, key=lambda marker: abs((marker.when - event_time).total_seconds())),
+            True,
+        )
     fuzzy_token_delta = max(256, int(event.total_tokens * 0.005))
     fuzzy_pool = (
         marker_index.near_time(event_time, 30)
@@ -4944,14 +5391,32 @@ def concrete_api_service_account_marker(
         and abs(marker.total_tokens - event.total_tokens) <= fuzzy_token_delta
     ]
     if fuzzy_candidates:
-        return min(
-            fuzzy_candidates,
-            key=lambda marker: (
-                abs(marker.total_tokens - event.total_tokens),
-                abs((marker.when - event_time).total_seconds()),
+        return (
+            min(
+                fuzzy_candidates,
+                key=lambda marker: (
+                    abs(marker.total_tokens - event.total_tokens),
+                    abs((marker.when - event_time).total_seconds()),
+                ),
             ),
+            False,
         )
-    return None
+    return None, False
+
+
+def concrete_api_service_account_marker(
+    event: UsageEvent,
+    markers: list[AccountMarker],
+    marker_index: dict[int, list[AccountMarker]] | None = None,
+    used_marker_ids: set[int] | None = None,
+) -> AccountMarker | None:
+    marker, _exact = concrete_api_service_account_match(
+        event,
+        markers,
+        marker_index,
+        used_marker_ids,
+    )
+    return marker
 
 
 def concrete_api_service_account_label(
@@ -5888,12 +6353,36 @@ def cockpit_consistent_temporal_affinity_turn_anchors(
     return anchors
 
 
+def api_service_verdict_tier(marker: AccountMarker, exact_usage_row_match: bool) -> str:
+    """Name the evidence tier behind a marker-derived account verdict.
+
+    Only an exact Cockpit usage row for this very event is archive-grade: the
+    token totals matched and the row sits inside the event's activity window.
+    Every weaker join - a fuzzy token guess, or a turn-level anchor inherited by
+    the other events of the same turn - stays temporal so it can never freeze a
+    guess into the archive.
+    """
+    if exact_usage_row_match and marker.kind == "request":
+        return "cockpit_usage_row"
+    return "temporal"
+
+
 def resolve_api_service_event_accounts(
     attributed: dict[str, list[UsageEvent]],
     account_markers: list[AccountMarker],
     known_session_accounts: dict[str, str] | None = None,
     affinity_events: list[CockpitAffinityEvent] | None = None,
+    verdicts: dict[str, dict[str, str]] | None = None,
+    record_verdicts: bool = True,
 ) -> tuple[dict[str, list[UsageEvent]], dict[str, str], int]:
+    """Resolve api-service mirror labels into concrete Cockpit accounts.
+
+    ``verdicts`` is read to fill events this run cannot decide. Window and
+    live-catch-up callers pass ``record_verdicts=False``: they must read the same
+    archive as the today pass so every view agrees, but their scans carry less
+    evidence, so they are not allowed to write into the archive that the today
+    pass just decided.
+    """
     marker_index = account_markers_by_total_tokens(account_markers)
     session_accounts = dict(known_session_accounts or {})
     resolved: dict[str, list[UsageEvent]] = {}
@@ -5909,9 +6398,15 @@ def resolve_api_service_event_accounts(
     records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]] = []
     cockpit_mode = bool(account_markers or affinity_events)
     anchors_by_turn: dict[str, list[tuple[datetime, AccountMarker]]] = {}
+    # The verdict key must be taken from the freshly scanned event, because a
+    # matched marker rewrites event.model further down and codex_event_id()
+    # folds the model into the id.
+    verdict_ids: list[str] = []
     for label, event in ordered:
-        session_id = event.session_id or event.request_key or codex_event_id(event)
+        verdict_id = codex_event_id(event) if verdicts is not None else ""
+        session_id = event.session_id or event.request_key or verdict_id or codex_event_id(event)
         turn_key = api_service_event_turn_key(event)
+        verdict_ids.append(verdict_id)
         records.append((label, event, session_id, turn_key, None))
 
     final_request_markers = cockpit_final_request_event_markers(
@@ -5923,10 +6418,17 @@ def resolve_api_service_event_accounts(
         id(marker)
         for marker in final_request_markers.values()
     }
+    # Records whose own token totals matched a Cockpit usage row exactly. Only
+    # these may enter the verdict archive.
+    exact_match_records: set[int] = set()
     for record_index, (label, event, session_id, turn_key, _marker) in enumerate(records):
         matched_marker = final_request_markers.get(record_index)
-        if matched_marker is None:
-            matched_marker = concrete_api_service_account_marker(
+        if matched_marker is not None:
+            # The request_id join already required equal token totals, so this
+            # is an exact usage-row match with affinity evidence on top.
+            exact_match_records.add(record_index)
+        else:
+            matched_marker, exact_match = concrete_api_service_account_match(
                 event,
                 account_markers,
                 marker_index,
@@ -5934,6 +6436,8 @@ def resolve_api_service_event_accounts(
             )
             if matched_marker is not None:
                 used_marker_ids.add(id(matched_marker))
+                if exact_match:
+                    exact_match_records.add(record_index)
         records[record_index] = (
             label,
             event,
@@ -6006,12 +6510,18 @@ def resolve_api_service_event_accounts(
         )
 
     latest_by_session: dict[str, tuple[str, bool]] = {}
-    for label, event, session_id, turn_key, matched_marker in records:
+    for record_index, (label, event, session_id, turn_key, matched_marker) in enumerate(records):
         resolved_label = label
         confirmed = False
+        verdict_tier = ""
+        counted_unresolved = False
         if matched_marker is not None:
             resolved_label = matched_marker.label
             confirmed = True
+            verdict_tier = api_service_verdict_tier(
+                matched_marker,
+                record_index in exact_match_records,
+            )
             if matched_marker.model:
                 event.model = matched_marker.model
         elif turn_key and anchors_by_turn.get(turn_key):
@@ -6020,17 +6530,48 @@ def resolve_api_service_event_accounts(
             position = bisect_right(anchor_times, event.when) - 1
             if position < 0:
                 position = 0
-            resolved_label = anchors[position][1].label
+            anchor_marker = anchors[position][1]
+            resolved_label = anchor_marker.label
             if is_api_service_mirror_label(resolved_label):
                 resolved_label = API_SERVICE_AGGREGATE_LABEL
                 unresolved += 1
+                counted_unresolved = True
             else:
                 confirmed = True
+                # A turn anchor is inherited by every event of the turn, including
+                # events that never matched a marker themselves, so it decides this
+                # run's label but stays out of the archive.
+                verdict_tier = ""
         elif cockpit_mode or is_api_service_mirror_label(label):
             resolved_label = API_SERVICE_AGGREGATE_LABEL
             unresolved += 1
+            counted_unresolved = True
         else:
             confirmed = True
+        if verdicts is not None:
+            # verdict_tier is only set when this event's own Cockpit usage row
+            # decided the account, so the archive stays scoped to the population
+            # that can decay back into the aggregate label.
+            concrete = bool(resolved_label) and not is_api_service_mirror_label(resolved_label)
+            if concrete:
+                if record_verdicts and confirmed and verdict_tier:
+                    record_attribution_verdict(
+                        verdicts,
+                        verdict_ids[record_index],
+                        resolved_label,
+                        verdict_tier,
+                        usage_event_attribution_time(event),
+                    )
+            else:
+                archived_label = archived_attribution_verdict(
+                    verdicts,
+                    verdict_ids[record_index],
+                )
+                if archived_label:
+                    resolved_label = archived_label
+                    confirmed = True
+                    if counted_unresolved:
+                        unresolved -= 1
         resolved.setdefault(resolved_label, []).append(event)
         latest_by_session[session_id] = (resolved_label, confirmed)
 
@@ -6267,9 +6808,8 @@ def merge_missing_cockpit_account_events(
 
 
 def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
-    try:
-        history = json.loads(USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    history = read_usage_history_json()
+    if history is None:
         return 0
     days = history.get("days") if isinstance(history, dict) else None
     if not isinstance(days, dict):
@@ -6315,6 +6855,9 @@ def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
         current_codex_account_label(home),
         datetime.now(),
     )
+    # No verdicts on purpose: a day already written into usage history keeps the
+    # split it was archived with, so filling it from the archive would rewrite
+    # numbers the user has already seen.
     resolved, _session_accounts, _unresolved = resolve_api_service_event_accounts(
         attributed,
         account_markers,
@@ -6365,6 +6908,7 @@ def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
     if updated:
         history["schema"] = max(2, int(history.get("schema") or 1))
         write_json_atomic(USAGE_HISTORY_PATH, history)
+        refresh_json_backup(USAGE_HISTORY_PATH)
     return updated
 
 
@@ -6417,11 +6961,21 @@ def collapse_api_service_mirror_providers(output: dict[str, Any]) -> dict[str, A
     return aggregate
 
 
-def load_usage_history_for_backfill() -> dict[str, Any]:
+def read_usage_history_json() -> dict[str, Any] | None:
+    """Read usage_history.json, recovering from corruption via the .bak copy."""
+    if not USAGE_HISTORY_PATH.exists():
+        return None
     try:
         history = json.loads(USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"schema": 2, "days": {}}
+    except json.JSONDecodeError:
+        history = recover_corrupt_json(USAGE_HISTORY_PATH)
+    except OSError:
+        return None
+    return history if isinstance(history, dict) else None
+
+
+def load_usage_history_for_backfill() -> dict[str, Any]:
+    history = read_usage_history_json()
     if not isinstance(history, dict):
         return {"schema": 2, "days": {}}
     if not isinstance(history.get("days"), dict):
@@ -6547,6 +7101,8 @@ def build_historical_usage_rows(
         account_markers,
         affinity_events,
     )
+    # No verdicts on purpose: history rows are rebuilt for days that are already
+    # closed, and the archive must not retro-edit a split the user has seen.
     resolved, _session_accounts, _unresolved = resolve_api_service_event_accounts(
         attributed,
         account_markers,
@@ -6776,6 +7332,7 @@ def backfill_offline_usage_history(
             "updated_days": changed,
         }
         write_json_atomic(USAGE_HISTORY_PATH, history)
+        refresh_json_backup(USAGE_HISTORY_PATH)
         return result
     except Exception as exc:
         completed_at = datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
@@ -6791,6 +7348,7 @@ def backfill_offline_usage_history(
         history["offline_sync"] = sync
         try:
             write_json_atomic(USAGE_HISTORY_PATH, history)
+            refresh_json_backup(USAGE_HISTORY_PATH)
         except OSError:
             pass
         result.update(
@@ -6989,9 +7547,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
 def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
     if output.get("api_service_aggregate"):
         return
-    try:
-        history = json.loads(USAGE_HISTORY_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    history = read_usage_history_json()
+    if history is None:
         return
     days = history.get("days") if isinstance(history, dict) else None
     row = days.get(day.isoformat()) if isinstance(days, dict) else None
@@ -7032,6 +7589,7 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
             history_row["source_gap"] = gap
             try:
                 write_json_atomic(USAGE_HISTORY_PATH, history)
+                refresh_json_backup(USAGE_HISTORY_PATH)
             except OSError:
                 pass
     gap = dict(gap)
@@ -7257,8 +7815,16 @@ def build_codex_window_stats(
     now: datetime,
     attribution_ledger: dict[str, str],
     current_label: str,
+    attribution_verdicts: dict[str, dict[str, str]] | None = None,
     include_30d: bool = False,
 ) -> dict[str, dict[str, dict[str, Any]]]:
+    """Build the per-account 5h/7d/cycle/30d windows.
+
+    The archived verdicts are read here as well, so a window that contains today
+    resolves the same accounts today's own totals do. Windows never write into
+    the archive: their scans carry no affinity evidence, so they must not be able
+    to overrule what the today pass decided.
+    """
     window_end = now + timedelta(seconds=1)
     window_5h_start = now - timedelta(hours=5)
     window_7d_start = now - timedelta(days=7)
@@ -7300,6 +7866,7 @@ def build_codex_window_stats(
             attribution_ledger,
             current_label,
             now,
+            attribution_verdicts,
         )
 
         events_5h = scan_all_codex_events(home, sessions_root, window_5h_start, window_end)
@@ -7313,6 +7880,7 @@ def build_codex_window_stats(
             attribution_ledger,
             current_label,
             now,
+            attribution_verdicts,
         )
         if include_30d:
             speed_markers_30d = codex_speed_history(home, window_30d_start, window_end)
@@ -7329,6 +7897,7 @@ def build_codex_window_stats(
                 attribution_ledger,
                 current_label,
                 now,
+                attribution_verdicts,
             )
     if include_30d and (direct_total.total_tokens > 0 or direct_total.requests > 0):
         speed_markers_30d = codex_speed_history(home, window_30d_start, window_end)
@@ -7355,6 +7924,10 @@ def build_codex_window_stats(
         attributed_30d, _session_accounts_30d, _unresolved_30d = resolve_api_service_event_accounts(
             attributed_30d,
             account_markers_30d,
+            None,
+            None,
+            attribution_verdicts,
+            record_verdicts=False,
         )
         raw_30d: dict[str, UsageBucket] = {}
         for label, account_events in attributed_30d.items():
@@ -7410,6 +7983,10 @@ def build_codex_window_stats(
         attributed_events, _session_accounts_aligned, _unresolved_aligned = resolve_api_service_event_accounts(
             attributed_events,
             aligned_account_markers,
+            None,
+            None,
+            attribution_verdicts,
+            record_verdicts=False,
         )
         raw_5h = {label: UsageBucket() for label in aligned_starts_5h}
         raw_7d = {label: UsageBucket() for label in aligned_starts_7d}
@@ -7552,6 +8129,10 @@ def build_live_catchup_payload(
 
     current_label = current_codex_account_label(home)
     attribution_ledger = load_attribution_ledger()
+    # Read-only: the catch-up must report the same accounts the full export does,
+    # otherwise the monitor would flip between an aggregate label and a concrete
+    # account between refreshes. It never archives, so it cannot decide anything.
+    attribution_verdicts = load_attribution_verdicts()
     markers = scan_cockpit_codex_switch_markers(home, day_start, through)
     markers.extend(load_account_timeline())
     account_markers = scan_cockpit_codex_account_markers(home, day_start, through)
@@ -7587,6 +8168,8 @@ def build_live_catchup_payload(
         account_markers,
         previous_active_session_account_labels(output_path, since.date()),
         affinity_events,
+        attribution_verdicts,
+        record_verdicts=False,
     )
     speed_by_account = cockpit_codex_speed_by_label(home)
     cost_multiplier_by_label = {
@@ -7712,6 +8295,7 @@ def main() -> int:
     codex_sessions_root = home / ".codex" / "sessions"
     record_current_account_snapshot(home, now)
     attribution_ledger = load_attribution_ledger()
+    attribution_verdicts = load_attribution_verdicts()
     current_label = current_codex_account_label(home)
     speed_by_account = cockpit_codex_speed_by_label(home)
     cost_multiplier_by_label = {
@@ -7786,6 +8370,7 @@ def main() -> int:
         account_markers,
         previous_active_session_account_labels(out, day),
         affinity_events,
+        attribution_verdicts,
     )
     attributed = buckets_from_attributed_events(
         attributed_events,
@@ -7842,6 +8427,7 @@ def main() -> int:
             now,
             attribution_ledger,
             current_label,
+            attribution_verdicts,
             include_30d=refresh_30d,
         )
     window_only_labels = window_only_provider_labels(
@@ -7854,7 +8440,7 @@ def main() -> int:
         codex_provider_map.items(),
         key=lambda item: (-item[1].total_tokens, -item[1].requests, item[0]),
     )
-    save_attribution_ledger(attribution_ledger, now)
+    save_attribution_ledger(attribution_ledger, now, attribution_verdicts)
 
     session_account_labels = dict(provider_session_accounts)
     (
@@ -7929,7 +8515,12 @@ def main() -> int:
             lookback_speed_markers = codex_speed_history(home, lookback_start, scan_end)
             apply_codex_speed_fallback(lookback_events, lookback_speed_markers)
             lookback_markers = scan_cockpit_codex_switch_markers(home, lookback_start, scan_end)
-            lookback_markers.extend(scan_cockpit_codex_account_markers(home, lookback_start, scan_end))
+            lookback_account_markers = scan_cockpit_codex_account_markers(
+                home,
+                lookback_start,
+                scan_end,
+            )
+            lookback_markers.extend(lookback_account_markers)
             lookback_markers.extend(load_account_timeline())
             recent_attributed = attribute_codex_events_by_account(
                     lookback_events,
@@ -7940,7 +8531,7 @@ def main() -> int:
                 )
             recent_latest_request = latest_request_from_attributed_events(
                 recent_attributed,
-                scan_cockpit_codex_account_markers(home, lookback_start, scan_end),
+                lookback_account_markers,
             )
             latest_provider = str(recent_latest_request.get("provider") or "")
             latest_model = str(recent_latest_request.get("model") or "")
@@ -8011,9 +8602,17 @@ def main() -> int:
         output["offline_catchup"] = catchup
         if offline_days or catchup.get("state") == "error":
             write_json_atomic(out, output)
-        save_attribution_ledger(attribution_ledger, datetime.now())
+        save_attribution_ledger(attribution_ledger, datetime.now(), attribution_verdicts)
     if args.backfill_history_details:
         backfill_usage_history_details(home, codex_sessions_root)
+    logger.info(
+        "export run finished in %.1fs: codex_events=%d providers=%d ledger_entries=%d verdicts=%d",
+        (datetime.now() - now).total_seconds(),
+        len(codex_events),
+        len(providers),
+        len(attribution_ledger),
+        len(attribution_verdicts),
+    )
     print(json.dumps(output["today"], ensure_ascii=False))
     return 0
 

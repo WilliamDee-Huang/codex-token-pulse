@@ -103,7 +103,7 @@ class CodexAuthIdentityTests(unittest.TestCase):
                         "accounts": [
                             {
                                 "id": account_id,
-                                "email": "zaodukeee98@gmail.com",
+                                "email": "fixture-a@example.com",
                                 "plan_type": "free",
                             }
                         ]
@@ -124,7 +124,7 @@ class CodexAuthIdentityTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     monitor.ranking_account_display_name(raw_name),
-                    "zaodukeee98@gmail.com",
+                    "fixture-a@example.com",
                 )
                 self.assertEqual(
                     monitor.account_type_label({"name": raw_name}),
@@ -1292,17 +1292,17 @@ class ApiServicePoolAggregateTests(unittest.TestCase):
         self.assertEqual(result["providers"][0]["name"], "Codex local - direct-account")
 
     def test_account_row_pool_filter_uses_manifest_emails(self) -> None:
-        pool = {"hails24.uranium@icloud.com", "tissue_wisp.24+g5@icloud.com"}
+        pool = {"fixture-b@example.com", "fixture-c+g5@example.com"}
 
         self.assertTrue(
             monitor.account_row_matches_pool(
-                {"name": "Codex local - hails24.uranium@icloud.com"},
+                {"name": "Codex local - fixture-b@example.com"},
                 pool,
             )
         )
         self.assertFalse(
             monitor.account_row_matches_pool(
-                {"name": "Codex local - rollers_tubers4s@icloud.com"},
+                {"name": "Codex local - fixture-d@example.com"},
                 pool,
             )
         )
@@ -1315,14 +1315,14 @@ class LocalActiveAccountTests(unittest.TestCase):
             "active_sessions": [
                 {
                     "session_id": "session-1",
-                    "provider": "Codex local - hails24.uranium@icloud.com",
+                    "provider": "Codex local - fixture-b@example.com",
                     "model": "gpt-5.5",
                     "latest_at": now,
                 }
             ],
             "providers": [
                 {
-                    "name": "Codex local - hails24.uranium@icloud.com",
+                    "name": "Codex local - fixture-b@example.com",
                     "latest_at": now,
                     "latest_model": "gpt-5.5",
                     "recent_sessions": 0,
@@ -1345,7 +1345,7 @@ class LocalActiveAccountTests(unittest.TestCase):
         active = monitor.local_active_accounts_from_client_usage(usage)
 
         self.assertEqual(len(active), 1)
-        self.assertIn("hails24.uranium@icloud.com", active[0]["name"])
+        self.assertIn("fixture-b@example.com", active[0]["name"])
         self.assertEqual(active[0]["current"], 1)
 
     def test_lifecycle_active_session_does_not_expire_by_token_timestamp(self) -> None:
@@ -3054,7 +3054,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
             logs = cockpit / "logs"
             logs.mkdir(parents=True)
             account_id = "codex_a537e71a6393d78bbac5e57d3d128fbc"
-            email = "zaodukeee98@gmail.com"
+            email = "fixture-a@example.com"
             (cockpit / "codex_accounts.json").write_text(
                 json.dumps(
                     {
@@ -10001,6 +10001,701 @@ class AttributionLedgerTests(unittest.TestCase):
 
         self.assertIn("Codex local - account@example.com", attributed)
         self.assertEqual(ledger[stable_id], "Codex local - account@example.com")
+
+
+class AttributionVerdictArchiveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.original_ledger_path = client_usage_export.ATTRIBUTION_LEDGER_PATH
+        client_usage_export.ATTRIBUTION_LEDGER_PATH = (
+            Path(self.temporary_directory.name) / "client_usage_attribution_ledger.json"
+        )
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+        client_usage_export._LEDGER_DIRTY = False
+        client_usage_export._VERDICT_ARCHIVE_DIRTY = False
+        client_usage_export._VERDICT_ARCHIVE_WRITES = set()
+
+    def tearDown(self) -> None:
+        client_usage_export.ATTRIBUTION_LEDGER_PATH = self.original_ledger_path
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+        client_usage_export._LEDGER_DIRTY = False
+        client_usage_export._VERDICT_ARCHIVE_DIRTY = False
+        client_usage_export._VERDICT_ARCHIVE_WRITES = set()
+        self.temporary_directory.cleanup()
+
+    @staticmethod
+    def api_service_event(
+        when: datetime,
+        total_tokens: int,
+        session_id: str = "session-verdict",
+        turn_started_at: datetime | None = None,
+    ) -> client_usage_export.UsageEvent:
+        return client_usage_export.UsageEvent(
+            when=when,
+            model="gpt-test",
+            input_tokens=total_tokens - 100,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id=session_id,
+            account_at=turn_started_at or (when - timedelta(seconds=30)),
+        )
+
+    def test_archived_verdict_only_fills_events_this_run_cannot_resolve(self) -> None:
+        event = self.api_service_event(datetime(2026, 7, 26, 9, 0, 0), 1_000)
+        event_id = client_usage_export.codex_event_id(event)
+        stale_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 3, 0, 0),
+            label="Codex local - other@example.com",
+            total_tokens=999_999,
+            kind="request",
+        )
+        verdicts = {
+            event_id: {
+                "label": "Codex local - archived@example.com",
+                "tier": "cockpit_usage_row",
+                "at": "2026-07-26T09:00:00+08:00",
+            }
+        }
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [stale_marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+
+        self.assertEqual(list(resolved), ["Codex local - archived@example.com"])
+        self.assertEqual(unresolved, 0)
+        self.assertEqual(
+            sum(item.total_tokens for events in resolved.values() for item in events),
+            1_000,
+        )
+
+    def test_archive_never_overrides_a_concrete_verdict_from_this_run(self) -> None:
+        event = self.api_service_event(datetime(2026, 7, 26, 9, 0, 0), 1_000)
+        event_id = client_usage_export.codex_event_id(event)
+        marker = client_usage_export.AccountMarker(
+            when=event.when,
+            label="Codex local - live@example.com",
+            model="gpt-5.6-sol",
+            total_tokens=1_000,
+            kind="request",
+        )
+        verdicts = {
+            event_id: {
+                "label": "Codex local - archived@example.com",
+                "tier": "cockpit_usage_row",
+                "at": "2026-07-20T09:00:00+08:00",
+            }
+        }
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+
+        self.assertEqual(list(resolved), ["Codex local - live@example.com"])
+        self.assertEqual(unresolved, 0)
+        # The archive is upgraded to this run's verdict under the pre-mutation id,
+        # even though the matched marker rewrote event.model.
+        self.assertEqual(event.model, "gpt-5.6-sol")
+        self.assertEqual(verdicts[event_id]["label"], "Codex local - live@example.com")
+        self.assertEqual(verdicts[event_id]["tier"], "cockpit_usage_row")
+
+    def test_unresolved_events_stay_unresolved_without_an_archived_verdict(self) -> None:
+        event = self.api_service_event(datetime(2026, 7, 26, 9, 0, 0), 1_000)
+        stale_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 3, 0, 0),
+            label="Codex local - other@example.com",
+            total_tokens=999_999,
+            kind="request",
+        )
+        verdicts: dict[str, dict[str, str]] = {}
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [stale_marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+
+        self.assertEqual(list(resolved), [client_usage_export.API_SERVICE_AGGREGATE_LABEL])
+        self.assertEqual(unresolved, 1)
+        self.assertEqual(verdicts, {})
+
+    def test_low_tier_verdicts_are_not_archived(self) -> None:
+        verdicts: dict[str, dict[str, str]] = {}
+
+        stored = client_usage_export.record_attribution_verdict(
+            verdicts,
+            "event-1",
+            "Codex local - guess@example.com",
+            "temporal",
+            datetime(2026, 7, 26, 9, 0, 0),
+        )
+
+        self.assertFalse(stored)
+        self.assertEqual(verdicts, {})
+        self.assertFalse(client_usage_export._VERDICT_ARCHIVE_DIRTY)
+
+    def test_mirror_labels_are_never_archived(self) -> None:
+        verdicts: dict[str, dict[str, str]] = {}
+
+        stored = client_usage_export.record_attribution_verdict(
+            verdicts,
+            "event-1",
+            client_usage_export.API_SERVICE_AGGREGATE_LABEL,
+            "cockpit_usage_row",
+            datetime(2026, 7, 26, 9, 0, 0),
+        )
+
+        self.assertFalse(stored)
+        self.assertEqual(verdicts, {})
+
+    def test_verdict_tier_follows_the_evidence_behind_the_marker(self) -> None:
+        request_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 9, 0, 0),
+            label="Codex local - account@example.com",
+            kind="request",
+        )
+        affinity_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 9, 0, 0),
+            label="Codex local - account@example.com",
+            kind="affinity",
+        )
+        switch_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 9, 0, 0),
+            label="Codex local - account@example.com",
+            kind="switch",
+        )
+
+        # Only an exact usage-row match for this very event is archive-grade.
+        self.assertEqual(
+            client_usage_export.api_service_verdict_tier(request_marker, True),
+            "cockpit_usage_row",
+        )
+        self.assertEqual(
+            client_usage_export.api_service_verdict_tier(request_marker, False),
+            "temporal",
+        )
+        self.assertEqual(
+            client_usage_export.api_service_verdict_tier(affinity_marker, True),
+            "temporal",
+        )
+        self.assertEqual(
+            client_usage_export.api_service_verdict_tier(affinity_marker, False),
+            "temporal",
+        )
+        self.assertEqual(
+            client_usage_export.api_service_verdict_tier(switch_marker, False),
+            "temporal",
+        )
+        self.assertLess(
+            client_usage_export.api_service_verdict_tier_rank("temporal"),
+            client_usage_export.API_SERVICE_VERDICT_ARCHIVE_MIN_TIER,
+        )
+
+    def test_lower_tier_verdict_cannot_downgrade_the_same_archived_account(self) -> None:
+        verdicts = {
+            "event-1": {
+                "label": "Codex local - strong@example.com",
+                "tier": "cockpit_usage_row",
+                "at": "2026-07-26T09:00:00+08:00",
+            }
+        }
+
+        client_usage_export.record_attribution_verdict(
+            verdicts,
+            "event-1",
+            "Codex local - strong@example.com",
+            "affinity_confirmed",
+            datetime(2026, 7, 26, 10, 0, 0),
+        )
+
+        self.assertEqual(verdicts["event-1"]["label"], "Codex local - strong@example.com")
+        self.assertEqual(verdicts["event-1"]["tier"], "cockpit_usage_row")
+
+    def test_live_verdict_overrides_an_archived_entry_that_names_another_account(self) -> None:
+        verdicts = {
+            "event-1": {
+                "label": "Codex local - wrong@example.com",
+                "tier": "cockpit_usage_row",
+                "at": "2026-07-20T09:00:00+08:00",
+            }
+        }
+
+        stored = client_usage_export.record_attribution_verdict(
+            verdicts,
+            "event-1",
+            "Codex local - right@example.com",
+            "affinity_confirmed",
+            datetime(2026, 7, 26, 10, 0, 0),
+        )
+
+        # A lower tier still wins: this run's evidence decided the number the
+        # user is looking at, so the archive may not keep contradicting it.
+        self.assertTrue(stored)
+        self.assertEqual(verdicts["event-1"]["label"], "Codex local - right@example.com")
+        self.assertEqual(verdicts["event-1"]["tier"], "affinity_confirmed")
+        self.assertTrue(verdicts["event-1"]["at"].startswith("2026-07-26T10:00:00"))
+
+    def test_expired_verdicts_are_pruned_on_save(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        verdicts = {
+            "fresh": {
+                "label": "Codex local - fresh@example.com",
+                "tier": "cockpit_usage_row",
+                "at": (now - timedelta(days=1)).replace(
+                    tzinfo=client_usage_export.LOCAL_TZ
+                ).isoformat(timespec="seconds"),
+            },
+            "expired": {
+                "label": "Codex local - expired@example.com",
+                "tier": "cockpit_usage_row",
+                "at": (
+                    now
+                    - timedelta(days=client_usage_export.API_SERVICE_VERDICT_RETENTION_DAYS + 1)
+                ).replace(tzinfo=client_usage_export.LOCAL_TZ).isoformat(timespec="seconds"),
+            },
+        }
+
+        kept = client_usage_export.prune_attribution_verdicts(verdicts, now)
+
+        self.assertEqual(list(kept), ["fresh"])
+
+    def test_verdict_archive_is_capped_by_entry_count(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        verdicts = {
+            f"event-{index}": {
+                "label": f"Codex local - account{index}@example.com",
+                "tier": "cockpit_usage_row",
+                "at": (now - timedelta(hours=index)).replace(
+                    tzinfo=client_usage_export.LOCAL_TZ
+                ).isoformat(timespec="seconds"),
+            }
+            for index in range(5)
+        }
+
+        with patch.object(client_usage_export, "API_SERVICE_VERDICT_ARCHIVE_LIMIT", 2):
+            kept = client_usage_export.prune_attribution_verdicts(verdicts, now)
+
+        self.assertEqual(sorted(kept), ["event-0", "event-1"])
+
+    def test_legacy_ledger_without_verdicts_loads_and_keeps_events(self) -> None:
+        client_usage_export.write_json_atomic(
+            client_usage_export.ATTRIBUTION_LEDGER_PATH,
+            {
+                "schema": 1,
+                "updated_at": "2026-07-25T09:00:00+08:00",
+                "events": {"event-1": "Codex local - account@example.com"},
+            },
+        )
+
+        ledger = client_usage_export.load_attribution_ledger()
+        verdicts = client_usage_export.load_attribution_verdicts()
+
+        self.assertEqual(ledger, {"event-1": "Codex local - account@example.com"})
+        self.assertEqual(verdicts, {})
+
+    def test_verdicts_round_trip_beside_the_legacy_event_labels(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        ledger = {"event-1": client_usage_export.API_SERVICE_AGGREGATE_LABEL}
+        verdicts: dict[str, dict[str, str]] = {}
+        client_usage_export.record_attribution_verdict(
+            verdicts,
+            "event-1",
+            "Codex local - account@example.com",
+            "cockpit_usage_row",
+            now,
+        )
+
+        client_usage_export.save_attribution_ledger(ledger, now, verdicts)
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+        document = json.loads(
+            client_usage_export.ATTRIBUTION_LEDGER_PATH.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(document["events"], ledger)
+        self.assertEqual(
+            client_usage_export.load_attribution_verdicts()["event-1"]["label"],
+            "Codex local - account@example.com",
+        )
+
+    def test_saving_without_verdicts_keeps_the_existing_archive(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        client_usage_export.write_json_atomic(
+            client_usage_export.ATTRIBUTION_LEDGER_PATH,
+            {
+                "schema": 1,
+                "updated_at": "2026-07-25T09:00:00+08:00",
+                "events": {"event-1": client_usage_export.API_SERVICE_AGGREGATE_LABEL},
+                "verdicts": {
+                    "event-1": {
+                        "label": "Codex local - account@example.com",
+                        "tier": "cockpit_usage_row",
+                        "at": "2026-07-25T09:00:00+08:00",
+                    }
+                },
+            },
+        )
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+        ledger = client_usage_export.load_attribution_ledger()
+        client_usage_export.ledger_assign(ledger, "event-2", "Codex local - account@example.com")
+
+        client_usage_export.save_attribution_ledger(ledger, now)
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+
+        self.assertEqual(
+            client_usage_export.load_attribution_verdicts()["event-1"]["label"],
+            "Codex local - account@example.com",
+        )
+
+    def test_below_floor_tiers_are_ignored_when_the_archive_is_read(self) -> None:
+        client_usage_export.write_json_atomic(
+            client_usage_export.ATTRIBUTION_LEDGER_PATH,
+            {
+                "schema": 1,
+                "events": {},
+                "verdicts": {
+                    "event-1": {
+                        "label": "Codex local - guess@example.com",
+                        "tier": "temporal",
+                        "at": "2026-07-26T09:00:00+08:00",
+                    },
+                    "event-2": {
+                        "label": client_usage_export.API_SERVICE_AGGREGATE_LABEL,
+                        "tier": "cockpit_usage_row",
+                        "at": "2026-07-26T09:00:00+08:00",
+                    },
+                },
+            },
+        )
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+
+        self.assertEqual(client_usage_export.load_attribution_verdicts(), {})
+
+    def test_fuzzy_token_match_decides_the_label_but_is_never_archived(self) -> None:
+        event = self.api_service_event(datetime(2026, 7, 26, 9, 0, 0), 100_000)
+        event_id = client_usage_export.codex_event_id(event)
+        fuzzy_marker = client_usage_export.AccountMarker(
+            when=event.when + timedelta(seconds=12),
+            label="Codex local - fuzzy@example.com",
+            total_tokens=100_400,
+            kind="request",
+        )
+        verdicts: dict[str, dict[str, str]] = {}
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [fuzzy_marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+
+        # The token totals differ, so this is a 30 second guess: it still decides
+        # this run's label, but it must never freeze into the archive.
+        self.assertEqual(list(resolved), ["Codex local - fuzzy@example.com"])
+        self.assertEqual(unresolved, 0)
+        self.assertNotIn(event_id, verdicts)
+        self.assertEqual(verdicts, {})
+        self.assertFalse(client_usage_export._VERDICT_ARCHIVE_DIRTY)
+
+    def test_near_time_turn_anchor_decides_the_label_but_is_never_archived(self) -> None:
+        turn_started_at = datetime(2026, 7, 26, 8, 59, 30)
+        first = self.api_service_event(
+            datetime(2026, 7, 26, 9, 0, 0),
+            1_000,
+            turn_started_at=turn_started_at,
+        )
+        second = self.api_service_event(
+            datetime(2026, 7, 26, 9, 5, 0),
+            2_000,
+            turn_started_at=turn_started_at,
+        )
+        near_time_marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 9, 0, 1),
+            label="Codex local - neartime@example.com",
+            total_tokens=5_000,
+            kind="request",
+        )
+        verdicts: dict[str, dict[str, str]] = {}
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [first, second]},
+                [near_time_marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+
+        # Pure +-2s proximity between differing token totals is not affinity
+        # evidence, so nothing here is archive-grade.
+        self.assertEqual(list(resolved), ["Codex local - neartime@example.com"])
+        self.assertEqual(unresolved, 0)
+        self.assertEqual(verdicts, {})
+
+    def test_nearest_turn_start_affinity_anchor_is_never_archived(self) -> None:
+        turn_started_at = datetime(2026, 7, 26, 8, 59, 30)
+        event = self.api_service_event(
+            datetime(2026, 7, 26, 9, 0, 0),
+            1_000,
+            turn_started_at=turn_started_at,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=50),
+                request_id="request-stable",
+                source="execution_session_id",
+                session_key="execution-1",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(milliseconds=80),
+                request_id="request-unevidenced",
+                source="execution_session_id",
+                session_key="execution-2",
+                account_id="other-id",
+                label="Codex local - other@example.com",
+                action="cache miss",
+            ),
+        ]
+        verdicts: dict[str, dict[str, str]] = {}
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [],
+                None,
+                affinity_events,
+                verdicts,
+            )
+        )
+
+        # An unconfirmed execution_session_id hit at the turn edge names the
+        # account for this run only; no request_id was confirmed, so it stays
+        # out of the archive.
+        self.assertEqual(list(resolved), ["Codex local - plus@example.com"])
+        self.assertEqual(unresolved, 0)
+        self.assertEqual(verdicts, {})
+
+    def test_only_the_directly_matched_event_of_a_turn_is_archived(self) -> None:
+        turn_started_at = datetime(2026, 7, 26, 8, 59, 30)
+        matched = self.api_service_event(
+            datetime(2026, 7, 26, 9, 0, 0),
+            1_000,
+            turn_started_at=turn_started_at,
+        )
+        inherited = self.api_service_event(
+            datetime(2026, 7, 26, 9, 5, 0),
+            2_000,
+            turn_started_at=turn_started_at,
+        )
+        matched_id = client_usage_export.codex_event_id(matched)
+        inherited_id = client_usage_export.codex_event_id(inherited)
+        marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 26, 9, 0, 1),
+            label="Codex local - turn@example.com",
+            total_tokens=1_000,
+            kind="request",
+        )
+        verdicts: dict[str, dict[str, str]] = {}
+
+        resolved, _session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [matched, inherited]},
+                [marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+
+        # Both events land on the account this run, but the second one only
+        # inherited the turn anchor, so one match may not archive the whole turn.
+        self.assertEqual(list(resolved), ["Codex local - turn@example.com"])
+        self.assertEqual(unresolved, 0)
+        self.assertEqual(list(verdicts), [matched_id])
+        self.assertNotIn(inherited_id, verdicts)
+        self.assertEqual(verdicts[matched_id]["tier"], "cockpit_usage_row")
+
+    def test_concurrent_saves_merge_instead_of_dropping_verdicts(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        ledger = {"event-a": client_usage_export.API_SERVICE_AGGREGATE_LABEL}
+        first_run: dict[str, dict[str, str]] = {}
+        client_usage_export.record_attribution_verdict(
+            first_run,
+            "event-a",
+            "Codex local - first@example.com",
+            "cockpit_usage_row",
+            now,
+        )
+        client_usage_export.save_attribution_ledger(ledger, now, first_run)
+
+        # A second exporter that loaded the ledger before the first one saved.
+        client_usage_export._VERDICT_ARCHIVE_WRITES = set()
+        second_run: dict[str, dict[str, str]] = {}
+        client_usage_export.record_attribution_verdict(
+            second_run,
+            "event-b",
+            "Codex local - second@example.com",
+            "cockpit_usage_row",
+            now,
+        )
+        client_usage_export.save_attribution_ledger(ledger, now, second_run)
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+
+        archived = client_usage_export.load_attribution_verdicts()
+        self.assertEqual(sorted(archived), ["event-a", "event-b"])
+        self.assertEqual(archived["event-a"]["label"], "Codex local - first@example.com")
+        self.assertEqual(archived["event-b"]["label"], "Codex local - second@example.com")
+
+    def test_shrink_guard_keeps_the_events_on_disk_but_still_saves_verdicts(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        stored_events = {
+            f"event-{index}": "Codex local - account@example.com"
+            for index in range(1_500)
+        }
+        client_usage_export.write_json_atomic(
+            client_usage_export.ATTRIBUTION_LEDGER_PATH,
+            {"schema": 1, "events": stored_events},
+        )
+        client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+        verdicts: dict[str, dict[str, str]] = {}
+        client_usage_export.record_attribution_verdict(
+            verdicts,
+            "event-0",
+            "Codex local - archived@example.com",
+            "cockpit_usage_row",
+            now,
+        )
+        client_usage_export._LEDGER_DIRTY = True
+
+        client_usage_export.save_attribution_ledger({"event-0": "x"}, now, verdicts)
+        document = json.loads(
+            client_usage_export.ATTRIBUTION_LEDGER_PATH.read_text(encoding="utf-8")
+        )
+
+        # The truncated event map is refused, but the archive still lands.
+        self.assertEqual(len(document["events"]), 1_500)
+        self.assertEqual(
+            document["verdicts"]["event-0"]["label"],
+            "Codex local - archived@example.com",
+        )
+        self.assertTrue(client_usage_export._LEDGER_DIRTY)
+        self.assertFalse(client_usage_export._VERDICT_ARCHIVE_DIRTY)
+
+    def test_today_and_the_window_stats_read_the_same_archive(self) -> None:
+        now = datetime(2026, 7, 26, 12, 0, 0)
+        archived_label = "Codex local - archived@example.com"
+
+        def codex_event() -> client_usage_export.UsageEvent:
+            return client_usage_export.UsageEvent(
+                when=now - timedelta(hours=1),
+                model="gpt-test",
+                input_tokens=900,
+                cached_tokens=0,
+                output_tokens=100,
+                session_id="session-window",
+                account_at=now - timedelta(hours=1, seconds=30),
+            )
+
+        stale_marker = client_usage_export.AccountMarker(
+            when=now - timedelta(hours=6),
+            label="Codex local - other@example.com",
+            total_tokens=999_999,
+            kind="request",
+        )
+        event_id = client_usage_export.codex_event_id(codex_event())
+        verdicts = {
+            event_id: {
+                "label": archived_label,
+                "tier": "cockpit_usage_row",
+                "at": (now - timedelta(hours=1))
+                .replace(tzinfo=client_usage_export.LOCAL_TZ)
+                .isoformat(timespec="seconds"),
+            }
+        }
+        aligned = ({}, {}, {}, {}, {}, {}, {})
+
+        def build(passed_verdicts: dict[str, dict[str, str]] | None):
+            with (
+                patch.object(client_usage_export, "cockpit_codex_quota_by_label", return_value={}),
+                patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+                patch.object(client_usage_export, "scan_cockpit_codex_accounts", return_value={}),
+                patch.object(client_usage_export, "scan_cockpit_codex_quota_windows", return_value=aligned),
+                patch.object(client_usage_export, "all_cockpit_codex_account_labels", return_value=[]),
+                patch.object(client_usage_export, "codex_speed_history", return_value=[]),
+                patch.object(client_usage_export, "scan_cockpit_codex_switch_markers", return_value=[]),
+                patch.object(
+                    client_usage_export,
+                    "scan_cockpit_codex_account_markers",
+                    return_value=[stale_marker],
+                ),
+                patch.object(
+                    client_usage_export,
+                    "scan_all_codex_events",
+                    side_effect=lambda *_args, **_kwargs: [codex_event()],
+                ),
+            ):
+                return client_usage_export.build_codex_window_stats(
+                    Path("."),
+                    Path("."),
+                    now,
+                    {},
+                    "",
+                    passed_verdicts,
+                )
+
+        today, _session_accounts, today_unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [codex_event()]},
+                [stale_marker],
+                None,
+                None,
+                verdicts,
+            )
+        )
+        with_archive = build(verdicts)
+        without_archive = build(None)
+
+        # Today's totals and every window that contains today must agree, or the
+        # user sees a day that is larger than the 7 day window holding it.
+        self.assertEqual(list(today), [archived_label])
+        self.assertEqual(today_unresolved, 0)
+        self.assertEqual(with_archive[archived_label]["window_5h"]["tokens"], 1_000)
+        self.assertEqual(with_archive[archived_label]["window_7d"]["tokens"], 1_000)
+        self.assertEqual(
+            with_archive[archived_label]["window_rolling_7d"]["tokens"],
+            1_000,
+        )
+        self.assertNotIn(archived_label, without_archive)
+        self.assertEqual(
+            without_archive[client_usage_export.API_SERVICE_AGGREGATE_LABEL][
+                "window_7d"
+            ]["tokens"],
+            1_000,
+        )
+        # Windows read the archive but never write to it.
+        self.assertEqual(list(verdicts), [event_id])
+        self.assertEqual(verdicts[event_id]["label"], archived_label)
 
 
 class SingleInstanceTests(unittest.TestCase):

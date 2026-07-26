@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -15,6 +16,7 @@ import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -35,6 +37,53 @@ if IS_FROZEN:
     APP_DIR.mkdir(parents=True, exist_ok=True)
 else:
     APP_DIR = SOURCE_DIR
+
+
+def _setup_monitor_logger() -> logging.Logger:
+    logger = logging.getLogger("tokenpulse.monitor")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if any(isinstance(handler, RotatingFileHandler) for handler in logger.handlers):
+        return logger
+    try:
+        handler = RotatingFileHandler(
+            APP_DIR / "tokenpulse-monitor.log",
+            maxBytes=2 * 1024 * 1024,
+            backupCount=1,
+            encoding="utf-8",
+            delay=True,
+        )
+    except OSError:
+        return logger
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+LOGGER = _setup_monitor_logger()
+
+
+def _log_tk_callback_exception(exc_type, exc_value, exc_traceback) -> None:
+    # Windowed builds have no visible stderr; the log file is the only trace.
+    LOGGER.error("Tk callback exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def _log_thread_exception(args) -> None:
+    if args.exc_type is not SystemExit:
+        LOGGER.error(
+            "unhandled thread exception: %s",
+            getattr(args.thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+    threading.__excepthook__(args)
+
+
+def _log_unhandled_exception(exc_type, exc_value, exc_traceback) -> None:
+    if exc_type not in (SystemExit, KeyboardInterrupt):
+        LOGGER.error("unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
 ENV_FILES = list(
     dict.fromkeys(
         [
@@ -215,6 +264,8 @@ if Path(CLIENT_USAGE_PYTHON).name.lower() == "pythonw.exe":
     if console_python.exists():
         CLIENT_USAGE_PYTHON = str(console_python)
 USAGE_HISTORY_JSON = Path(os.environ.get("SUB2API_USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
+USAGE_HISTORY_BACKUP_MIN_INTERVAL_SECONDS = 3600
+_USAGE_HISTORY_CACHE: tuple[tuple[str, int, int], dict[str, Any]] | None = None
 ACCOUNT_TYPE_HISTORY_JSON = Path(
     os.environ.get("TOKEN_PULSE_ACCOUNT_TYPE_HISTORY_JSON")
     or APP_DIR / "client_usage_account_types.json"
@@ -1397,19 +1448,90 @@ def trend_chart_day_label(date_value: str, index: int, total: int = 7) -> str:
         return "-"
 
 
+def _usage_history_backup_path() -> Path:
+    return USAGE_HISTORY_JSON.with_name(USAGE_HISTORY_JSON.name + ".bak")
+
+
+def _usage_history_signature() -> tuple[str, int, int] | None:
+    try:
+        stat_result = USAGE_HISTORY_JSON.stat()
+    except OSError:
+        return None
+    return (str(USAGE_HISTORY_JSON), stat_result.st_mtime_ns, stat_result.st_size)
+
+
+def _cache_usage_history(data: dict[str, Any], signature: tuple[str, int, int] | None) -> None:
+    global _USAGE_HISTORY_CACHE
+    if signature is not None:
+        _USAGE_HISTORY_CACHE = (signature, data)
+
+
+def _restore_usage_history_from_backup() -> dict[str, Any] | None:
+    """Read the .bak copy and rewrite the main history file from it."""
+    backup_path = _usage_history_backup_path()
+    if not backup_path.exists():
+        return None
+    try:
+        data = json.loads(backup_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        LOGGER.warning("usage history backup unusable: %s", backup_path)
+        return None
+    if not isinstance(data, dict):
+        LOGGER.warning("usage history backup unusable: %s", backup_path)
+        return None
+    LOGGER.warning("usage history restored from backup: %s", backup_path)
+    try:
+        write_json_atomic(USAGE_HISTORY_JSON, data)
+    except Exception:
+        LOGGER.warning("usage history restore write failed: %s", USAGE_HISTORY_JSON)
+    return data
+
+
+def _recover_corrupt_usage_history() -> dict[str, Any] | None:
+    """Quarantine an unparseable history file and fall back to the backup copy."""
+    timestamp = datetime.now(CN_TZ).strftime("%Y%m%d-%H%M%S-%f")
+    corrupt_path = USAGE_HISTORY_JSON.with_name(
+        f"{USAGE_HISTORY_JSON.stem}.corrupt-{timestamp}.json"
+    )
+    try:
+        os.replace(USAGE_HISTORY_JSON, corrupt_path)
+        LOGGER.warning("usage history corrupted; quarantined to %s", corrupt_path)
+    except OSError:
+        LOGGER.warning("usage history corrupted; quarantine failed for %s", USAGE_HISTORY_JSON)
+    return _restore_usage_history_from_backup()
+
+
 def load_usage_history() -> dict[str, Any]:
     if not USAGE_HISTORY_JSON.exists():
+        # A quarantined-but-not-rewritten file leaves a missing-file window;
+        # fall back to the backup so history is not rebuilt from today only.
+        restored = _restore_usage_history_from_backup()
+        if isinstance(restored, dict):
+            return restored
+        return {"schema": 1, "days": {}}
+    signature = _usage_history_signature()
+    cached = _USAGE_HISTORY_CACHE
+    if signature is not None and cached is not None and cached[0] == signature:
+        return cached[1]
+    try:
+        raw_text = USAGE_HISTORY_JSON.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        LOGGER.warning("usage history read failed: %s", USAGE_HISTORY_JSON)
         return {"schema": 1, "days": {}}
     try:
-        data = json.loads(USAGE_HISTORY_JSON.read_text(encoding="utf-8", errors="ignore"))
-    except Exception:
-        return {"schema": 1, "days": {}}
+        data = json.loads(raw_text)
+    except ValueError:
+        data = _recover_corrupt_usage_history()
+        if not isinstance(data, dict):
+            return {"schema": 1, "days": {}}
+        signature = _usage_history_signature()
     if not isinstance(data, dict):
         return {"schema": 1, "days": {}}
     days = data.get("days")
     if not isinstance(days, dict):
         data["days"] = {}
     data["schema"] = int(data.get("schema") or 1)
+    _cache_usage_history(data, signature)
     return data
 
 
@@ -1654,12 +1776,27 @@ def summarize_trend_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _refresh_usage_history_backup(history: dict[str, Any]) -> None:
+    backup_path = _usage_history_backup_path()
+    try:
+        backup_age = time.time() - backup_path.stat().st_mtime
+    except OSError:
+        backup_age = float("inf")
+    if backup_age < USAGE_HISTORY_BACKUP_MIN_INTERVAL_SECONDS:
+        return
+    try:
+        write_json_atomic(backup_path, history)
+    except Exception:
+        LOGGER.warning("usage history backup write failed: %s", backup_path)
+
+
 def update_usage_history(state: "MonitorState") -> dict[str, Any]:
-    history = load_usage_history()
-    days = history.setdefault("days", {})
-    if not isinstance(days, dict):
-        days = {}
-        history["days"] = days
+    # Copy the shared cached layers before mutating: readers on other threads
+    # may still hold the object returned by load_usage_history().
+    history = dict(load_usage_history())
+    days = history.get("days")
+    days = dict(days) if isinstance(days, dict) else {}
+    history["days"] = days
 
     key = today_key()
     existing = days.get(key) if isinstance(days.get(key), dict) else {}
@@ -1735,7 +1872,14 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     try:
         write_json_atomic(USAGE_HISTORY_JSON, history)
     except Exception:
-        pass
+        LOGGER.warning("usage history write failed: %s", USAGE_HISTORY_JSON)
+    else:
+        # Invalidate instead of caching (history, new stat): an external
+        # writer replacing the file between os.replace and stat would bind
+        # our in-memory copy to its signature and later clobber its data.
+        global _USAGE_HISTORY_CACHE
+        _USAGE_HISTORY_CACHE = None
+        _refresh_usage_history_backup(history)
     return summarize_usage_history(history)
 
 
@@ -5174,6 +5318,10 @@ class FloatingMonitorApp:
 
         # ── root window ──
         self.root = tk.Tk()
+        # Log instead of crashing/printing: windowed builds have no stderr.
+        self.root.report_callback_exception = _log_tk_callback_exception
+        threading.excepthook = _log_thread_exception
+        sys.excepthook = _log_unhandled_exception
         self.root.title("Token Monitor")
         self.root.overrideredirect(True)
         self.root.geometry(format_tk_geometry(self.WIDTH, self.HEIGHT, 1120, 70))
@@ -5919,8 +6067,13 @@ class FloatingMonitorApp:
     def _window_position_guard(self) -> None:
         if self.closed:
             return
-        self._ensure_window_recoverable()
-        self.root.after(WINDOW_POSITION_GUARD_MS, self._window_position_guard)
+        try:
+            self._ensure_window_recoverable()
+        finally:
+            try:
+                self.root.after(WINDOW_POSITION_GUARD_MS, self._window_position_guard)
+            except tk.TclError:
+                pass
 
     def _clear_ignore_configure(self) -> None:
         self._ignore_configure = False
@@ -8494,52 +8647,69 @@ class FloatingMonitorApp:
     def _fade_in(self) -> None:
         if self.closed:
             return
-        if self._fade_alpha < self.WINDOW_ALPHA:
-            self._fade_alpha = min(self._fade_alpha + 0.06, self.WINDOW_ALPHA)
-            self.root.attributes("-alpha", self._fade_alpha)
-            self.root.after(16, self._fade_in)
-        else:
-            self.root.attributes("-alpha", self.WINDOW_ALPHA)
+        keep_fading = False
+        try:
+            if self._fade_alpha < self.WINDOW_ALPHA:
+                self._fade_alpha = min(self._fade_alpha + 0.06, self.WINDOW_ALPHA)
+                keep_fading = True
+                self.root.attributes("-alpha", self._fade_alpha)
+            else:
+                self.root.attributes("-alpha", self.WINDOW_ALPHA)
+        finally:
+            if keep_fading:
+                try:
+                    self.root.after(16, self._fade_in)
+                except tk.TclError:
+                    pass
 
     def _pulse_tick(self) -> None:
         if self.closed:
             self._pulse_tick_scheduled = False
             return
-        flow_level, _recent_tokens = self._token_flow_snapshot()
-        has_recent_samples = bool(getattr(self, "_token_flow_samples", []))
-        meter_level = float(getattr(self, "_token_flow_meter_display_level", 0.0))
-        meter_animating = self._main_tab == "stats" and meter_level > 0.01
-        badge_animating = self._main_tab == "stats" and (
-            self._token_delta_badge_visual()[2]
-            or self._cost_delta_badge_visual()[2]
-        )
-        if (
-            not self._loading
-            and flow_level <= 0.01
-            and not meter_animating
-            and not badge_animating
-            and not has_recent_samples
-        ):
-            if self._main_tab != "stats":
-                self._token_flow_meter_display_level = 0.0
-            self._pulse_tick_scheduled = False
-            self._draw()
-            return
-        self._pulse_phase += 0.32
-        redrawn = False
-        if not self._loading:
-            redrawn = any((
-                self._redraw_token_flow_trace(),
-                self._redraw_token_flow_meter(),
-                self._redraw_token_delta_badge(),
-                self._redraw_cost_delta_badge(),
-            ))
-        if redrawn:
-            interval_ms = TOKEN_FLOW_ANIMATION_INTERVAL_MS
-        else:
-            self._draw()
-            interval_ms = TOKEN_FLOW_FULL_REDRAW_INTERVAL_MS
-        self.root.after(interval_ms, self._pulse_tick)
+        # Reschedule from finally so a drawing exception cannot kill the loop.
+        interval_ms: int | None = TOKEN_FLOW_FULL_REDRAW_INTERVAL_MS
+        try:
+            flow_level, _recent_tokens = self._token_flow_snapshot()
+            has_recent_samples = bool(getattr(self, "_token_flow_samples", []))
+            meter_level = float(getattr(self, "_token_flow_meter_display_level", 0.0))
+            meter_animating = self._main_tab == "stats" and meter_level > 0.01
+            badge_animating = self._main_tab == "stats" and (
+                self._token_delta_badge_visual()[2]
+                or self._cost_delta_badge_visual()[2]
+            )
+            if (
+                not self._loading
+                and flow_level <= 0.01
+                and not meter_animating
+                and not badge_animating
+                and not has_recent_samples
+            ):
+                if self._main_tab != "stats":
+                    self._token_flow_meter_display_level = 0.0
+                self._pulse_tick_scheduled = False
+                interval_ms = None
+                self._draw()
+                return
+            self._pulse_phase += 0.32
+            redrawn = False
+            if not self._loading:
+                redrawn = any((
+                    self._redraw_token_flow_trace(),
+                    self._redraw_token_flow_meter(),
+                    self._redraw_token_delta_badge(),
+                    self._redraw_cost_delta_badge(),
+                ))
+            if redrawn:
+                interval_ms = TOKEN_FLOW_ANIMATION_INTERVAL_MS
+            else:
+                self._draw()
+                interval_ms = TOKEN_FLOW_FULL_REDRAW_INTERVAL_MS
+        finally:
+            if interval_ms is not None:
+                try:
+                    self.root.after(interval_ms, self._pulse_tick)
+                except tk.TclError:
+                    self._pulse_tick_scheduled = False
 
     def _ensure_pulse_animation(self) -> None:
         if (
@@ -9184,8 +9354,13 @@ class FloatingMonitorApp:
     def _schedule_live_active_refresh(self) -> None:
         if self.closed:
             return
-        self._refresh_live_active_async()
-        self.root.after(REFRESH_SECONDS * 1000, self._schedule_live_active_refresh)
+        try:
+            self._refresh_live_active_async()
+        finally:
+            try:
+                self.root.after(REFRESH_SECONDS * 1000, self._schedule_live_active_refresh)
+            except tk.TclError:
+                pass
 
     def _capture_auth_switch(self, *, refresh_active: bool = True) -> bool:
         identity, _source_path, changed_at = current_codex_auth_snapshot()
@@ -9200,11 +9375,16 @@ class FloatingMonitorApp:
     def _schedule_auth_switch_refresh(self) -> None:
         if self.closed:
             return
-        self._capture_auth_switch()
-        self.root.after(
-            AUTH_SWITCH_WATCH_INTERVAL_MS,
-            self._schedule_auth_switch_refresh,
-        )
+        try:
+            self._capture_auth_switch()
+        finally:
+            try:
+                self.root.after(
+                    AUTH_SWITCH_WATCH_INTERVAL_MS,
+                    self._schedule_auth_switch_refresh,
+                )
+            except tk.TclError:
+                pass
 
     @staticmethod
     def _checkpoint_json_value(value: Any) -> Any:
@@ -9629,19 +9809,52 @@ class FloatingMonitorApp:
             return False
         return True
 
+    def _prefetch_live_cockpit_markers(self) -> list[dict[str, Any]] | None:
+        # Reading the Cockpit request log is the single heaviest step of live
+        # usage recording, so it happens on the worker thread. Returning None
+        # means "not prefetched": the Tk thread then falls back to the inline
+        # read and behaves exactly as it did before.
+        try:
+            state = self.state
+            client_usage = (
+                state.client_usage
+                if state is not None and isinstance(state.client_usage, dict)
+                else {}
+            )
+            current_label = _current_codex_account_label()
+            api_service_current = (
+                is_local_api_service_provider_name(current_label)
+                if current_label
+                else bool(client_usage.get("api_service_routed"))
+            )
+            if not api_service_current:
+                return None
+            return _load_live_cockpit_markers(
+                COCKPIT_REQUEST_LOG_DB,
+                datetime.now(timezone.utc),
+            )
+        except Exception:
+            return None
+
     def _refresh_live_usage_async(self) -> bool:
         if not self._live_usage_lock.acquire(blocking=False):
             return False
 
         def _worker() -> None:
+            markers: list[dict[str, Any]] | None = None
             try:
                 events = self._live_usage_watcher.poll_events()
                 changed = self._live_usage_watcher.token_count_changed
             except Exception:
                 events = []
                 changed = False
+            if events:
+                markers = self._prefetch_live_cockpit_markers()
             try:
-                self.root.after(0, lambda: self._apply_live_usage_change(changed, events))
+                self.root.after(
+                    0,
+                    lambda: self._apply_live_usage_change(changed, events, markers),
+                )
             except tk.TclError:
                 self._live_usage_lock.release()
 
@@ -9825,6 +10038,7 @@ class FloatingMonitorApp:
         *,
         allow_historical: bool = False,
         animate: bool = True,
+        cockpit_markers: list[dict[str, Any]] | None = None,
     ) -> bool:
         if self.state is None:
             return False
@@ -9916,11 +10130,12 @@ class FloatingMonitorApp:
             if current_label
             else bool(client_usage.get("api_service_routed"))
         )
-        cockpit_markers = (
-            _load_live_cockpit_markers(COCKPIT_REQUEST_LOG_DB, now_utc)
-            if api_service_current
-            else []
-        )
+        if not api_service_current:
+            cockpit_markers = []
+        elif cockpit_markers is None:
+            # No worker-thread prefetch available (direct caller, or the
+            # prefetch saw a different route): keep the original inline read.
+            cockpit_markers = _load_live_cockpit_markers(COCKPIT_REQUEST_LOG_DB, now_utc)
         latest_event = max(recent, key=lambda item: item["when"])
         existing_latest_request = (
             dict(self.state.latest_request)
@@ -10240,11 +10455,19 @@ class FloatingMonitorApp:
             and latest >= overlay_latest - timedelta(seconds=1)
         )
 
-    def _apply_live_usage_change(self, changed: bool, events: list[dict[str, Any]]) -> None:
+    def _apply_live_usage_change(
+        self,
+        changed: bool,
+        events: list[dict[str, Any]],
+        cockpit_markers: list[dict[str, Any]] | None = None,
+    ) -> None:
         try:
             if self.closed:
                 return
-            recorded = self._record_live_usage_events(events)
+            recorded = self._record_live_usage_events(
+                events,
+                cockpit_markers=cockpit_markers,
+            )
             watcher = getattr(self, "_live_usage_watcher", None)
             needs_reconcile = (changed and not recorded) or (
                 isinstance(watcher, CodexUsageFileWatcher)
@@ -10299,9 +10522,17 @@ class FloatingMonitorApp:
     def _schedule_live_usage_refresh(self) -> None:
         if self.closed:
             return
-        self._refresh_live_usage_async()
-        interval_ms = self._live_usage_watcher.next_poll_interval_ms()
-        self.root.after(interval_ms, self._schedule_live_usage_refresh)
+        try:
+            self._refresh_live_usage_async()
+        finally:
+            try:
+                interval_ms = self._live_usage_watcher.next_poll_interval_ms()
+            except Exception:
+                interval_ms = LIVE_USAGE_WATCH_COLD_INTERVAL_MS
+            try:
+                self.root.after(interval_ms, self._schedule_live_usage_refresh)
+            except tk.TclError:
+                pass
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  DATA REFRESH
@@ -10322,12 +10553,27 @@ class FloatingMonitorApp:
 
         def _worker() -> None:
             err = None
+            cost_history: dict[str, Any] | None = None
             try:
                 result = self.client.fetch_state()
             except Exception as exc:
                 result = None
                 err = f"\u8bf7\u6c42\u5931\u8d25: {exc}"
-            self.root.after(0, lambda: self._apply_state(result, err))
+            if result is not None:
+                # The history rewrite reads and re-serialises the whole file;
+                # it only touches the freshly fetched state, so it belongs on
+                # this thread rather than on Tk's.
+                try:
+                    cost_history = update_usage_history(result)
+                except Exception:
+                    try:
+                        cost_history = summarize_usage_history(load_usage_history())
+                    except Exception:
+                        cost_history = None
+            self.root.after(
+                0,
+                lambda: self._apply_state(result, err, cost_history=cost_history),
+            )
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
@@ -10492,7 +10738,13 @@ class FloatingMonitorApp:
         result.latest_account_name = str(self.state.latest_account_name or "")
         return True
 
-    def _apply_state(self, result: MonitorState | None, error: str | None = None) -> None:
+    def _apply_state(
+        self,
+        result: MonitorState | None,
+        error: str | None = None,
+        *,
+        cost_history: dict[str, Any] | None = None,
+    ) -> None:
         refresh_pending = self._refresh_pending
         attribution_inflight = getattr(
             self,
@@ -10513,10 +10765,14 @@ class FloatingMonitorApp:
             pass
         self.error = error or (result.error if result is not None else None)
         if result is not None:
-            try:
-                result.cost_history = update_usage_history(result)
-            except Exception:
-                result.cost_history = summarize_usage_history(load_usage_history())
+            if cost_history is not None:
+                # Already computed on the refresh worker thread.
+                result.cost_history = cost_history
+            else:
+                try:
+                    result.cost_history = update_usage_history(result)
+                except Exception:
+                    result.cost_history = summarize_usage_history(load_usage_history())
             if fresh_result:
                 client_usage = result.client_usage if isinstance(result.client_usage, dict) else {}
                 scan_status = (
@@ -10617,33 +10873,33 @@ class FloatingMonitorApp:
                 "window_minutes",
                 "window_days",
             )
-            quota_signature_fields = (
+            # Boundary fields only: percent/utilization jitter still reaches
+            # the redraw below, but must not trigger the heavyweight exporter
+            # rebuild every snapshot.
+            quota_boundary_signature_fields = (
                 "quota_available",
-                "quota_stale",
                 "quota_unlimited",
-                "remaining_percent",
-                "utilization",
                 "resets_at",
                 "window_minutes",
             )
-            quota_changed = False
+            quota_boundary_changed = False
 
-            def quota_signature(window: dict[str, Any]) -> tuple[Any, ...]:
-                return tuple(window.get(field) for field in quota_signature_fields)
+            def quota_boundary_signature(window: dict[str, Any]) -> tuple[Any, ...]:
+                return tuple(window.get(field) for field in quota_boundary_signature_fields)
 
             def merge_account_windows(row: dict[str, Any], quota: dict[str, Any]) -> None:
-                nonlocal quota_changed
+                nonlocal quota_boundary_changed
                 for window_key in ("window_5h", "window_7d", "window_cycle"):
                     quota_window = quota.get(window_key)
                     if not isinstance(quota_window, dict):
                         continue
                     current = dict(row.get(window_key) or {})
-                    previous_signature = quota_signature(current)
+                    previous_signature = quota_boundary_signature(current)
                     for field in quota_fields:
                         current.pop(field, None)
                     current.update(quota_window)
-                    if quota_signature(current) != previous_signature:
-                        quota_changed = True
+                    if quota_boundary_signature(current) != previous_signature:
+                        quota_boundary_changed = True
                     row[window_key] = current
 
             for provider, quota in accounts.items():
@@ -10658,7 +10914,7 @@ class FloatingMonitorApp:
                     if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key:
                         merge_account_windows(row, quota)
                         break
-            if quota_changed:
+            if quota_boundary_changed:
                 # The live watcher updates today's totals, but a changed quota
                 # boundary also requires rebuilding the 5h/7d Token and cost.
                 self._full_refresh_requested = True
@@ -10790,40 +11046,46 @@ class FloatingMonitorApp:
     def _schedule_auto_refresh(self) -> None:
         if self.closed:
             return
-        self._handle_day_rollover()
-        catchup_lock = getattr(self, "_live_catchup_lock", None)
-        refresh_in_progress = (
-            self._refresh_lock.locked()
-            or self._quota_refresh_lock.locked()
-            or bool(catchup_lock is not None and catchup_lock.locked())
-        )
-        logs_busy = self._codex_logs_busy()
-        attribution_started = False
-        if not refresh_in_progress and self._attribution_refresh_due(logs_busy):
-            revision = getattr(self, "_last_cockpit_usage_revision", None)
-            self._attribution_refresh_inflight_revision = revision
-            if self.refresh_async(force=True):
-                attribution_started = True
-                now = time.monotonic()
-                self._last_attribution_refresh_at = now
-                self._last_forced_full_refresh_at = now
-            else:
-                self._attribution_refresh_inflight_revision = None
-        quota_started = (
-            False
-            if refresh_in_progress or attribution_started
-            else self._refresh_quota_async()
-        )
-        if not refresh_in_progress and not quota_started:
-            full_refresh_due = self._full_usage_refresh_due()
-            last_attempt = float(getattr(self, "_last_forced_full_refresh_at", float("-inf")))
-            reconcile_live_overlay = bool(getattr(self, "_live_usage_overlay", None)) and not logs_busy and (
-                time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
+        # Reschedule from finally so one bad tick cannot kill the loop.
+        try:
+            self._handle_day_rollover()
+            catchup_lock = getattr(self, "_live_catchup_lock", None)
+            refresh_in_progress = (
+                self._refresh_lock.locked()
+                or self._quota_refresh_lock.locked()
+                or bool(catchup_lock is not None and catchup_lock.locked())
             )
-            if not attribution_started and (full_refresh_due or reconcile_live_overlay):
-                if self.refresh_async():
-                    self._last_forced_full_refresh_at = time.monotonic()
-        self.root.after(REFRESH_SECONDS * 1000, self._schedule_auto_refresh)
+            logs_busy = self._codex_logs_busy()
+            attribution_started = False
+            if not refresh_in_progress and self._attribution_refresh_due(logs_busy):
+                revision = getattr(self, "_last_cockpit_usage_revision", None)
+                self._attribution_refresh_inflight_revision = revision
+                if self.refresh_async(force=True):
+                    attribution_started = True
+                    now = time.monotonic()
+                    self._last_attribution_refresh_at = now
+                    self._last_forced_full_refresh_at = now
+                else:
+                    self._attribution_refresh_inflight_revision = None
+            quota_started = (
+                False
+                if refresh_in_progress or attribution_started
+                else self._refresh_quota_async()
+            )
+            if not refresh_in_progress and not quota_started:
+                full_refresh_due = self._full_usage_refresh_due()
+                last_attempt = float(getattr(self, "_last_forced_full_refresh_at", float("-inf")))
+                reconcile_live_overlay = bool(getattr(self, "_live_usage_overlay", None)) and not logs_busy and (
+                    time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
+                )
+                if not attribution_started and (full_refresh_due or reconcile_live_overlay):
+                    if self.refresh_async():
+                        self._last_forced_full_refresh_at = time.monotonic()
+        finally:
+            try:
+                self.root.after(REFRESH_SECONDS * 1000, self._schedule_auto_refresh)
+            except tk.TclError:
+                pass
 
     def _schedule_midnight_refresh(self) -> None:
         if self.closed:
@@ -10832,14 +11094,21 @@ class FloatingMonitorApp:
         next_day = now.date() + timedelta(days=1)
         next_midnight = datetime.combine(next_day, datetime.min.time(), tzinfo=CN_TZ)
         delay_ms = max(1000, int((next_midnight - now).total_seconds() * 1000) + 5000)
-        self.root.after(delay_ms, self._on_midnight_refresh)
+        try:
+            self.root.after(delay_ms, self._on_midnight_refresh)
+        except tk.TclError:
+            pass
 
     def _on_midnight_refresh(self) -> None:
         if self.closed:
             return
-        self._handle_day_rollover(force=True)
-        self.refresh_async()
-        self._schedule_midnight_refresh()
+        try:
+            self._handle_day_rollover(force=True)
+            # force=True: fall back to _refresh_pending when a refresh is in
+            # flight, so the midnight rollover is never silently dropped.
+            self.refresh_async(force=True)
+        finally:
+            self._schedule_midnight_refresh()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     #  LIFECYCLE
