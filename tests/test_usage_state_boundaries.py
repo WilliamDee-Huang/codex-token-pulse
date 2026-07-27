@@ -2442,6 +2442,137 @@ class LatestRequestFallbackTests(unittest.TestCase):
         )
         self.assertEqual(unresolved, 0)
 
+    def test_cockpit_request_snapshots_use_final_usage_once(self) -> None:
+        turn_started_at = datetime(2026, 7, 27, 9, 40, 26)
+        events = [
+            client_usage_export.UsageEvent(
+                when=turn_started_at + timedelta(seconds=offset),
+                model="gpt-test",
+                input_tokens=tokens - 100,
+                cached_tokens=0,
+                output_tokens=100,
+                session_id="snapshot-session",
+                account_at=turn_started_at,
+            )
+            for offset, tokens in ((10, 40_000), (20, 90_000), (30, 150_000))
+        ]
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=30),
+                request_id="long-request",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit",
+            )
+            for event in events
+        ]
+        marker = client_usage_export.AccountMarker(
+            when=events[-1].when + timedelta(seconds=1),
+            label="Codex local - plus@example.com",
+            model="gpt-test",
+            total_tokens=150_000,
+            input_tokens=149_900,
+            output_tokens=100,
+            request_id="long-request",
+            account_id="plus-id",
+            latency_ms=31_000,
+        )
+
+        reconciled = client_usage_export.reconcile_cockpit_request_usage_events(
+            events,
+            [marker],
+            affinity_events,
+        )
+
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0].total_tokens, 150_000)
+        self.assertEqual(reconciled[0].request_key, "long-request")
+        self.assertEqual(reconciled[0].route, "cockpit-request")
+        self.assertEqual(reconciled[0].session_id, "snapshot-session")
+
+    def test_cockpit_inflight_request_keeps_only_latest_snapshot(self) -> None:
+        turn_started_at = datetime(2026, 7, 27, 10, 0, 0)
+        events = [
+            client_usage_export.UsageEvent(
+                when=turn_started_at + timedelta(seconds=offset),
+                model="gpt-test",
+                input_tokens=tokens,
+                cached_tokens=0,
+                output_tokens=0,
+                session_id="live-snapshot-session",
+                account_at=turn_started_at,
+            )
+            for offset, tokens in ((10, 50_000), (20, 80_000), (30, 120_000))
+        ]
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=25),
+                request_id="inflight-request",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit",
+            )
+            for event in events
+        ]
+
+        reconciled = client_usage_export.reconcile_cockpit_request_usage_events(
+            events,
+            [],
+            affinity_events,
+        )
+
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0].total_tokens, 120_000)
+        self.assertEqual(reconciled[0].request_key, "inflight-request")
+        self.assertEqual(reconciled[0].route, "cockpit-live")
+
+    def test_cockpit_snapshot_reconciliation_keeps_request_rotation_and_direct_events(self) -> None:
+        turn_started_at = datetime(2026, 7, 27, 10, 10, 0)
+        routed = [
+            client_usage_export.UsageEvent(
+                when=turn_started_at + timedelta(seconds=offset),
+                model="gpt-test",
+                input_tokens=tokens,
+                cached_tokens=0,
+                output_tokens=0,
+                session_id="rotating-snapshot-session",
+                account_at=turn_started_at,
+            )
+            for offset, tokens in ((10, 50_000), (20, 80_000), (30, 60_000), (40, 90_000))
+        ]
+        direct = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=25),
+            model="gpt-test",
+            input_tokens=12_345,
+            cached_tokens=0,
+            output_tokens=0,
+            session_id="official-direct-session",
+            account_at=turn_started_at + timedelta(seconds=1),
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=25),
+                request_id="request-a" if position < 2 else "request-b",
+                account_id="plus-id",
+                label="Codex local - plus@example.com",
+                action="cache hit",
+            )
+            for position, event in enumerate(routed)
+        ]
+
+        reconciled = client_usage_export.reconcile_cockpit_request_usage_events(
+            [*routed, direct],
+            [],
+            affinity_events,
+        )
+
+        self.assertEqual(len(reconciled), 3)
+        self.assertEqual(
+            sorted(event.total_tokens for event in reconciled),
+            [12_345, 80_000, 90_000],
+        )
+        self.assertIn(direct, reconciled)
+
     def test_api_service_temporal_affinity_allows_request_id_rotation_on_same_account(self) -> None:
         turn_started_at = datetime(2026, 7, 23, 11, 4, 48, 703000)
         events = [
@@ -10012,6 +10143,7 @@ class AttributionVerdictArchiveTests(unittest.TestCase):
         )
         client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
         client_usage_export._LEDGER_DIRTY = False
+        client_usage_export._LEDGER_WRITES = set()
         client_usage_export._VERDICT_ARCHIVE_DIRTY = False
         client_usage_export._VERDICT_ARCHIVE_WRITES = set()
 
@@ -10019,6 +10151,7 @@ class AttributionVerdictArchiveTests(unittest.TestCase):
         client_usage_export.ATTRIBUTION_LEDGER_PATH = self.original_ledger_path
         client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
         client_usage_export._LEDGER_DIRTY = False
+        client_usage_export._LEDGER_WRITES = set()
         client_usage_export._VERDICT_ARCHIVE_DIRTY = False
         client_usage_export._VERDICT_ARCHIVE_WRITES = set()
         self.temporary_directory.cleanup()
@@ -10308,6 +10441,46 @@ class AttributionVerdictArchiveTests(unittest.TestCase):
         self.assertEqual(ledger, {"event-1": "Codex local - account@example.com"})
         self.assertEqual(verdicts, {})
 
+    def test_corrupt_ledger_restores_events_and_verdicts_for_later_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "attribution.json"
+            backup_path = ledger_path.with_name(f"{ledger_path.name}.bak")
+            document = {
+                "schema": 1,
+                "events": {"event-1": "Codex local - account@example.com"},
+                "verdicts": {
+                    "event-1": {
+                        "label": "Codex local - account@example.com",
+                        "tier": "cockpit_usage_row",
+                        "at": "2026-07-26T09:00:00+08:00",
+                    }
+                },
+            }
+            client_usage_export.write_json_atomic(backup_path, document)
+            ledger_path.write_text("{broken", encoding="utf-8")
+
+            with patch.object(
+                client_usage_export,
+                "ATTRIBUTION_LEDGER_PATH",
+                ledger_path,
+            ):
+                client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+                ledger = client_usage_export.load_attribution_ledger()
+                verdicts = client_usage_export.load_attribution_verdicts()
+                client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+                reloaded = client_usage_export.load_attribution_verdicts()
+                primary_recreated = ledger_path.exists()
+
+            client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+
+        self.assertEqual(
+            ledger,
+            {"event-1": "Codex local - account@example.com"},
+        )
+        self.assertEqual(verdicts, document["verdicts"])
+        self.assertEqual(reloaded, document["verdicts"])
+        self.assertTrue(primary_recreated)
+
     def test_verdicts_round_trip_beside_the_legacy_event_labels(self) -> None:
         now = datetime(2026, 7, 26, 9, 0, 0)
         ledger = {"event-1": client_usage_export.API_SERVICE_AGGREGATE_LABEL}
@@ -10566,6 +10739,82 @@ class AttributionVerdictArchiveTests(unittest.TestCase):
         self.assertEqual(sorted(archived), ["event-a", "event-b"])
         self.assertEqual(archived["event-a"]["label"], "Codex local - first@example.com")
         self.assertEqual(archived["event-b"]["label"], "Codex local - second@example.com")
+
+    def test_stale_writer_preserves_event_labels_saved_by_another_exporter(self) -> None:
+        now = datetime(2026, 7, 26, 9, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "attribution.json"
+            base = {"base": "Codex local - base@example.com"}
+            client_usage_export.write_json_atomic(
+                ledger_path,
+                {"schema": 1, "events": base},
+            )
+            with patch.object(
+                client_usage_export,
+                "ATTRIBUTION_LEDGER_PATH",
+                ledger_path,
+            ):
+                client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+                first = {**base, "event-a": "Codex local - first@example.com"}
+                client_usage_export._LEDGER_DIRTY = True
+                client_usage_export._LEDGER_WRITES = {"event-a"}
+                client_usage_export.save_attribution_ledger(first, now)
+
+                second = {**base, "event-b": "Codex local - second@example.com"}
+                client_usage_export._LEDGER_DIRTY = True
+                client_usage_export._LEDGER_WRITES = {"event-b"}
+                client_usage_export.save_attribution_ledger(second, now)
+                saved = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+            client_usage_export._ATTRIBUTION_LEDGER_DOCUMENT_CACHE = None
+            client_usage_export._LEDGER_DIRTY = False
+            client_usage_export._LEDGER_WRITES = set()
+
+        self.assertEqual(
+            saved["events"],
+            {
+                **base,
+                "event-a": "Codex local - first@example.com",
+                "event-b": "Codex local - second@example.com",
+            },
+        )
+
+    def test_attribution_ledger_lock_serializes_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "attribution.json"
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_entered = threading.Event()
+
+            def first_writer() -> None:
+                with client_usage_export.attribution_ledger_write_lock(
+                    ledger_path,
+                    timeout_seconds=2,
+                ):
+                    first_entered.set()
+                    release_first.wait(2)
+
+            def second_writer() -> None:
+                first_entered.wait(2)
+                with client_usage_export.attribution_ledger_write_lock(
+                    ledger_path,
+                    timeout_seconds=2,
+                ):
+                    second_entered.set()
+
+            first = threading.Thread(target=first_writer)
+            second = threading.Thread(target=second_writer)
+            first.start()
+            self.assertTrue(first_entered.wait(2))
+            second.start()
+            self.assertFalse(second_entered.wait(0.1))
+            release_first.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_entered.is_set())
 
     def test_shrink_guard_keeps_the_events_on_disk_but_still_saves_verdicts(self) -> None:
         now = datetime(2026, 7, 26, 9, 0, 0)

@@ -10,10 +10,12 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import zlib
 from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -100,7 +102,7 @@ if not logger.handlers:
 
 
 def recover_corrupt_json(path: Path) -> Any:
-    """Quarantine a corrupt json file and fall back to its .bak copy."""
+    """Quarantine corrupt json and atomically restore its .bak copy."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     corrupt = path.with_name(f"{path.name}.corrupt-{stamp}")
     try:
@@ -114,6 +116,12 @@ def recover_corrupt_json(path: Path) -> Any:
     except Exception:
         logger.warning("no usable backup for corrupt json %s", path.name)
         return None
+    try:
+        write_json_atomic(path, data)
+    except OSError as exc:
+        logger.warning("failed to restore %s from %s: %s", path.name, backup.name, exc)
+    else:
+        logger.warning("restored %s from %s", path.name, backup.name)
     logger.warning("recovered %s from %s", path.name, backup.name)
     return data
 
@@ -173,6 +181,76 @@ CODEX_EVENT_CACHE_PATH = Path(
     os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE")
     or APP_DIR / "client_usage_codex_event_cache.json"
 )
+
+
+@contextmanager
+def attribution_ledger_write_lock(
+    path: Path = ATTRIBUTION_LEDGER_PATH,
+    timeout_seconds: float = 30.0,
+):
+    """Serialize ledger writers across monitor/exporter processes."""
+    timeout_seconds = max(0.1, float(timeout_seconds))
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+        kernel32.ReleaseMutex.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        identity = os.path.normcase(str(path.resolve(strict=False))).encode("utf-8")
+        mutex_name = f"Local\\TokenPulseLedger-{hashlib.sha256(identity).hexdigest()}"
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "failed to create ledger mutex")
+        acquired = False
+        try:
+            result = kernel32.WaitForSingleObject(
+                handle,
+                min(0xFFFFFFFE, int(timeout_seconds * 1000)),
+            )
+            if result not in {0x00000000, 0x00000080}:
+                if result == 0x00000102:
+                    raise TimeoutError("timed out waiting for attribution ledger lock")
+                raise OSError(ctypes.get_last_error(), "failed to acquire ledger mutex")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    import fcntl
+
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for attribution ledger lock")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 CODEX_EVENT_CACHE_SCHEMA = 2
 CODEX_EVENT_CACHE_HASH_BYTES = max(
     1024,
@@ -2372,6 +2450,7 @@ def legacy_codex_event_id(event: UsageEvent) -> str:
 
 
 _LEDGER_DIRTY = False
+_LEDGER_WRITES: set[str] = set()
 _VERDICT_ARCHIVE_DIRTY = False
 # Event ids this run decided from live evidence. They win over the copy on disk
 # when the archive is merged at save time; every other key keeps whatever a
@@ -2384,6 +2463,7 @@ def ledger_assign(ledger: dict[str, str], event_id: str, label: str) -> None:
     if ledger.get(event_id) != label:
         ledger[event_id] = label
         _LEDGER_DIRTY = True
+        _LEDGER_WRITES.add(event_id)
 
 
 def ledger_label_for_event(
@@ -2765,18 +2845,36 @@ _ATTRIBUTION_LEDGER_DOCUMENT_CACHE: tuple[tuple[Any, ...], dict[str, Any]] | Non
 
 
 def attribution_ledger_document(refresh: bool = False) -> dict[str, Any]:
-    """Parse the ledger file once per run; it carries both events and verdicts."""
+    """Parse a stable ledger snapshot; it carries both events and verdicts."""
     global _ATTRIBUTION_LEDGER_DOCUMENT_CACHE
-    try:
-        stat = ATTRIBUTION_LEDGER_PATH.stat()
-        stamp: tuple[Any, ...] = (str(ATTRIBUTION_LEDGER_PATH), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        stamp = (str(ATTRIBUTION_LEDGER_PATH),)
-    cached = _ATTRIBUTION_LEDGER_DOCUMENT_CACHE
-    if not refresh and cached is not None and cached[0] == stamp:
-        return cached[1]
-    document = load_json_object(ATTRIBUTION_LEDGER_PATH)
-    _ATTRIBUTION_LEDGER_DOCUMENT_CACHE = (stamp, document)
+
+    def current_stamp() -> tuple[Any, ...]:
+        try:
+            stat = ATTRIBUTION_LEDGER_PATH.stat()
+            return (
+                str(ATTRIBUTION_LEDGER_PATH),
+                stat.st_mtime_ns,
+                stat.st_size,
+            )
+        except OSError:
+            return (str(ATTRIBUTION_LEDGER_PATH),)
+
+    for attempt in range(2):
+        before = current_stamp()
+        cached = _ATTRIBUTION_LEDGER_DOCUMENT_CACHE
+        if not refresh and attempt == 0 and cached is not None and cached[0] == before:
+            return cached[1]
+        document = load_json_object(ATTRIBUTION_LEDGER_PATH)
+        after = current_stamp()
+        if before == after:
+            _ATTRIBUTION_LEDGER_DOCUMENT_CACHE = (after, document)
+            return document
+        # Recovery or a concurrent atomic replace changed the file while it was
+        # read. Re-open it once so cached data and its signature describe the
+        # same generation.
+        refresh = True
+
+    _ATTRIBUTION_LEDGER_DOCUMENT_CACHE = (after, document)
     return document
 
 
@@ -2944,65 +3042,86 @@ def save_attribution_ledger(
     now: datetime,
     verdicts: dict[str, dict[str, str]] | None = None,
 ) -> None:
-    global _LEDGER_DIRTY, _VERDICT_ARCHIVE_DIRTY, _VERDICT_ARCHIVE_WRITES
-    verdicts_dirty = verdicts is not None and _VERDICT_ARCHIVE_DIRTY
-    if not _LEDGER_DIRTY and not verdicts_dirty:
-        logger.debug("attribution ledger unchanged; skipped save")
-        return
-    # This re-stats the file, so it carries whatever a concurrent exporter wrote
-    # after this run loaded the ledger.
-    document = attribution_ledger_document()
-    previous_events = document.get("events")
-    events = dict(ledger)
-    refused_events = (
-        isinstance(previous_events, dict)
-        and len(previous_events) > 1000
-        and len(ledger) < len(previous_events) * 0.5
-    )
-    if refused_events:
-        logger.warning(
-            "refused attribution ledger save: %d entries would replace %d",
-            len(ledger),
-            len(previous_events),
-        )
-        if not verdicts_dirty:
-            return
-        # The shrink guard only protects the event labels. The archive still has
-        # to land, otherwise a truncated scan would also cost every verdict this
-        # run decided, and those accounts would decay back to unattributed.
-        events = {
-            str(key): str(value or "").strip()
-            for key, value in previous_events.items()
-            if key and str(value or "").strip()
-        }
-    if verdicts is None:
-        stored = document.get("verdicts")
-        archived = stored if isinstance(stored, dict) else {}
-    else:
-        archived = prune_attribution_verdicts(
-            merge_attribution_verdicts(
-                document.get("verdicts"),
-                verdicts,
-                _VERDICT_ARCHIVE_WRITES,
-            ),
-            now,
-        )
-    payload: dict[str, Any] = {
-        "schema": 1,
-        "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-        "events": dict(sorted(events.items())),
-    }
-    if archived:
-        payload["verdicts"] = dict(sorted(archived.items()))
-    saved = write_json_object(ATTRIBUTION_LEDGER_PATH, payload)
-    if saved:
-        if not refused_events:
-            _LEDGER_DIRTY = False
-        if verdicts is not None:
-            _VERDICT_ARCHIVE_DIRTY = False
-            _VERDICT_ARCHIVE_WRITES = set()
-        attribution_ledger_document(refresh=True)
-        refresh_json_backup(ATTRIBUTION_LEDGER_PATH)
+    global _LEDGER_DIRTY, _LEDGER_WRITES
+    global _VERDICT_ARCHIVE_DIRTY, _VERDICT_ARCHIVE_WRITES
+    try:
+        with attribution_ledger_write_lock(ATTRIBUTION_LEDGER_PATH):
+            verdicts_dirty = verdicts is not None and _VERDICT_ARCHIVE_DIRTY
+            if not _LEDGER_DIRTY and not verdicts_dirty:
+                logger.debug("attribution ledger unchanged; skipped save")
+                return
+            # Re-read while holding the process lock so no writer can replace
+            # the generation between this merge and the atomic save.
+            document = attribution_ledger_document(refresh=True)
+            previous_events = document.get("events")
+            refused_events = (
+                isinstance(previous_events, dict)
+                and len(previous_events) > 1000
+                and len(ledger) < len(previous_events) * 0.5
+            )
+            if refused_events:
+                logger.warning(
+                    "refused attribution ledger save: %d entries would replace %d",
+                    len(ledger),
+                    len(previous_events),
+                )
+                if not verdicts_dirty:
+                    return
+                # The shrink guard only protects the event labels. The archive
+                # still has to land, otherwise a truncated scan would also cost
+                # every verdict this run decided.
+                events = {
+                    str(key): str(value or "").strip()
+                    for key, value in previous_events.items()
+                    if key and str(value or "").strip()
+                }
+            elif isinstance(previous_events, dict):
+                # Preserve keys written by another exporter after this process
+                # loaded its snapshot. Only labels changed by this run may
+                # override the copy currently on disk.
+                events = {
+                    str(key): str(value or "").strip()
+                    for key, value in previous_events.items()
+                    if key and str(value or "").strip()
+                }
+                for key, value in ledger.items():
+                    if key not in events or key in _LEDGER_WRITES:
+                        events[str(key)] = str(value or "").strip()
+            else:
+                events = dict(ledger)
+            if verdicts is None:
+                stored = document.get("verdicts")
+                archived = stored if isinstance(stored, dict) else {}
+            else:
+                archived = prune_attribution_verdicts(
+                    merge_attribution_verdicts(
+                        document.get("verdicts"),
+                        verdicts,
+                        _VERDICT_ARCHIVE_WRITES,
+                    ),
+                    now,
+                )
+            payload: dict[str, Any] = {
+                "schema": 1,
+                "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+                "events": dict(sorted(events.items())),
+            }
+            if archived:
+                payload["verdicts"] = dict(sorted(archived.items()))
+            saved = write_json_object(ATTRIBUTION_LEDGER_PATH, payload)
+            if not saved:
+                return
+            if not refused_events:
+                _LEDGER_DIRTY = False
+                _LEDGER_WRITES = set()
+            if verdicts is not None:
+                _VERDICT_ARCHIVE_DIRTY = False
+                _VERDICT_ARCHIVE_WRITES = set()
+            attribution_ledger_document(refresh=True)
+            refresh_json_backup(ATTRIBUTION_LEDGER_PATH)
+    except (OSError, TimeoutError) as exc:
+        # Keep the dirty flags set so a later exporter retries the save.
+        logger.warning("attribution ledger save deferred: %s", exc)
 
 
 def all_cockpit_codex_account_labels(home: Path) -> list[str]:
@@ -5475,6 +5594,175 @@ def account_marker_request_start(marker: AccountMarker) -> datetime | None:
     return marker.when - timedelta(milliseconds=latency_ms)
 
 
+def reconcile_cockpit_request_usage_events(
+    events: list[UsageEvent],
+    account_markers: list[AccountMarker],
+    affinity_events: list[CockpitAffinityEvent],
+) -> list[UsageEvent]:
+    """Collapse Cockpit's live token snapshots to one usage event per request.
+
+    Newer Codex clients can emit a token_count row after every tool result while
+    keeping the same Cockpit request_id. Those rows are cumulative snapshots of
+    one request, not separately billable requests. Cockpit affinity lines sit
+    within a few milliseconds of each snapshot, so request_id is a stronger
+    boundary than a Codex turn (which can contain either one or many requests).
+
+    Completed requests use Cockpit's final usage row. For an in-flight request,
+    only its latest snapshot is retained so the UI remains live without adding
+    every earlier snapshot again. Events with no unambiguous Cockpit affinity
+    evidence are left untouched for official-direct and non-Cockpit users.
+    """
+    if not events or not affinity_events:
+        return events
+
+    timed_events = sorted(
+        (
+            account_marker_epoch(event.when),
+            api_service_event_turn_key(event),
+            event,
+        )
+        for event in events
+    )
+    event_epochs = [item[0] for item in timed_events]
+    stable_items = [
+        item
+        for item in affinity_events
+        if item.request_id
+        and item.action in COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS
+        and usable_cockpit_account_label(item.label)
+        and normalize_cockpit_auth_id(item.account_id)
+    ]
+    if not stable_items:
+        return events
+
+    request_ids_by_event: dict[int, set[str]] = {}
+    match_seconds = COCKPIT_AFFINITY_EVENT_MATCH_SECONDS
+    ambiguity_seconds = COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS
+    for item in stable_items:
+        center = account_marker_epoch(item.when)
+        left = bisect_left(event_epochs, center - match_seconds)
+        right = bisect_right(event_epochs, center + match_seconds)
+        closest_by_turn: dict[str, tuple[float, UsageEvent]] = {}
+        for event_epoch, turn_key, event in timed_events[left:right]:
+            effective_turn = turn_key or f"event:{id(event)}"
+            delta = abs(event_epoch - center)
+            previous = closest_by_turn.get(effective_turn)
+            if previous is None or delta < previous[0]:
+                closest_by_turn[effective_turn] = (delta, event)
+        claims = sorted(
+            (delta, turn_key, event)
+            for turn_key, (delta, event) in closest_by_turn.items()
+        )
+        if not claims:
+            continue
+        if len(claims) > 1 and claims[1][0] - claims[0][0] < ambiguity_seconds:
+            continue
+        owner = claims[0][2]
+        request_ids_by_event.setdefault(id(owner), set()).add(item.request_id)
+
+    request_id_by_event = {
+        event_id: next(iter(request_ids))
+        for event_id, request_ids in request_ids_by_event.items()
+        if len(request_ids) == 1
+    }
+    events_by_request: dict[str, list[UsageEvent]] = {}
+    for event in events:
+        request_id = request_id_by_event.get(id(event), "")
+        if request_id:
+            events_by_request.setdefault(request_id, []).append(event)
+    if not events_by_request:
+        return events
+
+    final_by_request: dict[str, AccountMarker] = {}
+    for marker in account_markers:
+        if marker.kind != "request" or not marker.request_id:
+            continue
+        previous = final_by_request.get(marker.request_id)
+        if previous is None or marker.when > previous.when:
+            final_by_request[marker.request_id] = marker
+
+    consumed_event_ids: set[int] = set()
+    replacements: list[UsageEvent] = []
+    for request_id, request_events in events_by_request.items():
+        ordered = sorted(request_events, key=lambda event: event.when)
+        marker = final_by_request.get(request_id)
+        if marker is None:
+            if len(ordered) == 1:
+                continue
+            latest = ordered[-1]
+            replacements.append(
+                replace(
+                    latest,
+                    request_key=request_id,
+                    route=latest.route or "cockpit-live",
+                )
+            )
+            consumed_event_ids.update(id(event) for event in ordered)
+            continue
+
+        turn_keys = {
+            turn_key
+            for event in ordered
+            if (turn_key := api_service_event_turn_key(event))
+        }
+        exact_candidates = [
+            event
+            for event in events
+            if id(event) not in consumed_event_ids
+            and event.total_tokens == marker.total_tokens
+            and account_marker_covers_event_time(marker, event.when)
+            and (
+                not turn_keys
+                or api_service_event_turn_key(event) in turn_keys
+            )
+        ]
+        source_from_exact = bool(exact_candidates)
+        source = (
+            min(
+                exact_candidates,
+                key=lambda event: abs((marker.when - event.when).total_seconds()),
+            )
+            if exact_candidates
+            else ordered[-1]
+        )
+        cached_tokens = min(
+            max(0, marker.cached_tokens),
+            max(0, marker.total_tokens),
+        )
+        output_tokens = min(
+            max(0, marker.output_tokens),
+            max(0, marker.total_tokens - cached_tokens),
+        )
+        reported_input = max(0, marker.input_tokens)
+        if reported_input <= 0:
+            reported_input = max(0, marker.total_tokens - output_tokens)
+        reported_input = max(reported_input, cached_tokens)
+        replacements.append(
+            replace(
+                source,
+                when=source.when if source_from_exact else marker.when,
+                model=marker.model or source.model,
+                input_tokens=max(0, reported_input - cached_tokens),
+                cached_tokens=cached_tokens,
+                output_tokens=output_tokens,
+                request_key=request_id,
+                route="cockpit-request",
+                request_at=account_marker_request_start(marker) or source.request_at,
+            )
+        )
+        consumed_event_ids.update(id(event) for event in ordered)
+        consumed_event_ids.update(id(event) for event in exact_candidates)
+
+    reconciled = [
+        event
+        for event in events
+        if id(event) not in consumed_event_ids
+    ]
+    reconciled.extend(replacements)
+    reconciled.sort(key=lambda event: event.when)
+    return reconciled
+
+
 def cockpit_request_start_turn_anchors(
     records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]],
     account_markers: list[AccountMarker],
@@ -6845,6 +7133,11 @@ def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
         end,
         account_markers,
     )
+    events = reconcile_cockpit_request_usage_events(
+        events,
+        account_markers,
+        affinity_events,
+    )
     markers = scan_cockpit_codex_switch_markers(home, start, end)
     markers.extend(load_account_timeline())
     markers.extend(account_markers)
@@ -7085,6 +7378,11 @@ def build_historical_usage_rows(
         affinity_scan_start,
         end,
         account_markers,
+    )
+    events = reconcile_cockpit_request_usage_events(
+        events,
+        account_markers,
+        affinity_events,
     )
     markers = scan_cockpit_codex_switch_markers(home, start, end)
     markers.extend(load_account_timeline())
@@ -7858,7 +8156,23 @@ def build_codex_window_stats(
         events_7d = scan_all_codex_events(home, sessions_root, window_7d_start, window_end)
         apply_codex_speed_fallback(events_7d, speed_markers)
         markers_7d = scan_cockpit_codex_switch_markers(home, window_7d_start, window_end)
-        markers_7d.extend(scan_cockpit_codex_account_markers(home, window_7d_start, window_end))
+        account_markers_7d = scan_cockpit_codex_account_markers(
+            home,
+            window_7d_start,
+            window_end,
+        )
+        affinity_events_7d = scan_cockpit_codex_affinity_events(
+            home,
+            window_7d_start,
+            window_end,
+            account_markers_7d,
+        )
+        events_7d = reconcile_cockpit_request_usage_events(
+            events_7d,
+            account_markers_7d,
+            affinity_events_7d,
+        )
+        markers_7d.extend(account_markers_7d)
         buckets_7d = attribute_codex_events_to_account_markers(
             events_7d,
             markers_7d,
@@ -7872,7 +8186,23 @@ def build_codex_window_stats(
         events_5h = scan_all_codex_events(home, sessions_root, window_5h_start, window_end)
         apply_codex_speed_fallback(events_5h, speed_markers)
         markers_5h = scan_cockpit_codex_switch_markers(home, window_5h_start, window_end)
-        markers_5h.extend(scan_cockpit_codex_account_markers(home, window_5h_start, window_end))
+        account_markers_5h = scan_cockpit_codex_account_markers(
+            home,
+            window_5h_start,
+            window_end,
+        )
+        affinity_events_5h = scan_cockpit_codex_affinity_events(
+            home,
+            window_5h_start,
+            window_end,
+            account_markers_5h,
+        )
+        events_5h = reconcile_cockpit_request_usage_events(
+            events_5h,
+            account_markers_5h,
+            affinity_events_5h,
+        )
+        markers_5h.extend(account_markers_5h)
         buckets_5h = attribute_codex_events_to_account_markers(
             events_5h,
             markers_5h,
@@ -7887,9 +8217,23 @@ def build_codex_window_stats(
             events_30d = scan_all_codex_events(home, sessions_root, window_30d_start, window_end)
             apply_codex_speed_fallback(events_30d, speed_markers_30d)
             markers_30d = scan_cockpit_codex_switch_markers(home, window_30d_start, window_end)
-            markers_30d.extend(
-                scan_cockpit_codex_account_markers(home, window_30d_start, window_end)
+            account_markers_30d = scan_cockpit_codex_account_markers(
+                home,
+                window_30d_start,
+                window_end,
             )
+            affinity_events_30d = scan_cockpit_codex_affinity_events(
+                home,
+                window_30d_start,
+                window_end,
+                account_markers_30d,
+            )
+            events_30d = reconcile_cockpit_request_usage_events(
+                events_30d,
+                account_markers_30d,
+                affinity_events_30d,
+            )
+            markers_30d.extend(account_markers_30d)
             buckets_30d = attribute_codex_events_to_account_markers(
                 events_30d,
                 markers_30d,
@@ -7912,6 +8256,17 @@ def build_codex_window_stats(
             home,
             window_30d_start,
             window_end,
+        )
+        affinity_events_30d = scan_cockpit_codex_affinity_events(
+            home,
+            window_30d_start,
+            window_end,
+            account_markers_30d,
+        )
+        events_30d = reconcile_cockpit_request_usage_events(
+            events_30d,
+            account_markers_30d,
+            affinity_events_30d,
         )
         markers_30d = switch_markers_30d + account_markers_30d
         attributed_30d = attribute_codex_events_by_account(
@@ -7972,6 +8327,17 @@ def build_codex_window_stats(
         apply_codex_speed_fallback(aligned_events, speed_markers)
         aligned_markers = scan_cockpit_codex_switch_markers(home, aligned_scan_start, window_end)
         aligned_account_markers = scan_cockpit_codex_account_markers(home, aligned_scan_start, window_end)
+        aligned_affinity_events = scan_cockpit_codex_affinity_events(
+            home,
+            aligned_scan_start,
+            window_end,
+            aligned_account_markers,
+        )
+        aligned_events = reconcile_cockpit_request_usage_events(
+            aligned_events,
+            aligned_account_markers,
+            aligned_affinity_events,
+        )
         aligned_markers.extend(aligned_account_markers)
         attributed_events = attribute_codex_events_by_account(
             aligned_events,
@@ -8148,6 +8514,11 @@ def build_live_catchup_payload(
         affinity_scan_start,
         through,
         account_markers,
+    )
+    codex_events = reconcile_cockpit_request_usage_events(
+        codex_events,
+        account_markers,
+        affinity_events,
     )
     markers.extend(account_markers)
     raw_attributed = attribute_codex_events_by_account(
@@ -8339,6 +8710,11 @@ def main() -> int:
         affinity_scan_start,
         scan_end,
         account_markers,
+    )
+    codex_events = reconcile_cockpit_request_usage_events(
+        codex_events,
+        account_markers,
+        affinity_events,
     )
     markers.extend(account_markers)
     raw_attributed_events = attribute_codex_events_by_account(
