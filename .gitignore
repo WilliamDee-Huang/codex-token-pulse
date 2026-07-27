@@ -21,3 +21,15 @@ client_usage_codex_event_cache.json
 usage_history.json
 .venv/
 venv/
+client_usage_*.json
+client_usage_*.jsonl
+client_usage_*.jsonl.*
+.usage_history.json.*.tmp
+.client_usage_*.tmp
+*.corrupt-*
+*.bak
+tokenpulse-*.log*
+.codegraph/
+switch-snapshots/
+tauri-app/
+rollback-backup-*.patch

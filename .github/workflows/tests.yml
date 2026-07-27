@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Privacy gate (no real-domain emails in tracked files)
+        shell: python
+        run: |
+          import re
+          import subprocess
+          import sys
+
+          pattern = re.compile(
+              r"[A-Za-z0-9._%+-]+@(?:gmail|icloud|outlook|hotmail|qq)\.com",
+              re.IGNORECASE,
+          )
+          # Third-party Inno Setup translation keeps its upstream translator credit.
+          allowed = {"packaging/languages/ChineseSimplified.isl"}
+          tracked = subprocess.run(
+              ["git", "ls-files"],
+              capture_output=True,
+              text=True,
+              check=True,
+          ).stdout.splitlines()
+          hits = []
+          for name in tracked:
+              if name in allowed:
+                  continue
+              try:
+                  with open(name, "r", encoding="utf-8") as handle:
+                      text = handle.read()
+              except (OSError, UnicodeDecodeError):
+                  continue
+              for match in pattern.finditer(text):
+                  hits.append(f"{name}: {match.group(0)}")
+          if hits:
+              print("Real-domain emails found in tracked files:")
+              print("\n".join(hits))
+              sys.exit(1)
+          print("Privacy gate passed.")
