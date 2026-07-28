@@ -287,7 +287,7 @@ ATTRIBUTION_DIAGNOSTICS_MAX_BYTES = max(
         )
     ),
 )
-LIVE_USAGE_CHECKPOINT_SCHEMA = 2
+LIVE_USAGE_CHECKPOINT_SCHEMA = 3
 LIVE_USAGE_CHECKPOINT_WRITE_SECONDS = max(
     0.25,
     float(os.environ.get("TOKEN_PULSE_LIVE_CHECKPOINT_WRITE_SECONDS", "1")),
@@ -2951,11 +2951,13 @@ def _load_live_cockpit_markers(
             for row in connection.execute("PRAGMA table_info(request_logs)").fetchall()
         }
         latency_ms_sql = "latency_ms" if "latency_ms" in columns else "0"
+        request_id_sql = "request_id" if "request_id" in columns else "''"
         rows = connection.execute(
             f"""
             SELECT timestamp, account_id, email, api_key_label, model_id,
                    total_tokens, input_tokens, cached_tokens, output_tokens,
-                   {latency_ms_sql} AS latency_ms
+                   {latency_ms_sql} AS latency_ms,
+                   {request_id_sql} AS request_id
             FROM request_logs
             WHERE timestamp >= ?
               AND (
@@ -2987,6 +2989,7 @@ def _load_live_cockpit_markers(
         cached,
         output,
         latency_ms,
+        request_id,
     ) in rows:
         label = _cockpit_account_label(account_id, email, api_key_label)
         if not label:
@@ -3015,6 +3018,7 @@ def _load_live_cockpit_markers(
                 "cached_tokens": cached_token_count,
                 "output_tokens": output_token_count,
                 "latency_ms": max(0, int(latency_ms or 0)),
+                "request_id": str(request_id or "").strip(),
             }
         )
     return markers
@@ -3165,6 +3169,37 @@ def _match_live_cockpit_markers(
             continue
         matches[usage_index] = best_marker
     return matches
+
+
+def _same_turn_confirmed_provider(
+    event: dict[str, Any],
+    session: dict[str, Any],
+) -> str:
+    """Return a confirmed provider only when the event is in the session's current turn.
+
+    Codex writes cumulative token snapshots with a new event id for every
+    snapshot.  Once one snapshot has a final Cockpit marker, the confirmed
+    account is safe to reuse for later snapshots in that same turn.  The turn
+    boundary is required so a previous K12 assignment cannot leak forward.
+    """
+    if session.get("provider_confirmed") is not True:
+        return ""
+    provider = _concrete_live_provider(session.get("provider"))
+    if not provider:
+        return ""
+    event_when = event.get("when")
+    if not isinstance(event_when, datetime):
+        return ""
+    turn_started_at = _parse_time(
+        str(session.get("turn_started_at") or session.get("started_at") or "")
+    )
+    if turn_started_at is None or event_when < turn_started_at:
+        return ""
+    event_turn_started_at = event.get("turn_started_at")
+    if isinstance(event_turn_started_at, datetime):
+        if abs((event_turn_started_at - turn_started_at).total_seconds()) > 1:
+            return ""
+    return provider
 
 
 def _match_live_cockpit_marker(
@@ -9230,7 +9265,12 @@ class FloatingMonitorApp:
             started_at = _parse_time(str(session.get(start_key) or ""))
             if session_id and started_at is not None:
                 turn_starts[session_id] = started_at
-        for _event_id, event in pending_items:
+        # Attach the active turn boundary to every retained event, including
+        # events already resolved by an earlier marker scan. Later model calls
+        # need those resolved events as same-turn account anchors.
+        for _event_id, event in records.items():
+            if not isinstance(event, dict):
+                continue
             session_id = str(event.get("session_id") or "")
             turn_started_at = turn_starts.get(session_id)
             event_when = event.get("when")
@@ -9245,6 +9285,31 @@ class FloatingMonitorApp:
             markers,
         )
         anchors_by_turn: dict[tuple[str, datetime], list[tuple[datetime, str]]] = {}
+
+        # A marker is normally matched only once, to the model call whose usage
+        # Cockpit recorded. Other model calls can still belong to the same
+        # Codex turn, so reuse only already-resolved concrete providers from
+        # that current turn.
+        for _event_id, event in records.items():
+            if not isinstance(event, dict) or event.get("attribution_pending"):
+                continue
+            session_id = str(event.get("session_id") or "")
+            turn_started_at = turn_starts.get(session_id)
+            event_when = event.get("when")
+            provider = _concrete_live_provider(event.get("provider"))
+            if (
+                not session_id
+                or turn_started_at is None
+                or not isinstance(event_when, datetime)
+                or event_when < turn_started_at
+                or not provider
+            ):
+                continue
+            anchors_by_turn.setdefault(
+                (session_id, turn_started_at),
+                [],
+            ).append((event_when, provider))
+
         for index, marker in matches.items():
             provider = _concrete_live_provider(marker.get("label"))
             if not provider:
@@ -9266,6 +9331,26 @@ class FloatingMonitorApp:
             ).append((marker_when, provider))
         for anchors in anchors_by_turn.values():
             anchors.sort(key=lambda item: item[0])
+        # Keep the live-session card in sync with the same-turn anchor as
+        # soon as reconciliation finds it.  This affects display only; token
+        # accounting still happens per event below.
+        for session in sessions or []:
+            if not isinstance(session, dict):
+                continue
+            session_id = str(session.get("session_id") or "")
+            turn_started_at = turn_starts.get(session_id)
+            anchors = (
+                anchors_by_turn.get((session_id, turn_started_at), [])
+                if isinstance(turn_started_at, datetime)
+                else []
+            )
+            if not anchors:
+                continue
+            provider = anchors[-1][1]
+            session["provider"] = provider
+            session["provider_confirmed"] = True
+            session["provider_provisional"] = False
+            session["provider_confirmation_source"] = "same_turn_final_anchor"
         changed = False
         latest_event_id = str(getattr(self, "_pending_latest_event_id", "") or "")
         if not latest_event_id and isinstance(self.state.latest_request, dict):
@@ -9273,7 +9358,6 @@ class FloatingMonitorApp:
         for index, (event_id, event) in enumerate(pending_items):
             marker = matches.get(index)
             provider = _concrete_live_provider(marker.get("label")) if marker else ""
-            provider_usage: dict[str, Any] = event
             if not provider:
                 session_id = str(event.get("session_id") or "")
                 turn_started_at = event.get("turn_started_at")
@@ -9292,7 +9376,10 @@ class FloatingMonitorApp:
                 marker.get("model") if marker else event.get("model") or ""
             )
             if marker:
-                provider_usage = dict(marker)
+                marker_request_id = str(marker.get("request_id") or "").strip()
+                if marker_request_id:
+                    event["request_key"] = marker_request_id
+                    event["route"] = "cockpit-request"
             event["provider"] = provider
             if model:
                 event["model"] = model
@@ -9325,11 +9412,10 @@ class FloatingMonitorApp:
                 isinstance(live_overlay, dict)
                 and not event.get("live_provider_overlay_recorded")
             ):
-                provider_usage["cost"] = max(0.0, float(event.get("cost") or 0.0))
                 self._record_live_provider_overlay(
                     live_overlay,
                     provider,
-                    provider_usage,
+                    event,
                     event["when"],
                 )
                 event["live_provider_overlay_recorded"] = True
@@ -9617,15 +9703,18 @@ class FloatingMonitorApp:
                 if not isinstance(when, datetime) or when < through:
                     continue
                 tail_events.append(event)
+
+            for event in tail_events:
+                when = event["when"]
                 raw_input = max(0, int(event.get("input_tokens") or 0))
                 cached = min(raw_input, max(0, int(event.get("cached_tokens") or 0)))
                 output = max(0, int(event.get("output_tokens") or 0))
-                tokens = max(0, int(event.get("total_tokens") or 0))
-                event_cost = max(0.0, float(event.get("cost") or 0.0))
-                target["tokens"] += tokens
-                tail_tokens += tokens
+                token_delta = max(0, int(event.get("total_tokens") or 0))
+                cost_delta = max(0.0, float(event.get("cost") or 0.0))
+                target["tokens"] += token_delta
+                tail_tokens += token_delta
                 target["requests"] += 1
-                target["cost"] += event_cost
+                target["cost"] += cost_delta
                 target["input_tokens"] += max(0, raw_input - cached)
                 target["cached_input_tokens"] += cached
                 target["output_tokens"] += output
@@ -9643,9 +9732,9 @@ class FloatingMonitorApp:
                             "output_tokens": 0,
                         },
                     )
-                    provider["tokens"] = int(provider.get("tokens") or 0) + tokens
+                    provider["tokens"] = int(provider.get("tokens") or 0) + token_delta
                     provider["requests"] = int(provider.get("requests") or 0) + 1
-                    provider["cost"] = float(provider.get("cost") or 0.0) + event_cost
+                    provider["cost"] = float(provider.get("cost") or 0.0) + cost_delta
                     provider["input_tokens"] = int(provider.get("input_tokens") or 0) + max(0, raw_input - cached)
                     provider["cached_input_tokens"] = int(provider.get("cached_input_tokens") or 0) + cached
                     provider["output_tokens"] = int(provider.get("output_tokens") or 0) + output
@@ -9893,6 +9982,12 @@ class FloatingMonitorApp:
                 and str(session.get("usage_event_id") or "") == event_id
             ):
                 provider = _concrete_live_provider(session.get("provider"))
+            elif api_service_current:
+                # Codex emits cumulative token snapshots with a different
+                # event id each time.  A final Cockpit marker confirms the
+                # account for the whole current turn, so keep that account
+                # for later snapshots without carrying it into a new turn.
+                provider = _same_turn_confirmed_provider(event, session)
             model = model or str(session.get("model") or "")
             break
         if not provider and self.state and not api_service_current:
@@ -10044,6 +10139,14 @@ class FloatingMonitorApp:
             return False
         now_utc = datetime.now(timezone.utc)
         today = now_utc.astimezone(CN_TZ).date()
+        historical_date = today
+        if allow_historical and isinstance(self.state.client_usage, dict):
+            try:
+                historical_date = date.fromisoformat(
+                    str(self.state.client_usage.get("date") or today.isoformat())
+                )
+            except ValueError:
+                historical_date = today
         seen_ids = getattr(self, "_live_usage_seen_ids", None)
         if not isinstance(seen_ids, dict):
             seen_ids = {}
@@ -10057,7 +10160,7 @@ class FloatingMonitorApp:
             if age_seconds < -30:
                 continue
             if allow_historical:
-                if when.astimezone(CN_TZ).date() != today:
+                if when.astimezone(CN_TZ).date() != historical_date:
                     continue
             elif age_seconds > 600:
                 continue
@@ -10157,37 +10260,19 @@ class FloatingMonitorApp:
         latest_provider = ""
         latest_model = ""
         for event_index, event in enumerate(recent):
-            tokens = int(event.get("total_tokens") or 0)
-            accepted_tokens += tokens
             event_cost = max(0.0, float(event.get("cost") or 0.0))
-            raw_input = max(0, int(event.get("input_tokens") or 0))
-            cached_input = max(0, int(event.get("cached_tokens") or 0))
-            output = max(0, int(event.get("output_tokens") or 0))
-            overlay["tokens"] += tokens
-            overlay["requests"] += 1
-            overlay["input_tokens"] += max(0, raw_input - cached_input)
-            overlay["cached_input_tokens"] += cached_input
-            overlay["output_tokens"] += output
-            overlay["latest_when"] = max(overlay["latest_when"], event["when"])
-            self._add_live_hourly_delta(overlay, event)
-            if animate:
-                if not hasattr(self, "_token_flow_samples"):
-                    self._token_flow_samples = []
-                # Statistics retain the log timestamp, while the trace starts when
-                # the watcher detects the event. A tiny capped offset keeps events
-                # discovered in the same poll visually distinct at the left edge.
-                visual_offset = min(0.12, event_index * 0.02)
-                self._token_flow_samples.append((sample_clock - visual_offset, tokens))
             provider = _concrete_live_provider(event.get("provider"))
             model = str(event.get("model") or "")
             matched_marker = live_cockpit_matches.get(event_index)
-            provider_usage = event
             record_provider = bool(provider)
             if matched_marker is not None:
                 provider = str(matched_marker.get("label") or "")
                 model = str(matched_marker.get("model") or "")
-                provider_usage = matched_marker
                 record_provider = bool(provider)
+                marker_request_id = str(matched_marker.get("request_id") or "").strip()
+                if marker_request_id:
+                    event["request_key"] = marker_request_id
+                    event["route"] = "cockpit-request"
             context_provider, context_model = ("", "")
             if not provider or not model:
                 context_provider, context_model = self._live_event_request_context(event)
@@ -10244,25 +10329,58 @@ class FloatingMonitorApp:
                 event.pop("attribution_pending", None)
             if event_cost <= 0:
                 event_cost = estimate_live_usage_cost(
-                    provider_usage,
+                    event,
                     model,
                     fallback_cost_per_token=fallback_cost_per_token,
                 )
             event["cost"] = event_cost
-            provider_usage["cost"] = event_cost
-            overlay["cost"] += event_cost
-            accepted_cost += event_cost
-            if record_provider and provider:
-                self._record_live_provider_overlay(
-                    overlay,
-                    provider,
-                    provider_usage,
-                    event["when"],
-                )
             if provider:
                 event["provider"] = provider
             if model:
                 event["model"] = model
+
+            raw_input = max(0, int(event.get("input_tokens") or 0))
+            cached = min(raw_input, max(0, int(event.get("cached_tokens") or 0)))
+            token_delta = max(0, int(event.get("total_tokens") or 0))
+            net_input = max(0, raw_input - cached)
+            output_tokens = max(0, int(event.get("output_tokens") or 0))
+            cost_delta = max(0.0, float(event.get("cost") or 0.0))
+            overlay["tokens"] += token_delta
+            overlay["requests"] += 1
+            overlay["cost"] += cost_delta
+            overlay["input_tokens"] += net_input
+            overlay["cached_input_tokens"] += cached
+            overlay["output_tokens"] += output_tokens
+            overlay["latest_when"] = max(overlay["latest_when"], event["when"])
+            hourly_delta = {
+                "when": event["when"],
+                "total_tokens": token_delta,
+                "cost": cost_delta,
+                "request_delta": 1,
+            }
+            self._add_live_hourly_delta(overlay, hourly_delta)
+
+            accepted_tokens += max(0, token_delta)
+            accepted_cost += max(0.0, cost_delta)
+            if animate and token_delta > 0:
+                if not hasattr(self, "_token_flow_samples"):
+                    self._token_flow_samples = []
+                # Statistics retain the log timestamp, while the trace starts when
+                # the watcher detects the event. A tiny capped offset keeps events
+                # discovered in the same poll visually distinct at the left edge.
+                visual_offset = min(0.12, event_index * 0.02)
+                self._token_flow_samples.append(
+                    (sample_clock - visual_offset, token_delta)
+                )
+
+            if provider and record_provider:
+                self._record_live_provider_overlay(
+                    overlay,
+                    provider,
+                    event,
+                    event["when"],
+                )
+                event["live_provider_overlay_recorded"] = True
             if event is latest_event:
                 latest_provider = provider
                 latest_model = model
@@ -10314,14 +10432,17 @@ class FloatingMonitorApp:
         )
         state.today_account_cost = max(
             float(state.today_account_cost or 0.0),
-            float(overlay.get("base_today_cost") or 0.0) + float(overlay.get("cost") or 0.0),
+            float(overlay.get("base_today_cost") or 0.0)
+            + float(overlay.get("cost") or 0.0),
+        )
+        client_usage = (
+            state.client_usage if isinstance(state.client_usage, dict) else {}
         )
         provider_targets = overlay.get("providers")
         if isinstance(provider_targets, dict):
             raw_providers = (
-                state.client_usage.get("providers")
-                if isinstance(state.client_usage, dict)
-                and isinstance(state.client_usage.get("providers"), list)
+                client_usage.get("providers")
+                if isinstance(client_usage.get("providers"), list)
                 else []
             )
             top_accounts = state.top_accounts if isinstance(state.top_accounts, list) else []

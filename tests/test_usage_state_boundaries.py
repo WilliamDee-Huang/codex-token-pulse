@@ -2442,7 +2442,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
         )
         self.assertEqual(unresolved, 0)
 
-    def test_cockpit_request_snapshots_use_final_usage_once(self) -> None:
+    def test_cockpit_request_preserves_each_last_usage_event(self) -> None:
         turn_started_at = datetime(2026, 7, 27, 9, 40, 26)
         events = [
             client_usage_export.UsageEvent(
@@ -2484,13 +2484,13 @@ class LatestRequestFallbackTests(unittest.TestCase):
             affinity_events,
         )
 
-        self.assertEqual(len(reconciled), 1)
-        self.assertEqual(reconciled[0].total_tokens, 150_000)
-        self.assertEqual(reconciled[0].request_key, "long-request")
-        self.assertEqual(reconciled[0].route, "cockpit-request")
-        self.assertEqual(reconciled[0].session_id, "snapshot-session")
+        self.assertEqual(reconciled, events)
+        self.assertEqual(
+            sum(event.total_tokens for event in reconciled),
+            280_000,
+        )
 
-    def test_cockpit_inflight_request_keeps_only_latest_snapshot(self) -> None:
+    def test_cockpit_inflight_request_preserves_each_model_call(self) -> None:
         turn_started_at = datetime(2026, 7, 27, 10, 0, 0)
         events = [
             client_usage_export.UsageEvent(
@@ -2521,12 +2521,13 @@ class LatestRequestFallbackTests(unittest.TestCase):
             affinity_events,
         )
 
-        self.assertEqual(len(reconciled), 1)
-        self.assertEqual(reconciled[0].total_tokens, 120_000)
-        self.assertEqual(reconciled[0].request_key, "inflight-request")
-        self.assertEqual(reconciled[0].route, "cockpit-live")
+        self.assertEqual(reconciled, events)
+        self.assertEqual(
+            sum(event.total_tokens for event in reconciled),
+            250_000,
+        )
 
-    def test_cockpit_snapshot_reconciliation_keeps_request_rotation_and_direct_events(self) -> None:
+    def test_cockpit_request_rotation_keeps_all_model_calls_and_direct_events(self) -> None:
         turn_started_at = datetime(2026, 7, 27, 10, 10, 0)
         routed = [
             client_usage_export.UsageEvent(
@@ -2566,10 +2567,10 @@ class LatestRequestFallbackTests(unittest.TestCase):
             affinity_events,
         )
 
-        self.assertEqual(len(reconciled), 3)
+        self.assertEqual(len(reconciled), 5)
         self.assertEqual(
             sorted(event.total_tokens for event in reconciled),
-            [12_345, 80_000, 90_000],
+            [12_345, 50_000, 60_000, 80_000, 90_000],
         )
         self.assertIn(direct, reconciled)
 
@@ -5553,6 +5554,77 @@ class CodexEventRowCacheTests(unittest.TestCase):
             self.assertTrue(available)
             self.assertEqual(paths, [session_path.resolve()])
 
+    def test_recent_rollouts_include_archives_and_prefer_live_session_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_root = Path(directory) / ".codex"
+            sessions_root = codex_root / "sessions"
+            now = datetime.now()
+            day_dir = sessions_root / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
+            archived_root = codex_root / "archived_sessions"
+            day_dir.mkdir(parents=True)
+            archived_root.mkdir(parents=True)
+
+            duplicate_id = "019f54a2-9034-7651-a517-89989e6d6b1b"
+            archived_only_id = "019f54a2-9034-7651-a517-89989e6d6b1c"
+            duplicate_name = f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{duplicate_id}.jsonl"
+            live_path = day_dir / duplicate_name
+            archived_duplicate = archived_root / duplicate_name
+            archived_only = archived_root / (
+                f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{archived_only_id}.jsonl"
+            )
+            for path in (live_path, archived_duplicate, archived_only):
+                path.write_text("{}\n", encoding="utf-8")
+
+            session_paths: dict[str, Path] = {}
+            paths = client_usage_export.iter_recent_jsonl(
+                sessions_root,
+                now - timedelta(hours=1),
+                session_paths=session_paths,
+            )
+
+            self.assertEqual(set(paths), {live_path.resolve(), archived_only.resolve()})
+            self.assertEqual(session_paths[duplicate_id], live_path.resolve())
+            self.assertEqual(session_paths[archived_only_id], archived_only.resolve())
+
+    def test_archived_token_event_is_counted_once_when_live_copy_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_root = Path(directory) / ".codex"
+            sessions_root = codex_root / "sessions"
+            archived_root = codex_root / "archived_sessions"
+            now = datetime.now()
+            start = now - timedelta(hours=1)
+            end = now + timedelta(hours=1)
+            event_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+            session_id = "019f54a2-9034-7651-a517-89989e6d6b1d"
+            filename = f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{session_id}.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"id": session_id}},
+                self.token_row(event_at.isoformat(), 50, 50),
+            ]
+            content = "".join(json.dumps(row) + "\n" for row in rows)
+            archived_root.mkdir(parents=True)
+            archived_path = archived_root / filename
+            archived_path.write_text(content, encoding="utf-8")
+
+            archived_events = client_usage_export.scan_codex_events(
+                sessions_root,
+                start,
+                end,
+            )
+            self.assertEqual(len(archived_events), 1)
+            self.assertEqual(archived_events[0].total_tokens, 50)
+
+            live_dir = sessions_root / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
+            live_dir.mkdir(parents=True)
+            (live_dir / filename).write_text(content, encoding="utf-8")
+            deduplicated_events = client_usage_export.scan_codex_events(
+                sessions_root,
+                start,
+                end,
+            )
+            self.assertEqual(len(deduplicated_events), 1)
+            self.assertEqual(deduplicated_events[0].total_tokens, 50)
+
 
 class CodexUsageFileWatcherTests(unittest.TestCase):
     @staticmethod
@@ -7358,7 +7430,10 @@ class LiveUsageOverlayTests(unittest.TestCase):
             "when": event["when"],
             "label": "Codex local - routed@example.com",
             "model": "gpt-test",
-            "total_tokens": 50,
+            # Cockpit's final request row may contain a cumulative/final value;
+            # it identifies the account but must not replace this model call's
+            # own 50-token usage event.
+            "total_tokens": 150,
             "input_tokens": 40,
             "cached_tokens": 20,
             "output_tokens": 10,
@@ -7375,6 +7450,155 @@ class LiveUsageOverlayTests(unittest.TestCase):
         self.assertEqual(provider["cached_input_tokens"], 520)
         self.assertEqual(provider["output_tokens"], 110)
         self.assertEqual(app.state.latest_account_name, "Codex local - routed@example.com")
+
+    def test_same_cockpit_request_keeps_each_model_call(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=0, requests=0)
+        app.state.client_usage["api_service_routed"] = True
+        app._live_usage_overlay = None
+        app._live_usage_seen_ids = {}
+        app._live_usage_event_records = {}
+
+        base = datetime.now(timezone.utc)
+
+        def snapshot(event_id: str, total: int, offset: int) -> dict:
+            return {
+                "event_id": event_id,
+                "when": base + timedelta(seconds=offset),
+                "request_key": "request-1",
+                "route": "cockpit-request",
+                "provider": "Codex local - account@example.com",
+                "total_tokens": total,
+                "input_tokens": total,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "cost": total / 1000,
+            }
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            self.assertTrue(
+                app._record_live_usage_events(
+                    [snapshot("snapshot-100", 100, 1)],
+                    animate=False,
+                    cockpit_markers=[],
+                )
+            )
+            self.assertTrue(
+                app._record_live_usage_events(
+                    [snapshot("snapshot-150", 150, 2)],
+                    animate=False,
+                    cockpit_markers=[],
+                )
+            )
+            self.assertTrue(
+                app._record_live_usage_events(
+                    [snapshot("snapshot-180", 180, 3)],
+                    animate=False,
+                    cockpit_markers=[],
+                )
+            )
+
+        self.assertEqual(app.state.today_tokens, 430)
+        self.assertEqual(app.state.today_requests, 3)
+        provider = app._live_usage_overlay["providers"][
+            "Codex local - account@example.com"
+        ]
+        self.assertEqual(provider["tokens"], 430)
+        self.assertEqual(provider["requests"], 3)
+
+    def test_different_cockpit_requests_remain_separate(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=0, requests=0)
+        app.state.client_usage["api_service_routed"] = True
+        app._live_usage_overlay = None
+        app._live_usage_seen_ids = {}
+        app._live_usage_event_records = {}
+        base = datetime.now(timezone.utc)
+        events = [
+            {
+                "event_id": "request-a-event",
+                "when": base + timedelta(seconds=1),
+                "request_key": "request-a",
+                "route": "cockpit-request",
+                "provider": "Codex local - account@example.com",
+                "total_tokens": 100,
+                "input_tokens": 100,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+            },
+            {
+                "event_id": "request-b-event",
+                "when": base + timedelta(seconds=2),
+                "request_key": "request-b",
+                "route": "cockpit-request",
+                "provider": "Codex local - account@example.com",
+                "total_tokens": 50,
+                "input_tokens": 50,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+            },
+        ]
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            self.assertTrue(
+                app._record_live_usage_events(
+                    events,
+                    animate=False,
+                    cockpit_markers=[],
+                )
+            )
+
+        self.assertEqual(app.state.today_tokens, 150)
+        self.assertEqual(app.state.today_requests, 2)
+
+    def test_repeated_live_event_id_is_still_deduplicated(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=0, requests=0)
+        app.state.client_usage["api_service_routed"] = True
+        app._live_usage_overlay = None
+        app._live_usage_seen_ids = {}
+        app._live_usage_event_records = {}
+        base = datetime.now(timezone.utc)
+
+        def event(total: int, offset: int) -> dict:
+            return {
+                "event_id": "same-live-event",
+                "when": base + timedelta(seconds=offset),
+                "provider": "Codex local - account@example.com",
+                "total_tokens": total,
+                "input_tokens": total,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+            }
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            app._record_live_usage_events(
+                [event(100, 1)],
+                animate=False,
+                cockpit_markers=[],
+            )
+            app._record_live_usage_events(
+                [event(80, 2)],
+                animate=False,
+                cockpit_markers=[],
+            )
+
+        self.assertEqual(app.state.today_tokens, 100)
+        provider = app._live_usage_overlay["providers"][
+            "Codex local - account@example.com"
+        ]
+        self.assertEqual(provider["tokens"], 100)
 
     def test_unconfirmed_api_service_turn_does_not_reuse_old_account_context(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -7406,6 +7630,38 @@ class LiveUsageOverlayTests(unittest.TestCase):
             )
 
         self.assertEqual(provider, "")
+        self.assertEqual(model, "gpt-test")
+
+    def test_confirmed_api_service_turn_reuses_account_for_later_snapshot(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["api_service_routed"] = True
+        turn_started_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "current-session",
+                "provider": "Codex local - final@example.com",
+                "provider_confirmed": True,
+                "usage_event_id": "older-snapshot",
+                "turn_started_at": turn_started_at.isoformat(),
+            }
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - api-service-local",
+        ):
+            provider, model = app._live_event_request_context(
+                {
+                    "event_id": "newer-snapshot",
+                    "session_id": "current-session",
+                    "when": turn_started_at + timedelta(seconds=9),
+                    "model": "gpt-test",
+                }
+            )
+
+        self.assertEqual(provider, "Codex local - final@example.com")
         self.assertEqual(model, "gpt-test")
 
     def test_unconfirmed_live_api_event_is_marked_pending_not_old_account(self) -> None:
@@ -7690,6 +7946,72 @@ class LiveUsageOverlayTests(unittest.TestCase):
         )
         app._apply_live_usage_overlay.assert_called_once_with(app.state)
 
+    def test_later_snapshot_uses_resolved_same_turn_anchor(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        app.state.latest_request = {
+            "event_id": "later",
+            "session_id": "session-1",
+        }
+        app._live_usage_overlay = {"providers": {}}
+        app._apply_live_usage_overlay = MagicMock()
+        base = datetime.now(timezone.utc)
+        anchor = {
+            "event_id": "anchor",
+            "session_id": "session-1",
+            "when": base + timedelta(seconds=1),
+            "turn_started_at": base,
+            "total_tokens": 100,
+            "input_tokens": 90,
+            "cached_tokens": 0,
+            "output_tokens": 10,
+            "provider": "Codex local - final@example.com",
+        }
+        later = {
+            "event_id": "later",
+            "session_id": "session-1",
+            "when": base + timedelta(seconds=8),
+            "turn_started_at": base,
+            "total_tokens": 300,
+            "input_tokens": 290,
+            "cached_tokens": 0,
+            "output_tokens": 10,
+            "cost": 0.2,
+            "attribution_pending": True,
+        }
+        app._live_usage_event_records = {
+            "anchor": anchor,
+            "later": later,
+        }
+        marker = {
+            "when": anchor["when"],
+            "label": "Codex local - final@example.com",
+            "model": "gpt-test",
+            "total_tokens": anchor["total_tokens"],
+            "input_tokens": anchor["input_tokens"],
+            "cached_tokens": anchor["cached_tokens"],
+            "output_tokens": anchor["output_tokens"],
+        }
+
+        changed = app._reconcile_pending_live_events_with_markers(
+            [marker],
+            [
+                {
+                    "session_id": "session-1",
+                    "turn_started_at": base.isoformat(),
+                }
+            ],
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn("attribution_pending", later)
+        self.assertEqual(later["provider"], "Codex local - final@example.com")
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - final@example.com",
+        )
+
     def test_authoritative_refresh_recovers_pending_recent_request_display(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
@@ -7935,14 +8257,23 @@ class LiveUsageOverlayTests(unittest.TestCase):
         self.assertEqual(app.state.today_tokens, 225)
         self.assertAlmostEqual(app.state.today_account_cost, 0.5)
 
-    def test_historical_catchup_accepts_old_event_and_deduplicates_it(self) -> None:
+    def test_historical_catchup_uses_snapshot_date_and_deduplicates_it(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
         app._live_usage_overlay = None
         app._live_usage_seen_ids = {}
         event = self.event()
-        event["when"] = datetime.now(timezone.utc) - timedelta(hours=2)
+        snapshot_date = datetime.now(monitor.CN_TZ).date() - timedelta(days=1)
+        event["when"] = datetime(
+            snapshot_date.year,
+            snapshot_date.month,
+            snapshot_date.day,
+            23,
+            30,
+            tzinfo=monitor.CN_TZ,
+        ).astimezone(timezone.utc)
         event["event_id"] = "catchup-event-1"
+        app.state.client_usage["date"] = snapshot_date.isoformat()
 
         self.assertTrue(
             app._record_live_usage_events(
@@ -7952,6 +8283,21 @@ class LiveUsageOverlayTests(unittest.TestCase):
             )
         )
         self.assertEqual(app.state.today_tokens, 150)
+
+        different_day = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        different_day.state = self.state()
+        different_day._live_usage_overlay = None
+        different_day._live_usage_seen_ids = {}
+        different_day.state.client_usage["date"] = (
+            snapshot_date + timedelta(days=1)
+        ).isoformat()
+        self.assertFalse(
+            different_day._record_live_usage_events(
+                [dict(event)],
+                allow_historical=True,
+                animate=False,
+            )
+        )
         self.assertFalse(
             app._record_live_usage_events(
                 [event],
@@ -8160,6 +8506,112 @@ class LiveUsageOverlayTests(unittest.TestCase):
             bucket = next(row for row in summary["series"] if row["hour"] == hour)
             self.assertEqual(bucket["tokens"], 150)
             self.assertEqual(bucket["requests"], 3)
+
+    def test_catchup_keeps_full_tail_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            app.state = self.state(tokens=100, requests=1)
+            app.state.client_usage["providers"] = [
+                {
+                    "name": "Codex local - account@example.com",
+                    "tokens": 100,
+                    "requests": 1,
+                    "cost": 1.0,
+                }
+            ]
+            app.state.top_accounts = [
+                {
+                    "name": "Codex local - account@example.com",
+                    "tokens": 100,
+                    "requests": 1,
+                    "cost": 1.0,
+                }
+            ]
+            app._live_usage_overlay = None
+            app._live_usage_seen_ids = {}
+            app._live_usage_event_records = {}
+            app._live_usage_verification_pending = False
+            app._live_usage_verification_latest_when = None
+            app._live_usage_verification_pending_tokens = 0
+            app._live_usage_rate_samples = []
+            app._last_live_checkpoint_write_at = float("-inf")
+            app._live_catchup_lock = threading.Lock()
+            app._live_catchup_lock.acquire()
+            app._live_initial_recheck_scheduled = True
+            app.closed = False
+            app._draw = lambda: None
+
+            through = datetime.now(timezone.utc) - timedelta(seconds=1)
+            tail = {
+                "event_id": "request-1-tail",
+                "when": through + timedelta(milliseconds=500),
+                "request_key": "request-1",
+                "route": "cockpit-request",
+                "provider": "Codex local - account@example.com",
+                "total_tokens": 180,
+                "input_tokens": 180,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "cost": 1.8,
+            }
+            app._live_usage_event_records = {tail["event_id"]: tail}
+            payload = {
+                "through": through.isoformat(),
+                "events": [
+                    {
+                        "event_id": "request-1-baseline",
+                        "when": (through - timedelta(seconds=1)).isoformat(),
+                        "request_key": "request-1",
+                        "route": "cockpit-request",
+                        "provider": "Codex local - account@example.com",
+                        "total_tokens": 150,
+                        "input_tokens": 150,
+                        "cached_tokens": 0,
+                        "output_tokens": 0,
+                        "cost": 1.5,
+                    }
+                ],
+                "summary": {
+                    "tokens": 150,
+                    "requests": 2,
+                    "cost": 1.5,
+                    "input_tokens": 150,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "latest_at": (through - timedelta(seconds=1)).isoformat(),
+                    "latest_model": "gpt-test",
+                },
+                "providers": [
+                    {
+                        "name": "Codex local - account@example.com",
+                        "tokens": 150,
+                        "requests": 2,
+                        "cost": 1.5,
+                        "input_tokens": 150,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                    }
+                ],
+            }
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                app._apply_live_usage_catchup(payload)
+
+            self.assertEqual(app.state.today_tokens, 330)
+            self.assertEqual(app.state.today_requests, 3)
+            self.assertEqual(
+                app._live_usage_overlay["catchup_tail_tokens"],
+                180,
+            )
+            self.assertEqual(
+                app.state.client_usage["providers"][0]["tokens"],
+                330,
+            )
+            self.assertEqual(
+                app.state.client_usage["providers"][0]["requests"],
+                3,
+            )
 
     def test_live_event_updates_recent_request_from_matching_session(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)

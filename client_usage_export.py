@@ -1711,9 +1711,12 @@ def iter_recent_jsonl(
         if session_paths is not None:
             match = CODEX_SESSION_FILE_ID_RE.search(resolved.name)
             if match is not None:
-                preferred = session_paths.get(match.group("id").lower())
-                if preferred is not None and preferred != resolved and preferred.exists():
-                    return
+                session_key = match.group("id").lower()
+                preferred = session_paths.get(session_key)
+                if preferred is not None and preferred != resolved:
+                    if preferred.exists():
+                        return
+                    session_paths[session_key] = resolved
         seen.add(resolved)
         paths.append(resolved)
 
@@ -1753,6 +1756,26 @@ def iter_recent_jsonl(
                 continue
             if modified >= start - timedelta(hours=2):
                 add_path(resolved)
+
+    # Codex moves completed rollouts out of sessions. Scan recent archives
+    # after live paths so an existing sessions copy remains authoritative.
+    archived_root = root.parent / "archived_sessions"
+    if archived_root.exists():
+        threshold = start - timedelta(hours=2)
+        try:
+            archived_paths = sorted(
+                archived_root.rglob("*.jsonl"),
+                key=lambda path: str(path).lower(),
+            )
+        except OSError:
+            archived_paths = []
+        for path in archived_paths:
+            try:
+                modified = datetime.fromtimestamp(path.stat().st_mtime)
+            except OSError:
+                continue
+            if modified >= threshold:
+                add_path(path)
     return paths
 
 
@@ -5594,7 +5617,7 @@ def account_marker_request_start(marker: AccountMarker) -> datetime | None:
     return marker.when - timedelta(milliseconds=latency_ms)
 
 
-def reconcile_cockpit_request_usage_events(
+def _collapse_cockpit_request_usage_events_legacy(
     events: list[UsageEvent],
     account_markers: list[AccountMarker],
     affinity_events: list[CockpitAffinityEvent],
@@ -5761,6 +5784,23 @@ def reconcile_cockpit_request_usage_events(
     reconciled.extend(replacements)
     reconciled.sort(key=lambda event: event.when)
     return reconciled
+
+
+def reconcile_cockpit_request_usage_events(
+    events: list[UsageEvent],
+    account_markers: list[AccountMarker],
+    affinity_events: list[CockpitAffinityEvent],
+) -> list[UsageEvent]:
+    """Preserve each distinct Codex ``last_token_usage`` event.
+
+    A Cockpit request can span multiple model calls while Codex handles tool
+    results.  Every token_count row advances ``total_token_usage`` by exactly
+    that row's ``last_token_usage`` and is therefore independently billable.
+    Cockpit request ids remain attribution evidence, but they must not collapse
+    those model calls into the final response usage row.
+    """
+    del account_markers, affinity_events
+    return events
 
 
 def cockpit_request_start_turn_anchors(
@@ -8585,6 +8625,8 @@ def build_live_catchup_payload(
                     "provider": provider,
                     "model": event.model,
                     "session_id": event.session_id,
+                    "request_key": event.request_key,
+                    "route": event.route,
                     "total_tokens": event.total_tokens,
                     "input_tokens": event.input_tokens + event.cached_tokens,
                     "cached_tokens": event.cached_tokens,
