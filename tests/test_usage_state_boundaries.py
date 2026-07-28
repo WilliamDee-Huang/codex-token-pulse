@@ -5591,13 +5591,11 @@ class CodexEventRowCacheTests(unittest.TestCase):
             codex_root = Path(directory) / ".codex"
             sessions_root = codex_root / "sessions"
             archived_root = codex_root / "archived_sessions"
-            now = datetime.now(client_usage_export.LOCAL_TZ).replace(tzinfo=None)
+            now = datetime.now()
             start = now - timedelta(hours=1)
             end = now + timedelta(hours=1)
-            event_at = (
-                (now - timedelta(minutes=5))
-                .replace(tzinfo=client_usage_export.LOCAL_TZ)
-                .astimezone(timezone.utc)
+            event_at = (now - timedelta(minutes=5)).replace(
+                tzinfo=client_usage_export.LOCAL_TZ
             )
             session_id = "019f54a2-9034-7651-a517-89989e6d6b1d"
             filename = f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{session_id}.jsonl"
