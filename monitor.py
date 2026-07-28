@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import heapq
 import json
 import logging
 import math
@@ -2834,6 +2835,106 @@ def _load_live_cockpit_route_events(
     return events
 
 
+def _minimum_cost_live_route_pairs(
+    candidates_by_request: dict[str, list[tuple[float, int, datetime]]],
+) -> dict[int, tuple[str, datetime, float]]:
+    """Match concurrent Cockpit requests to turn boundaries one-to-one."""
+    request_ids = sorted(candidates_by_request)
+    turn_indices = sorted(
+        {
+            turn_index
+            for candidates in candidates_by_request.values()
+            for _delta, turn_index, _anchor_at in candidates
+        }
+    )
+    if not request_ids or not turn_indices:
+        return {}
+
+    request_nodes = {request_id: index + 1 for index, request_id in enumerate(request_ids)}
+    turn_offset = 1 + len(request_ids)
+    turn_nodes = {
+        turn_index: turn_offset + index
+        for index, turn_index in enumerate(turn_indices)
+    }
+    source = 0
+    sink = turn_offset + len(turn_indices)
+    graph: list[list[list[float | int]]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(start: int, end: int, capacity: int, cost: float) -> list[float | int]:
+        forward: list[float | int] = [end, len(graph[end]), capacity, cost]
+        reverse: list[float | int] = [start, len(graph[start]), 0, -cost]
+        graph[start].append(forward)
+        graph[end].append(reverse)
+        return forward
+
+    for request_id in request_ids:
+        add_edge(source, request_nodes[request_id], 1, 0.0)
+    for turn_index in turn_indices:
+        add_edge(turn_nodes[turn_index], sink, 1, 0.0)
+
+    edge_refs: dict[tuple[str, int], tuple[list[float | int], datetime, float]] = {}
+    for request_id, candidates in candidates_by_request.items():
+        for delta, turn_index, anchor_at in candidates:
+            edge = add_edge(
+                request_nodes[request_id],
+                turn_nodes[turn_index],
+                1,
+                float(delta),
+            )
+            edge_refs[(request_id, turn_index)] = (edge, anchor_at, float(delta))
+
+    node_count = len(graph)
+    potential = [0.0] * node_count
+    while True:
+        distance = [math.inf] * node_count
+        previous_node = [-1] * node_count
+        previous_edge = [-1] * node_count
+        distance[source] = 0.0
+        queue: list[tuple[float, int]] = [(0.0, source)]
+        while queue:
+            current_distance, node = heapq.heappop(queue)
+            if current_distance > distance[node] + 1e-12:
+                continue
+            for edge_index, edge in enumerate(graph[node]):
+                if int(edge[2]) <= 0:
+                    continue
+                target = int(edge[0])
+                candidate_distance = (
+                    current_distance
+                    + float(edge[3])
+                    + potential[node]
+                    - potential[target]
+                )
+                if candidate_distance + 1e-12 >= distance[target]:
+                    continue
+                distance[target] = candidate_distance
+                previous_node[target] = node
+                previous_edge[target] = edge_index
+                heapq.heappush(queue, (candidate_distance, target))
+        if not math.isfinite(distance[sink]):
+            break
+        for node, value in enumerate(distance):
+            if math.isfinite(value):
+                potential[node] += value
+        node = sink
+        while node != source:
+            parent = previous_node[node]
+            edge_index = previous_edge[node]
+            if parent < 0 or edge_index < 0:
+                break
+            edge = graph[parent][edge_index]
+            edge[2] = int(edge[2]) - 1
+            reverse = graph[node][int(edge[1])]
+            reverse[2] = int(reverse[2]) + 1
+            node = parent
+
+    pairs: dict[int, tuple[str, datetime, float]] = {}
+    for (request_id, turn_index), (edge, anchor_at, delta) in edge_refs.items():
+        if int(edge[2]) == 0:
+            pairs[turn_index] = (request_id, anchor_at, delta)
+    return pairs
+
+
 def _match_live_cockpit_route_hints(
     request_boundary_at: list[datetime | None],
     events: list[dict[str, Any]],
@@ -2845,7 +2946,7 @@ def _match_live_cockpit_route_hints(
         if request_id and isinstance(when, datetime):
             events_by_request.setdefault(request_id, []).append(event)
 
-    assigned_requests: dict[int, list[tuple[str, datetime]]] = {}
+    candidates_by_request: dict[str, list[tuple[float, int, datetime]]] = {}
     for request_id, request_events in events_by_request.items():
         candidates: list[tuple[float, int, datetime]] = []
         for index, boundary_at in enumerate(request_boundary_at):
@@ -2861,16 +2962,49 @@ def _match_live_cockpit_route_hints(
         candidates.sort(key=lambda item: item[0])
         if not candidates:
             continue
-        if (
-            len(candidates) > 1
-            and candidates[1][0] - candidates[0][0]
-            < LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS
-        ):
-            for _delta, index, anchor_at in candidates:
-                assigned_requests.setdefault(index, []).append(("", anchor_at))
-            continue
-        _delta, turn_index, anchor_at = candidates[0]
-        assigned_requests.setdefault(turn_index, []).append((request_id, anchor_at))
+        candidates_by_request[request_id] = candidates
+
+    pairs = _minimum_cost_live_route_pairs(candidates_by_request)
+    candidate_turns = {
+        turn_index
+        for candidates in candidates_by_request.values()
+        for _delta, turn_index, _anchor_at in candidates
+    }
+    unmatched_turns = candidate_turns - set(pairs)
+    ambiguous_turns = set(unmatched_turns)
+    for turn_index, (request_id, _anchor_at, matched_delta) in pairs.items():
+        close_unmatched = {
+            candidate_turn
+            for candidate_delta, candidate_turn, _candidate_at in candidates_by_request[request_id]
+            if candidate_turn in unmatched_turns
+            and abs(candidate_delta - matched_delta) < LIVE_ACCOUNT_TURN_AMBIGUITY_SECONDS
+        }
+        if close_unmatched:
+            ambiguous_turns.add(turn_index)
+            ambiguous_turns.update(close_unmatched)
+
+    nearest_anchor_by_turn: dict[int, datetime] = {}
+    for candidates in candidates_by_request.values():
+        for delta, turn_index, anchor_at in candidates:
+            previous = nearest_anchor_by_turn.get(turn_index)
+            if previous is None:
+                nearest_anchor_by_turn[turn_index] = anchor_at
+                continue
+            boundary_at = request_boundary_at[turn_index]
+            if boundary_at is not None and abs((anchor_at - boundary_at).total_seconds()) < abs(
+                (previous - boundary_at).total_seconds()
+            ):
+                nearest_anchor_by_turn[turn_index] = anchor_at
+
+    assigned_requests: dict[int, list[tuple[str, datetime]]] = {}
+    for turn_index in sorted(ambiguous_turns):
+        boundary_at = request_boundary_at[turn_index]
+        anchor_at = nearest_anchor_by_turn.get(turn_index) or boundary_at
+        if anchor_at is not None:
+            assigned_requests[turn_index] = [("", anchor_at)]
+    for turn_index, (request_id, anchor_at, _delta) in pairs.items():
+        if turn_index not in ambiguous_turns:
+            assigned_requests[turn_index] = [(request_id, anchor_at)]
 
     hints: dict[int, dict[str, Any]] = {}
     for turn_index, assigned in assigned_requests.items():
@@ -3427,6 +3561,16 @@ def scan_live_codex_active_sessions(
             and abs((started_dt - cached_turn_started).total_seconds()) <= 1
             and not route_hint_resolved
         )
+        # Keep a concrete account visible through transient failed route attempts.
+        # This is display-only and is deliberately bounded to the current turn.
+        same_turn_cached_provider = bool(
+            api_service_route
+            and current_latest_usage is not None
+            and cached_provider
+            and started_dt is not None
+            and cached_turn_started is not None
+            and abs((started_dt - cached_turn_started).total_seconds()) <= 1
+        )
         if api_service_route:
             provider = matched_label or route_hint_label or (
                 cached_provider
@@ -3434,6 +3578,8 @@ def scan_live_codex_active_sessions(
                 else ""
             ) or (
                 cached_provider if same_turn_provisional_provider else ""
+            ) or (
+                cached_provider if same_turn_cached_provider else ""
             )
         else:
             provider = cached_provider or current_label or matched_label
@@ -3474,7 +3620,11 @@ def scan_live_codex_active_sessions(
                         matched_label
                         or (same_turn_confirmed_provider and not route_hint_resolved)
                     )
-                    and (route_hint_label or same_turn_provisional_provider)
+                    and (
+                        route_hint_label
+                        or same_turn_provisional_provider
+                        or same_turn_cached_provider
+                    )
                 ),
                 "provider_confirmation_source": (
                     "final_usage_marker"
@@ -3488,7 +3638,11 @@ def scan_live_codex_active_sessions(
                             else (
                                 "same_turn_route_hint"
                                 if same_turn_provisional_provider
-                                else ""
+                                else (
+                                    "same_turn_cached_account"
+                                    if same_turn_cached_provider
+                                    else ""
+                                )
                             )
                         )
                     )

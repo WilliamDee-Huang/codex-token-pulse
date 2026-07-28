@@ -5391,6 +5391,197 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertEqual(result[label]["window_rolling_7d"]["tokens"], 66_000_000)
 
 
+class QuotaFingerprintAttributionTests(unittest.TestCase):
+    def test_near_time_marker_does_not_override_unique_quota_fingerprint(self) -> None:
+        turn_started_at = datetime(2026, 7, 28, 10, 0, 0)
+        quota_label = "Codex local - quota-owner@example.com"
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=100_000,
+            cached_tokens=80_000,
+            output_tokens=1_000,
+            session_id="quota-session",
+            account_at=turn_started_at,
+            account_label_hint=quota_label,
+            account_hint_source="quota_fingerprint",
+        )
+        nearby_marker = client_usage_export.AccountMarker(
+            when=event.when,
+            label="Codex local - concurrent@example.com",
+            total_tokens=7_777,
+        )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {quota_label: [event]},
+                [nearby_marker],
+            )
+        )
+
+        self.assertEqual(resolved, {quota_label: [event]})
+        self.assertEqual(session_accounts["quota-session"], quota_label)
+        self.assertEqual(unresolved, 0)
+
+    def test_exact_usage_marker_still_overrides_quota_fingerprint(self) -> None:
+        quota_label = "Codex local - quota-owner@example.com"
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 28, 10, 0, 30),
+            model="gpt-test",
+            input_tokens=100_000,
+            cached_tokens=80_000,
+            output_tokens=1_000,
+            session_id="quota-session",
+            account_at=datetime(2026, 7, 28, 10, 0, 0),
+            account_label_hint=quota_label,
+            account_hint_source="quota_fingerprint",
+        )
+        final_label = "Codex local - final-account@example.com"
+        exact_marker = client_usage_export.AccountMarker(
+            when=event.when,
+            label=final_label,
+            total_tokens=event.total_tokens,
+            input_tokens=event.input_tokens + event.cached_tokens,
+            cached_tokens=event.cached_tokens,
+            output_tokens=event.output_tokens,
+        )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {quota_label: [event]},
+                [exact_marker],
+            )
+        )
+
+        self.assertEqual(resolved, {final_label: [event]})
+        self.assertEqual(session_accounts["quota-session"], final_label)
+        self.assertEqual(unresolved, 0)
+
+    def test_exact_marker_maps_entire_quota_fingerprint_and_overrides_ledger(self) -> None:
+        base = datetime(2026, 7, 28, 10, 0, 0)
+        fingerprint = (10_080, 1_785_634_970)
+        correct_label = "Codex local - plus@example.com"
+        events = [
+            client_usage_export.UsageEvent(
+                when=base + timedelta(minutes=index),
+                model="gpt-test",
+                input_tokens=1_000 + index,
+                cached_tokens=2_000,
+                output_tokens=100,
+                session_id="same-session",
+                account_at=base + timedelta(minutes=index, seconds=-30),
+                quota_fingerprints=(fingerprint,),
+            )
+            for index in range(2)
+        ]
+        marker = client_usage_export.AccountMarker(
+            when=events[0].when,
+            label=correct_label,
+            total_tokens=events[0].total_tokens,
+            input_tokens=events[0].input_tokens + events[0].cached_tokens,
+            cached_tokens=events[0].cached_tokens,
+            output_tokens=events[0].output_tokens,
+        )
+        ledger = {
+            client_usage_export.codex_event_id(event): "Codex local - stale@example.com"
+            for event in events
+        }
+
+        with patch.object(client_usage_export, "load_official_quota_cache", return_value={}):
+            attributed = client_usage_export.attribute_codex_events_by_account(
+                events,
+                [marker],
+                ledger,
+            )
+            resolved, session_accounts, unresolved = (
+                client_usage_export.resolve_api_service_event_accounts(
+                    attributed,
+                    [marker],
+                )
+            )
+
+        self.assertEqual(resolved[correct_label], events)
+        self.assertEqual(session_accounts["same-session"], correct_label)
+        self.assertEqual(unresolved, 0)
+        self.assertTrue(all(event.account_hint_source == "quota_fingerprint" for event in events))
+        self.assertEqual(set(ledger.values()), {correct_label})
+
+    def test_official_quota_cache_maps_direct_event_without_request_marker(self) -> None:
+        reset_at = datetime(2026, 8, 4, 11, 13, 25)
+        fingerprint = (
+            10_080,
+            int(reset_at.replace(tzinfo=client_usage_export.LOCAL_TZ).timestamp()),
+        )
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 28, 14, 38, 24),
+            model="gpt-test",
+            input_tokens=1_000,
+            cached_tokens=2_000,
+            output_tokens=100,
+            session_id="direct-session",
+            quota_fingerprints=(fingerprint,),
+        )
+        event_id = client_usage_export.codex_event_id(event)
+        correct_label = "Codex local - current@example.com"
+        cache = {
+            "account-id": {
+                "label": correct_label,
+                "quota": {
+                    "window_7d": {
+                        "window_minutes": 10_080,
+                        "resets_at": reset_at.replace(
+                            tzinfo=client_usage_export.LOCAL_TZ
+                        ).isoformat(),
+                    }
+                },
+            }
+        }
+        ledger = {event_id: "Codex local - stale@example.com"}
+
+        with patch.object(
+            client_usage_export,
+            "load_official_quota_cache",
+            return_value=cache,
+        ):
+            attributed = client_usage_export.attribute_codex_events_by_account(
+                [event],
+                [],
+                ledger,
+            )
+
+        self.assertEqual(attributed, {correct_label: [event]})
+        self.assertEqual(ledger[event_id], correct_label)
+
+    def test_conflicting_fingerprint_evidence_does_not_guess_an_account(self) -> None:
+        base = datetime(2026, 7, 28, 10, 0, 0)
+        fingerprint = (10_080, 1_785_634_970)
+        events = [
+            client_usage_export.UsageEvent(
+                when=base + timedelta(seconds=index),
+                model="gpt-test",
+                input_tokens=1_000 + index,
+                cached_tokens=2_000,
+                output_tokens=100,
+                session_id=f"session-{index}",
+                quota_fingerprints=(fingerprint,),
+            )
+            for index in range(2)
+        ]
+        markers = [
+            client_usage_export.AccountMarker(
+                when=event.when,
+                label=f"Codex local - account-{index}@example.com",
+                total_tokens=event.total_tokens,
+            )
+            for index, event in enumerate(events)
+        ]
+
+        with patch.object(client_usage_export, "load_official_quota_cache", return_value={}):
+            client_usage_export.apply_quota_fingerprint_account_hints(events, markers)
+
+        self.assertTrue(all(not event.account_label_hint for event in events))
+
+
 class CodexEventRowCacheTests(unittest.TestCase):
     @staticmethod
     def token_row(timestamp: str, total_tokens: int, cumulative_tokens: int) -> dict:
@@ -5466,6 +5657,148 @@ class CodexEventRowCacheTests(unittest.TestCase):
                     cached_rows = second.rows_for_path(path)
                 self.assertEqual(len(cached_rows), 3)
                 self.assertEqual(read_rows.call_args.args[1], old_size)
+
+    def test_compact_cache_preserves_quota_window_fingerprint(self) -> None:
+        row = self.token_row("2026-07-15T10:00:00Z", 50, 50)
+        row["payload"]["rate_limits"] = {
+            "plan_type": "plus",
+            "primary": {
+                "used_percent": 12.0,
+                "window_minutes": 10_080,
+                "resets_at": 1_789_000_000,
+            },
+            "credits": {"has_credits": False},
+        }
+
+        compact = client_usage_export.compact_codex_cache_row(row)
+
+        self.assertIsNotNone(compact)
+        rate_limits = compact["payload"]["rate_limits"]
+        self.assertEqual(rate_limits["plan_type"], "plus")
+        self.assertEqual(rate_limits["primary"]["window_minutes"], 10_080)
+        self.assertEqual(rate_limits["primary"]["resets_at"], 1_789_000_000)
+        self.assertNotIn("credits", rate_limits)
+
+    def test_deleted_rollout_is_recovered_from_persistent_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_root = Path(directory) / ".codex"
+            sessions_root = codex_root / "sessions"
+            now = datetime.now().replace(microsecond=0)
+            start = now - timedelta(hours=1)
+            end = now + timedelta(hours=1)
+            session_id = "019fa386-6c16-7ee1-8410-3e01fd8d97d1"
+            day_dir = sessions_root / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
+            day_dir.mkdir(parents=True)
+            path = day_dir / f"rollout-{now:%Y-%m-%dT%H-%M-%S}-{session_id}.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"id": session_id}},
+                self.token_row(
+                    now.replace(tzinfo=client_usage_export.LOCAL_TZ).isoformat(),
+                    75,
+                    75,
+                ),
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            cache_path = Path(directory) / "events-cache.json"
+            with patch.dict(
+                os.environ,
+                {"CLIENT_USAGE_CODEX_EVENT_CACHE": str(cache_path)},
+            ):
+                first_cache = client_usage_export.CodexEventRowCache(cache_path)
+                with patch.object(
+                    client_usage_export,
+                    "_CODEX_EVENT_ROW_CACHE",
+                    first_cache,
+                ):
+                    first = client_usage_export.scan_codex_events(
+                        sessions_root,
+                        start,
+                        end,
+                    )
+                    first_cache.flush()
+                self.assertEqual([event.total_tokens for event in first], [75])
+
+                path.unlink()
+                second_cache = client_usage_export.CodexEventRowCache(cache_path)
+                with patch.object(
+                    client_usage_export,
+                    "_CODEX_EVENT_ROW_CACHE",
+                    second_cache,
+                ):
+                    recovered = client_usage_export.scan_codex_events(
+                        sessions_root,
+                        start,
+                        end,
+                    )
+
+            self.assertEqual([event.total_tokens for event in recovered], [75])
+            self.assertEqual(recovered[0].session_id, session_id)
+
+    def test_deleted_rollout_cache_does_not_cross_codex_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_sessions = root / "first" / ".codex" / "sessions"
+            second_sessions = root / "second" / ".codex" / "sessions"
+            now = datetime.now().replace(microsecond=0)
+            foreign_path = (
+                first_sessions
+                / f"{now.year:04d}"
+                / f"{now.month:02d}"
+                / f"{now.day:02d}"
+                / "rollout-foreign.jsonl"
+            )
+            foreign_path.parent.mkdir(parents=True)
+            foreign_path.write_text(
+                json.dumps(self.token_row(now.isoformat(), 75, 75)) + "\n",
+                encoding="utf-8",
+            )
+            second_sessions.mkdir(parents=True)
+            cache_path = root / "events-cache.json"
+            cache = client_usage_export.CodexEventRowCache(cache_path)
+            cache.rows_for_path(foreign_path)
+            foreign_path.unlink()
+
+            missing = cache.cached_missing_paths(
+                second_sessions,
+                now - timedelta(hours=1),
+            )
+
+            self.assertEqual(missing, [])
+
+    def test_stale_cache_writer_merges_entries_written_by_another_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_path = root / "events-cache.json"
+            first_path = root / "first.jsonl"
+            second_path = root / "second.jsonl"
+            first_path.write_text(
+                json.dumps(self.token_row("2026-07-15T10:00:00Z", 50, 50)) + "\n",
+                encoding="utf-8",
+            )
+            second_path.write_text(
+                json.dumps(self.token_row("2026-07-15T10:00:01Z", 75, 75)) + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"CLIENT_USAGE_CODEX_EVENT_CACHE": str(cache_path)},
+            ):
+                stale_writer = client_usage_export.CodexEventRowCache(cache_path)
+                concurrent_writer = client_usage_export.CodexEventRowCache(cache_path)
+                stale_writer.rows_for_path(first_path)
+                concurrent_writer.rows_for_path(second_path)
+                concurrent_writer.flush()
+                stale_writer.flush()
+
+                merged = client_usage_export.CodexEventRowCache(cache_path)
+                merged._load()
+
+            self.assertEqual(len(merged.entries), 2)
+            self.assertIn(merged._key(first_path), merged.entries)
+            self.assertIn(merged._key(second_path), merged.entries)
 
     def test_incomplete_last_json_row_is_retried_after_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6336,6 +6669,38 @@ class LiveActiveSessionScanTests(unittest.TestCase):
         self.assertTrue(hints[0]["resolved"])
         self.assertFalse(hints[0]["label"])
 
+    def test_live_route_hint_jointly_matches_concurrent_requests(self) -> None:
+        first_boundary = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
+        second_boundary = first_boundary + timedelta(milliseconds=130)
+        events = [
+            {
+                "when": first_boundary + timedelta(milliseconds=26),
+                "request_id": "request-enoch",
+                "kind": "route",
+                "account_id": "enoch-account",
+                "label": "Codex local - enoch@example.com",
+                "model": "gpt-test",
+            },
+            {
+                "when": first_boundary + timedelta(milliseconds=429),
+                "request_id": "request-hyenas",
+                "kind": "route",
+                "account_id": "hyenas-account",
+                "label": "Codex local - hyenas@example.com",
+                "model": "gpt-test",
+            },
+        ]
+
+        hints = monitor._match_live_cockpit_route_hints(
+            [first_boundary, second_boundary],
+            events,
+        )
+
+        self.assertEqual(hints[0]["label"], "Codex local - enoch@example.com")
+        self.assertEqual(hints[0]["request_id"], "request-enoch")
+        self.assertEqual(hints[1]["label"], "Codex local - hyenas@example.com")
+        self.assertEqual(hints[1]["request_id"], "request-hyenas")
+
     def test_live_route_hint_is_cleared_when_request_completes(self) -> None:
         boundary_at = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
         events = [
@@ -6564,6 +6929,66 @@ class LiveActiveSessionScanTests(unittest.TestCase):
                 18_000,
                 700,
             ),
+        )
+
+    def test_api_service_session_keeps_same_turn_cached_account_for_display(self) -> None:
+        now = datetime.now(timezone.utc)
+        started_at = now - timedelta(seconds=30)
+        token_at = now - timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            self.write_live_rows(
+                sessions,
+                [
+                    {"type": "session_meta", "payload": {"id": self.SESSION_ID}},
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "turn-1"},
+                    },
+                    {
+                        "timestamp": token_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 20_000,
+                                    "cached_input_tokens": 18_000,
+                                    "output_tokens": 700,
+                                    "total_tokens": 20_700,
+                                }
+                            },
+                        },
+                    },
+                ],
+            )
+            cached = [
+                {
+                    "session_id": self.SESSION_ID,
+                    "provider": "Codex local - plus@example.com",
+                    "started_at": started_at.isoformat(),
+                }
+            ]
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - api-service-local",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    sessions,
+                    cached,
+                    now=now,
+                    cockpit_db_path=root / "missing.sqlite",
+                )
+
+        self.assertEqual(rows[0]["provider"], "Codex local - plus@example.com")
+        self.assertFalse(rows[0]["provider_confirmed"])
+        self.assertTrue(rows[0]["provider_provisional"])
+        self.assertEqual(
+            rows[0]["provider_confirmation_source"],
+            "same_turn_cached_account",
         )
 
     def test_api_service_session_does_not_carry_provider_into_new_turn(self) -> None:

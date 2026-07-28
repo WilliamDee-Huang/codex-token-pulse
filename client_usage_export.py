@@ -252,6 +252,7 @@ def attribution_ledger_write_lock(
 
 
 CODEX_EVENT_CACHE_SCHEMA = 2
+CODEX_COMPACT_ROW_SCHEMA = 3
 CODEX_EVENT_CACHE_HASH_BYTES = max(
     1024,
     int(os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE_HASH_BYTES", "4096")),
@@ -490,6 +491,9 @@ class UsageEvent:
     route: str = ""
     request_at: datetime | None = None
     account_at: datetime | None = None
+    quota_fingerprints: tuple[tuple[int, int], ...] = ()
+    account_label_hint: str = ""
+    account_hint_source: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -1003,6 +1007,7 @@ def make_codex_event(
     request_at: datetime | None = None,
     account_at: datetime | None = None,
     pricing_tier: str = "",
+    quota_fingerprints: tuple[tuple[int, int], ...] = (),
 ) -> UsageEvent | None:
     if when is None:
         return None
@@ -1026,6 +1031,7 @@ def make_codex_event(
         route=str(route or "").strip().lower(),
         request_at=request_at,
         account_at=account_at,
+        quota_fingerprints=tuple(quota_fingerprints or ()),
     )
 
 
@@ -1096,6 +1102,42 @@ def epoch_to_local_datetime(value: Any) -> datetime | None:
         return datetime.fromtimestamp(seconds, tz=LOCAL_TZ).replace(tzinfo=None)
     except (OSError, OverflowError, ValueError):
         return None
+
+
+def quota_reset_epoch(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        epoch = int(value)
+        if epoch > 10_000_000_000:
+            epoch //= 1000
+        return max(0, epoch)
+    reset_at = parse_dt(value)
+    if reset_at is None:
+        return 0
+    return max(0, int(reset_at.replace(tzinfo=LOCAL_TZ).timestamp()))
+
+
+def quota_window_fingerprint(window: Any) -> tuple[int, int] | None:
+    if not isinstance(window, dict):
+        return None
+    try:
+        window_minutes = int(window.get("window_minutes") or 0)
+    except (TypeError, ValueError):
+        window_minutes = 0
+    reset_epoch = quota_reset_epoch(window.get("resets_at"))
+    if window_minutes <= 0 or reset_epoch <= 0:
+        return None
+    return window_minutes, reset_epoch
+
+
+def codex_quota_fingerprints(rate_limits: Any) -> tuple[tuple[int, int], ...]:
+    if not isinstance(rate_limits, dict):
+        return ()
+    fingerprints = {
+        fingerprint
+        for value in rate_limits.values()
+        if (fingerprint := quota_window_fingerprint(value)) is not None
+    }
+    return tuple(sorted(fingerprints, reverse=True))
 
 
 def parse_json_after_marker(text: str, marker: str) -> dict[str, Any] | None:
@@ -1258,6 +1300,25 @@ def compact_codex_cache_row(row: dict[str, Any]) -> dict[str, Any] | None:
                 }
         if compact_info:
             compact_payload["info"] = compact_info
+        rate_limits = payload.get("rate_limits")
+        if isinstance(rate_limits, dict):
+            compact_rate_limits: dict[str, Any] = {}
+            plan_type = str(rate_limits.get("plan_type") or "").strip()
+            if plan_type:
+                compact_rate_limits["plan_type"] = plan_type
+            for key, value in rate_limits.items():
+                if not isinstance(value, dict):
+                    continue
+                fingerprint = quota_window_fingerprint(value)
+                if fingerprint is None:
+                    continue
+                compact_rate_limits[str(key)] = {
+                    field: value.get(field)
+                    for field in ("used_percent", "window_minutes", "resets_at")
+                    if value.get(field) is not None
+                }
+            if len(compact_rate_limits) > bool(plan_type):
+                compact_payload["rate_limits"] = compact_rate_limits
     elif payload_type == "error":
         if payload.get("codex_error_info") is not None:
             compact_payload["codex_error_info"] = payload.get("codex_error_info")
@@ -1310,7 +1371,11 @@ class CodexEventRowCache:
         self._loaded = True
         try:
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError:
+            payload = recover_corrupt_json(self.cache_path)
+        except OSError:
+            return
+        if not isinstance(payload, dict):
             return
         if int(payload.get("schema") or 0) != CODEX_EVENT_CACHE_SCHEMA:
             return
@@ -1438,14 +1503,19 @@ class CodexEventRowCache:
         try:
             stat = path.stat()
         except OSError:
-            self.entries.pop(key, None)
-            self._persistent_keys.discard(key)
-            return []
+            entry = self.entries.get(key)
+            return self._entry_rows(entry) if entry is not None else []
         size = max(0, int(stat.st_size))
         modified_ns = int(stat.st_mtime_ns)
         entry = self.entries.get(key)
+        current_row_schema = (
+            int(entry.get("row_schema") or 0)
+            if isinstance(entry, dict)
+            else 0
+        )
         if (
             entry is not None
+            and current_row_schema >= CODEX_COMPACT_ROW_SCHEMA
             and int(entry.get("size") or -1) == size
             and int(entry.get("mtime_ns") or -1) == modified_ns
         ):
@@ -1453,6 +1523,7 @@ class CodexEventRowCache:
 
         append = bool(
             entry is not None
+            and current_row_schema >= CODEX_COMPACT_ROW_SCHEMA
             and size > int(entry.get("size") or 0)
             and self._append_is_valid(path, entry, size)
         )
@@ -1469,6 +1540,7 @@ class CodexEventRowCache:
         boundary_start = max(0, processed - CODEX_EVENT_CACHE_HASH_BYTES)
         boundary_length = max(0, processed - boundary_start)
         self.entries[key] = {
+            "row_schema": CODEX_COMPACT_ROW_SCHEMA,
             "size": size,
             "mtime_ns": modified_ns,
             "processed_length": processed,
@@ -1484,32 +1556,106 @@ class CodexEventRowCache:
             self._dirty = True
         return rows
 
+    def cached_missing_paths(self, root: Path, start: datetime) -> list[Path]:
+        self._load()
+        allowed_roots: list[Path] = []
+        for candidate in (root, root.parent / "archived_sessions"):
+            try:
+                allowed_roots.append(candidate.resolve(strict=False))
+            except OSError:
+                allowed_roots.append(candidate)
+        threshold_ns = int((start - timedelta(hours=2)).timestamp() * 1_000_000_000)
+        result: list[tuple[int, Path]] = []
+        for key, entry in self.entries.items():
+            try:
+                modified_ns = int(entry.get("mtime_ns") or 0)
+            except (TypeError, ValueError):
+                continue
+            if modified_ns < threshold_ns:
+                continue
+            path = Path(key)
+            try:
+                resolved = path.resolve(strict=False)
+            except OSError:
+                continue
+            if not any(
+                resolved.is_relative_to(allowed_root)
+                for allowed_root in allowed_roots
+            ):
+                continue
+            if path.exists():
+                continue
+            result.append((modified_ns, path))
+        return [path for _modified_ns, path in sorted(result)]
+
+    @staticmethod
+    def _entry_rank(entry: dict[str, Any]) -> tuple[int, int, int, int]:
+        def integer(key: str) -> int:
+            try:
+                return int(entry.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return (
+            integer("mtime_ns"),
+            integer("processed_length"),
+            integer("size"),
+            integer("row_schema"),
+        )
+
+    def _merge_entries_from_disk(self) -> None:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        if int(payload.get("schema") or 0) != CODEX_EVENT_CACHE_SCHEMA:
+            return
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            return
+        for key, disk_entry in entries.items():
+            if not isinstance(key, str) or not isinstance(disk_entry, dict):
+                continue
+            if not isinstance(disk_entry.get("rows_zlib"), str):
+                continue
+            current = self.entries.get(key)
+            if current is None or self._entry_rank(disk_entry) > self._entry_rank(current):
+                self.entries[key] = disk_entry
+            self._persistent_keys.add(key)
+
     def flush(self) -> None:
         if not self._dirty or not self._persistent_keys:
             return
-        keys = sorted(
-            (key for key in self._persistent_keys if key in self.entries),
-            key=lambda key: int(self.entries[key].get("mtime_ns") or 0),
-            reverse=True,
-        )[:CODEX_EVENT_CACHE_MAX_ENTRIES]
-        payload = {
-            "schema": CODEX_EVENT_CACHE_SCHEMA,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "entries": {
-                key: self._serialized_entry(self.entries[key])
-                for key in keys
-            },
-        }
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.cache_path.with_name(f".{self.cache_path.name}.{os.getpid()}.tmp")
         try:
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.cache_path)
-            self._dirty = False
-            self._persistent_keys = set(keys)
+            with attribution_ledger_write_lock(self.cache_path):
+                self._merge_entries_from_disk()
+                keys = sorted(
+                    (key for key in self._persistent_keys if key in self.entries),
+                    key=lambda key: self._entry_rank(self.entries[key]),
+                    reverse=True,
+                )[:CODEX_EVENT_CACHE_MAX_ENTRIES]
+                payload = {
+                    "schema": CODEX_EVENT_CACHE_SCHEMA,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "entries": {
+                        key: self._serialized_entry(self.entries[key])
+                        for key in keys
+                    },
+                }
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, self.cache_path)
+                self._dirty = False
+                self._persistent_keys = set(keys)
+            refresh_json_backup(self.cache_path)
+        except (OSError, TimeoutError) as exc:
+            logger.warning("Codex event cache save deferred: %s", exc)
         finally:
             try:
                 temporary.unlink(missing_ok=True)
@@ -1776,6 +1922,11 @@ def iter_recent_jsonl(
                 continue
             if modified >= threshold:
                 add_path(path)
+    # Completed child tasks can be removed from both sessions and archives.
+    # Their compact token rows remain authoritative and must stay in today's
+    # totals instead of disappearing with the rollout file.
+    for path in _CODEX_EVENT_ROW_CACHE.cached_missing_paths(root, start):
+        add_path(path)
     return paths
 
 
@@ -2077,6 +2228,7 @@ def scan_codex_events(
             if payload_type != "token_count":
                 continue
             ts = event_ts
+            quota_fingerprints = codex_quota_fingerprints(payload.get("rate_limits"))
             if signature_index < len(session_signatures):
                 signature = session_signatures[signature_index]
             else:
@@ -2169,6 +2321,7 @@ def scan_codex_events(
                         session_id=session_id,
                         request_key=session_id,
                         account_at=active_turn_started_at,
+                        quota_fingerprints=quota_fingerprints,
                     )
                     if event is not None:
                         events.append(event)
@@ -2202,6 +2355,7 @@ def scan_codex_events(
                     session_id=session_id,
                     request_key=session_id,
                     account_at=active_turn_started_at,
+                    quota_fingerprints=quota_fingerprints,
                 )
                 if event is not None:
                     events.append(event)
@@ -2520,6 +2674,8 @@ def usage_event_account_time(event: UsageEvent) -> datetime:
 
 def usage_event_info_score(event: UsageEvent) -> int:
     score = 0
+    if event.quota_fingerprints:
+        score += 16
     if event.route:
         score += 8
     if event.session_id:
@@ -5009,6 +5165,77 @@ def account_label_at_time(
     )
 
 
+def quota_fingerprint_account_candidates(
+    events: list[UsageEvent],
+    markers: list[AccountMarker],
+) -> dict[tuple[int, int], set[str]]:
+    candidates: dict[tuple[int, int], set[str]] = {}
+    for account_id, entry in load_official_quota_cache().items():
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "").strip()
+        if not label.startswith("Codex local - "):
+            label = cockpit_account_label(
+                str(account_id),
+                str(entry.get("email") or ""),
+                label,
+            )
+        quota = entry.get("quota")
+        if not label or not isinstance(quota, dict):
+            continue
+        for window in quota.values():
+            fingerprint = quota_window_fingerprint(window)
+            if fingerprint is not None:
+                candidates.setdefault(fingerprint, set()).add(label)
+
+    request_markers = [
+        marker
+        for marker in markers
+        if marker.kind == "request" and account_marker_has_recorded_usage(marker)
+    ]
+    if not request_markers:
+        return candidates
+    marker_index = account_markers_by_total_tokens(request_markers)
+    used_marker_ids: set[int] = set()
+    for event in sorted(events, key=lambda item: item.when):
+        if not event.quota_fingerprints:
+            continue
+        marker, exact = concrete_api_service_account_match(
+            event,
+            request_markers,
+            marker_index,
+            used_marker_ids,
+        )
+        if marker is None or not exact or is_api_service_mirror_label(marker.label):
+            continue
+        used_marker_ids.add(id(marker))
+        for fingerprint in event.quota_fingerprints:
+            candidates.setdefault(fingerprint, set()).add(marker.label)
+    return candidates
+
+
+def apply_quota_fingerprint_account_hints(
+    events: list[UsageEvent],
+    markers: list[AccountMarker],
+) -> None:
+    candidates = quota_fingerprint_account_candidates(events, markers)
+    unique_labels = {
+        fingerprint: next(iter(labels))
+        for fingerprint, labels in candidates.items()
+        if len(labels) == 1
+    }
+    for event in events:
+        labels = {
+            unique_labels[fingerprint]
+            for fingerprint in event.quota_fingerprints
+            if fingerprint in unique_labels
+        }
+        if len(labels) != 1:
+            continue
+        event.account_label_hint = next(iter(labels))
+        event.account_hint_source = "quota_fingerprint"
+
+
 def attribute_codex_events_by_account(
     events: list[UsageEvent],
     markers: list[AccountMarker],
@@ -5019,9 +5246,19 @@ def attribute_codex_events_by_account(
     attributed: dict[str, list[UsageEvent]] = {}
     if not events:
         return attributed
+    apply_quota_fingerprint_account_hints(events, markers)
     if not markers:
         for event in events:
-            label, event_id = ledger_label_for_event(event, attribution_ledger)
+            event_id = codex_event_id(event)
+            label = (
+                event.account_label_hint
+                if event.account_hint_source == "quota_fingerprint"
+                else ""
+            )
+            if label and attribution_ledger is not None:
+                ledger_assign(attribution_ledger, event_id, label)
+            if not label:
+                label, event_id = ledger_label_for_event(event, attribution_ledger)
             if not label:
                 label = UNASSIGNED_CODEX_LABEL
                 if (
@@ -5042,7 +5279,16 @@ def attribute_codex_events_by_account(
     request_times = [marker.when for marker in request_markers]
     ledger = attribution_ledger
     for event in events:
-        label, event_id = ledger_label_for_event(event, ledger)
+        event_id = codex_event_id(event)
+        label = (
+            event.account_label_hint
+            if event.account_hint_source == "quota_fingerprint"
+            else ""
+        )
+        if label and ledger is not None:
+            ledger_assign(ledger, event_id, label)
+        if not label:
+            label, event_id = ledger_label_for_event(event, ledger)
         if not label:
             label = account_label_at_time(event, switch_markers, switch_times, request_markers, request_times)
             if (
@@ -6843,13 +7089,34 @@ def resolve_api_service_event_accounts(
         confirmed = False
         verdict_tier = ""
         counted_unresolved = False
-        if matched_marker is not None:
+        quota_hint_label = (
+            event.account_label_hint
+            if event.account_hint_source == "quota_fingerprint"
+            and event.account_label_hint
+            and not is_api_service_mirror_label(event.account_label_hint)
+            else ""
+        )
+        # A row with the same usage totals is the final Cockpit request and is
+        # the strongest evidence. A unique quota-window fingerprint is next:
+        # unlike a near-time or inherited turn anchor, it comes from the token
+        # response itself and must not be overwritten by a nearby concurrent
+        # request from another account.
+        if matched_marker is not None and record_index in exact_match_records:
             resolved_label = matched_marker.label
             confirmed = True
             verdict_tier = api_service_verdict_tier(
                 matched_marker,
-                record_index in exact_match_records,
+                True,
             )
+            if matched_marker.model:
+                event.model = matched_marker.model
+        elif quota_hint_label:
+            resolved_label = quota_hint_label
+            confirmed = True
+        elif matched_marker is not None:
+            resolved_label = matched_marker.label
+            confirmed = True
+            verdict_tier = api_service_verdict_tier(matched_marker, False)
             if matched_marker.model:
                 event.model = matched_marker.model
         elif turn_key and anchors_by_turn.get(turn_key):
