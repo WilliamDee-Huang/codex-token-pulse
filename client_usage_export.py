@@ -294,6 +294,7 @@ COCKPIT_OFFICIAL_QUOTA_ENABLED = os.environ.get(
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CLAUDE_USAGE_DEDUPE_SCHEMA = 2
+COCKPIT_USAGE_DEDUPE_SCHEMA = 1
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
 API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "300"))
 COCKPIT_AFFINITY_TURN_MATCH_SECONDS = max(
@@ -5719,7 +5720,10 @@ def account_marker_covers_event_time(
     if abs(delta_seconds) <= API_SERVICE_ACTIVITY_MATCH_SECONDS:
         return True
     latency_seconds = max(0.0, float(marker.latency_ms or 0) / 1000.0)
-    return latency_seconds > 0 and 0 <= delta_seconds <= latency_seconds
+    # Cockpit versions have stored request_logs.timestamp as either the
+    # request start or the response completion time.  Exact token matches can
+    # therefore sit on either side of the marker by up to the request latency.
+    return latency_seconds > 0 and abs(delta_seconds) <= latency_seconds
 
 
 def concrete_api_service_account_match(
@@ -7779,6 +7783,7 @@ def build_historical_usage_rows(
             "date": key,
             "source": "local-backfill",
             "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
+            "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
             "requests": int(total_row.get("requests") or 0),
             "tokens": int(total_row.get("tokens") or 0),
             "input_tokens": int(total_row.get("input_tokens") or 0),
@@ -7989,6 +7994,14 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         current_claude_schema = 0
         existing_claude_schema = 0
     claude_schema_upgrade = current_claude_schema > existing_claude_schema
+    try:
+        current_cockpit_schema = int(output.get("cockpit_usage_schema") or 0)
+        existing_cockpit_schema = int(existing.get("cockpit_usage_schema") or 0)
+    except (TypeError, ValueError):
+        current_cockpit_schema = 0
+        existing_cockpit_schema = 0
+    cockpit_schema_upgrade = current_cockpit_schema > existing_cockpit_schema
+    usage_schema_upgrade = claude_schema_upgrade or cockpit_schema_upgrade
     current_api_aggregate = bool(output.get("api_service_aggregate"))
     current_api_account_routing = current_api_aggregate or bool(output.get("api_service_routed"))
 
@@ -8089,13 +8102,13 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
     current_today = output.get("today")
     if (
         not current_api_aggregate
-        and not claude_schema_upgrade
+        and not usage_schema_upgrade
         and isinstance(existing_today, dict)
         and isinstance(current_today, dict)
     ):
         merge_cumulative(current_today, existing_today)
     merge_latest_request()
-    if not current_api_aggregate and not claude_schema_upgrade:
+    if not current_api_aggregate and not usage_schema_upgrade:
         merge_hourly_today()
     if "account_30d_updated_at" not in output and existing.get("account_30d_updated_at"):
         output["account_30d_updated_at"] = existing["account_30d_updated_at"]
@@ -8168,6 +8181,14 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         current_claude_schema = 0
         history_claude_schema = 0
     if current_claude_schema > history_claude_schema:
+        return
+    try:
+        current_cockpit_schema = int(output.get("cockpit_usage_schema") or 0)
+        history_cockpit_schema = int(row.get("cockpit_usage_schema") or 0)
+    except (TypeError, ValueError):
+        current_cockpit_schema = 0
+        history_cockpit_schema = 0
+    if current_cockpit_schema > history_cockpit_schema:
         return
     try:
         history_tokens = int(row.get("tokens") or 0)
@@ -8783,6 +8804,7 @@ def build_live_catchup_payload(
         return {
             "schema": 1,
             "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
+            "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
             "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "events": [],
@@ -8905,6 +8927,7 @@ def build_live_catchup_payload(
     return {
         "schema": 1,
         "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
+        "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
         "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "events": rows,
@@ -9225,6 +9248,7 @@ def main() -> int:
     output = {
         "schema": 1,
         "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
+        "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
         "source": "client-jsonl",
         "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "date": day.isoformat(),

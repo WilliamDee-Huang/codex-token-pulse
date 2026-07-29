@@ -1809,18 +1809,29 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     existing_requests = int(existing.get("requests") or 0)
     source_date = ""
     claude_usage_schema = 0
+    cockpit_usage_schema = 0
     if isinstance(state.client_usage, dict):
         source_date = str(state.client_usage.get("date") or "").strip()
         try:
             claude_usage_schema = int(state.client_usage.get("claude_usage_schema") or 0)
         except (TypeError, ValueError):
             claude_usage_schema = 0
+        try:
+            cockpit_usage_schema = int(state.client_usage.get("cockpit_usage_schema") or 0)
+        except (TypeError, ValueError):
+            cockpit_usage_schema = 0
     existing_source_date = str(existing.get("source_date") or "").strip()
     try:
         existing_claude_usage_schema = int(existing.get("claude_usage_schema") or 0)
     except (TypeError, ValueError):
         existing_claude_usage_schema = 0
     claude_schema_upgrade = claude_usage_schema > existing_claude_usage_schema
+    try:
+        existing_cockpit_usage_schema = int(existing.get("cockpit_usage_schema") or 0)
+    except (TypeError, ValueError):
+        existing_cockpit_usage_schema = 0
+    cockpit_schema_upgrade = cockpit_usage_schema > existing_cockpit_usage_schema
+    usage_schema_upgrade = claude_schema_upgrade or cockpit_schema_upgrade
     mix = token_mix_from_client_usage(state.client_usage if isinstance(state.client_usage, dict) else None)
     details = detailed_usage_from_state(state)
     preserve_existing_details = False
@@ -1831,7 +1842,7 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     use_local_high_water = state.usage_source in {"local", "client", "local-codex"}
     if (
         use_local_high_water
-        and not claude_schema_upgrade
+        and not usage_schema_upgrade
         and existing_source_date in {"", source_date, key}
     ):
         if existing_tokens > new_tokens and existing_tokens >= max(1, int(new_tokens * 1.05)):
@@ -1867,7 +1878,9 @@ def update_usage_history(state: "MonitorState") -> dict[str, Any]:
     }
     if claude_usage_schema > 0:
         updated_row["claude_usage_schema"] = claude_usage_schema
-    if not claude_schema_upgrade and isinstance(existing.get("source_gap"), dict):
+    if cockpit_usage_schema > 0:
+        updated_row["cockpit_usage_schema"] = cockpit_usage_schema
+    if not usage_schema_upgrade and isinstance(existing.get("source_gap"), dict):
         updated_row["source_gap"] = existing["source_gap"]
     days[key] = updated_row
     try:
@@ -3201,7 +3214,7 @@ def _live_marker_covers_usage_time(
     if abs(delta_seconds) <= LIVE_ACCOUNT_MATCH_SECONDS:
         return True
     latency_seconds = max(0.0, float(marker.get("latency_ms") or 0) / 1000.0)
-    return latency_seconds > 0 and 0 <= delta_seconds <= latency_seconds
+    return latency_seconds > 0 and abs(delta_seconds) <= latency_seconds
 
 
 def _live_cockpit_match_score(

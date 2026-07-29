@@ -1010,6 +1010,31 @@ class UsageHistoryIsolationTests(unittest.TestCase):
             client_usage_export.CLAUDE_USAGE_DEDUPE_SCHEMA,
         )
 
+    def test_cockpit_schema_upgrade_replaces_legacy_history_high_water(self) -> None:
+        self.seed_history("local")
+        state = monitor.MonitorState(
+            usage_source="local",
+            today_requests=8,
+            today_tokens=800_000,
+            today_account_cost=8.0,
+            client_usage={
+                "date": self.day,
+                "cockpit_usage_schema": (
+                    client_usage_export.COCKPIT_USAGE_DEDUPE_SCHEMA
+                ),
+                "providers": [],
+            },
+        )
+
+        monitor.update_usage_history(state)
+
+        saved = monitor.load_usage_history()["days"][self.day]
+        self.assertEqual(saved["tokens"], 800_000)
+        self.assertEqual(
+            saved["cockpit_usage_schema"],
+            client_usage_export.COCKPIT_USAGE_DEDUPE_SCHEMA,
+        )
+
 
 class AccountUsageSortTests(unittest.TestCase):
     def test_5h_and_7d_sort_recently_used_accounts_first(self) -> None:
@@ -3543,6 +3568,62 @@ class LatestRequestFallbackTests(unittest.TestCase):
             marker,
         )
 
+    def test_exact_token_match_accepts_request_start_timestamp(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 29, 8, 36, 30, 118000),
+            model="gpt-5.6-sol",
+            input_tokens=1_127,
+            cached_tokens=204_544,
+            output_tokens=31,
+        )
+        marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 29, 8, 31, 29, 292000),
+            label="Codex local - final@example.com",
+            total_tokens=event.total_tokens,
+            input_tokens=event.input_tokens,
+            cached_tokens=event.cached_tokens,
+            output_tokens=event.output_tokens,
+            latency_ms=309_565,
+        )
+
+        self.assertIs(
+            client_usage_export.concrete_api_service_account_marker(
+                event,
+                [marker],
+            ),
+            marker,
+        )
+
+    def test_cockpit_union_does_not_duplicate_request_start_marker(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 7, 29, 8, 36, 30, 118000),
+            model="gpt-5.6-sol",
+            input_tokens=1_127,
+            cached_tokens=204_544,
+            output_tokens=31,
+            session_id="request-start-session",
+        )
+        marker = client_usage_export.AccountMarker(
+            when=datetime(2026, 7, 29, 8, 31, 29, 292000),
+            label="Codex local - final@example.com",
+            model=event.model,
+            total_tokens=event.total_tokens,
+            input_tokens=event.input_tokens,
+            cached_tokens=event.cached_tokens,
+            output_tokens=event.output_tokens,
+            event_key="request-start-marker",
+            latency_ms=309_565,
+        )
+
+        merged, added = client_usage_export.merge_missing_cockpit_account_events(
+            {marker.label: [event]},
+            [marker],
+            fallback_before=marker.when + timedelta(hours=1),
+        )
+
+        self.assertEqual(added, 0)
+        self.assertEqual(merged[marker.label], [event])
+
     def test_request_start_latency_resolves_intermediate_turn_to_final_account(self) -> None:
         turn_started_at = datetime(2026, 7, 23, 10, 4, 59, 40000)
         intermediate = client_usage_export.UsageEvent(
@@ -4223,6 +4304,33 @@ class LocalExportHighWaterTests(unittest.TestCase):
         self.assertEqual(current["today"]["tokens"], 880_000)
         self.assertEqual(claude["tokens"], 80_000)
         self.assertEqual(current["dashboard"]["hourly_today"][0]["tokens"], 880_000)
+
+    def test_cockpit_schema_upgrade_does_not_restore_duplicate_high_water(self) -> None:
+        previous = self.snapshot(self.day, 1_000_000)
+        self.output_path.write_text(json.dumps(previous), encoding="utf-8")
+        self.history_path.write_text(
+            json.dumps({"days": {self.day.isoformat(): previous["today"]}}),
+            encoding="utf-8",
+        )
+
+        current = self.snapshot(self.day, 800_000)
+        current["api_service_routed"] = True
+        current["cockpit_usage_schema"] = (
+            client_usage_export.COCKPIT_USAGE_DEDUPE_SCHEMA
+        )
+
+        client_usage_export.same_day_output_high_water(
+            current,
+            self.output_path,
+            self.day,
+        )
+        client_usage_export.restore_today_from_usage_history(current, self.day)
+
+        self.assertEqual(current["today"]["tokens"], 800_000)
+        self.assertEqual(
+            current["dashboard"]["hourly_today"][0]["tokens"],
+            800_000,
+        )
 
 
 class WindowSemanticsTests(unittest.TestCase):
@@ -7268,6 +7376,31 @@ class LiveActiveSessionScanTests(unittest.TestCase):
             "cached_tokens": 10_624,
             "output_tokens": 772,
             "latency_ms": 360_500,
+        }
+
+        self.assertIs(
+            monitor._match_live_cockpit_marker(usage, [marker]),
+            marker,
+        )
+
+    def test_live_exact_marker_accepts_request_start_timestamp(self) -> None:
+        event_when = datetime(2026, 7, 29, 8, 36, 30, 118000, tzinfo=timezone.utc)
+        usage = {
+            "when": event_when,
+            "session_id": "request-start-session",
+            "total_tokens": 205_702,
+            "input_tokens": 1_127,
+            "cached_tokens": 204_544,
+            "output_tokens": 31,
+        }
+        marker = {
+            "when": event_when - timedelta(seconds=300.826),
+            "label": "Codex local - final@example.com",
+            "total_tokens": 205_702,
+            "input_tokens": 1_127,
+            "cached_tokens": 204_544,
+            "output_tokens": 31,
+            "latency_ms": 309_565,
         }
 
         self.assertIs(
