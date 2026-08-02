@@ -846,6 +846,21 @@ class ModelPricingFallbackTests(unittest.TestCase):
 
         self.assertEqual(prices["gpt-new"], (6.0, 0.6, 36.0))
 
+    def test_online_xai_prices_are_available_to_local_grok_models(self) -> None:
+        prices = client_usage_export.extract_online_price_table(
+            {
+                "xai/grok-new": {
+                    "litellm_provider": "xai",
+                    "input_cost_per_token": 0.000003,
+                    "cache_read_input_token_cost": 0.00000075,
+                    "output_cost_per_token": 0.000015,
+                }
+            }
+        )
+
+        self.assertEqual(prices["xai/grok-new"], (3.0, 0.75, 15.0))
+        self.assertEqual(prices["grok-new"], (3.0, 0.75, 15.0))
+
     def test_complete_online_pricing_rules_ignore_long_context_surcharge(self) -> None:
         profile = {
             "input_cost_per_token": 5.0,
@@ -9173,6 +9188,89 @@ class LiveUsageOverlayTests(unittest.TestCase):
                 3,
             )
 
+    def test_catchup_keeps_latest_provider_and_model_from_one_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            app.state = self.state(tokens=100, requests=1)
+            app.state.client_usage["api_service_routed"] = True
+            app.state.client_usage["providers"] = [
+                {
+                    "name": "Codex local - plus@example.com",
+                    "tokens": 100,
+                    "requests": 1,
+                    "cost": 1.0,
+                }
+            ]
+            app.state.top_accounts = [
+                {
+                    "name": "Codex local - plus@example.com",
+                    "tokens": 100,
+                    "requests": 1,
+                    "cost": 1.0,
+                }
+            ]
+            app.state.latest_account_name = "Grok local"
+            previous_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            app.state.latest_request = {
+                "kind": "success",
+                "provider": "Grok local",
+                "model": "grok-4.5-build",
+                "created_at": previous_at.isoformat(timespec="seconds"),
+            }
+            app._live_usage_overlay = None
+            app._live_usage_seen_ids = {}
+            app._live_usage_event_records = {}
+            app._live_usage_verification_pending = False
+            app._live_usage_verification_latest_when = None
+            app._live_usage_verification_pending_tokens = 0
+            app._live_usage_rate_samples = []
+            app._last_live_checkpoint_write_at = float("-inf")
+            app._live_catchup_lock = threading.Lock()
+            app._live_catchup_lock.acquire()
+            app._live_initial_recheck_scheduled = True
+            app.closed = False
+            app._draw = lambda: None
+
+            latest_when = datetime.now(timezone.utc)
+            payload = {
+                "through": latest_when.isoformat(),
+                "events": [],
+                "summary": {
+                    "tokens": 150,
+                    "requests": 2,
+                    "cost": 1.5,
+                    "input_tokens": 100,
+                    "cached_input_tokens": 30,
+                    "output_tokens": 20,
+                    "latest_at": latest_when.isoformat(),
+                    "latest_model": "gpt-5.6-sol",
+                },
+                "providers": [
+                    {
+                        "name": "Codex local - plus@example.com",
+                        "tokens": 150,
+                        "requests": 2,
+                        "cost": 1.5,
+                        "latest_at": latest_when.isoformat(),
+                        "latest_model": "gpt-5.6-sol",
+                    }
+                ],
+            }
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                app._apply_live_usage_catchup(payload)
+
+            self.assertEqual(
+                app.state.latest_request["provider"],
+                "Codex local - plus@example.com",
+            )
+            self.assertEqual(app.state.latest_request["model"], "gpt-5.6-sol")
+            self.assertEqual(
+                app.state.latest_account_name,
+                "Codex local - plus@example.com",
+            )
+
     def test_live_event_updates_recent_request_from_matching_session(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
@@ -10940,6 +11038,266 @@ class ClaudeUsageEventTests(unittest.TestCase):
         self.assertEqual(buckets[date(2026, 7, 23)].requests, 1)
         self.assertEqual(buckets[date(2026, 7, 23)].total_tokens, 550)
         self.assertNotIn(date(2026, 7, 24), buckets)
+
+
+class GrokUsageEventTests(unittest.TestCase):
+    @staticmethod
+    def _row(
+        timestamp: str,
+        prompt_id: str,
+        model_usage: dict[str, dict[str, int]],
+        *,
+        session_id: str = "grok-session-1",
+        session_update: str = "turn_completed",
+        stop_reason: str = "end_turn",
+    ) -> dict[str, object]:
+        return {
+            "timestamp": timestamp,
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": session_update,
+                    "prompt_id": prompt_id,
+                    "stop_reason": stop_reason,
+                    "usage": {"modelUsage": model_usage},
+                },
+            },
+        }
+
+    @staticmethod
+    def _write(path: Path, rows: list[dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _detail(
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        cached_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        model_calls: int = 1,
+    ) -> dict[str, int]:
+        return {
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "totalTokens": total_tokens,
+            "cachedReadTokens": cached_read_tokens,
+            "cacheCreationTokens": cache_creation_tokens,
+            "modelCalls": model_calls,
+        }
+
+    def test_model_calls_preserve_request_count_tokens_and_cache_partition(self) -> None:
+        row = self._row(
+            "2026-07-23T10:00:00+08:00",
+            "prompt-1",
+            {
+                "grok-test": self._detail(
+                    input_tokens=900,
+                    output_tokens=100,
+                    total_tokens=1_000,
+                    cached_read_tokens=600,
+                    cache_creation_tokens=100,
+                    model_calls=3,
+                )
+            },
+        )
+
+        events = client_usage_export.grok_usage_events_from_update_row(row)
+        bucket = client_usage_export.bucket_from_grok_events(events)
+
+        self.assertEqual(len(events), 3)
+        self.assertEqual(bucket.requests, 3)
+        self.assertEqual(bucket.total_tokens, 1_000)
+        self.assertEqual(bucket.input_tokens, 200)
+        self.assertEqual(bucket.cached_input_tokens, 700)
+        self.assertEqual(bucket.output_tokens, 100)
+        self.assertEqual(sum(event.total_tokens for event in events), 1_000)
+
+    def test_multiple_models_and_duplicate_files_are_counted_once(self) -> None:
+        row = self._row(
+            "2026-07-23T11:00:00+08:00",
+            "prompt-shared",
+            {
+                "grok-a": self._detail(
+                    input_tokens=180,
+                    output_tokens=20,
+                    total_tokens=200,
+                    model_calls=2,
+                ),
+                "grok-b": self._detail(
+                    input_tokens=250,
+                    output_tokens=50,
+                    total_tokens=300,
+                ),
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write(root / "copy-a" / "updates.jsonl", [row])
+            self._write(root / "copy-b" / "updates.jsonl", [row])
+
+            events = client_usage_export.scan_grok_events(
+                root,
+                datetime(2026, 7, 23),
+                datetime(2026, 7, 24),
+            )
+            bucket = client_usage_export.bucket_from_grok_events(events)
+
+        self.assertEqual(len(events), 3)
+        self.assertEqual(bucket.requests, 3)
+        self.assertEqual(bucket.total_tokens, 500)
+        self.assertEqual(bucket.models, {"grok-a": 200, "grok-b": 300})
+
+    def test_cancelled_turn_with_usage_counts_but_incomplete_rows_do_not(self) -> None:
+        completed = self._row(
+            "2026-07-23T12:00:00+08:00",
+            "prompt-cancelled",
+            {
+                "grok-test": self._detail(
+                    input_tokens=80,
+                    output_tokens=20,
+                    total_tokens=100,
+                )
+            },
+            stop_reason="cancelled",
+        )
+        incomplete = self._row(
+            "2026-07-23T12:01:00+08:00",
+            "prompt-incomplete",
+            {
+                "grok-test": self._detail(
+                    input_tokens=900,
+                    output_tokens=100,
+                    total_tokens=1_000,
+                )
+            },
+            session_update="turn_started",
+        )
+        no_usage = self._row(
+            "2026-07-23T12:02:00+08:00",
+            "prompt-empty",
+            {"grok-test": self._detail(input_tokens=0, output_tokens=0, total_tokens=0)},
+        )
+
+        events = [
+            *client_usage_export.grok_usage_events_from_update_row(completed),
+            *client_usage_export.grok_usage_events_from_update_row(incomplete),
+            *client_usage_export.grok_usage_events_from_update_row(no_usage),
+        ]
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].total_tokens, 100)
+
+    def test_missing_prompt_ids_use_stable_but_turn_specific_fallbacks(self) -> None:
+        first = self._row(
+            "2026-07-23T13:00:00+08:00",
+            "",
+            {"grok-test": self._detail(input_tokens=90, output_tokens=10, total_tokens=100)},
+        )
+        second = self._row(
+            "2026-07-23T13:01:00+08:00",
+            "",
+            {"grok-test": self._detail(input_tokens=90, output_tokens=10, total_tokens=100)},
+        )
+
+        first_event = client_usage_export.grok_usage_events_from_update_row(first)[0]
+        duplicate_event = client_usage_export.grok_usage_events_from_update_row(first)[0]
+        second_event = client_usage_export.grok_usage_events_from_update_row(second)[0]
+
+        self.assertEqual(first_event.request_key, duplicate_event.request_key)
+        self.assertNotEqual(first_event.request_key, second_event.request_key)
+
+    def test_live_watcher_emits_only_appended_completed_usage(self) -> None:
+        completed = self._row(
+            "2026-07-23T14:00:00+08:00",
+            "prompt-live",
+            {
+                "grok-live": self._detail(
+                    input_tokens=900,
+                    output_tokens=100,
+                    total_tokens=1_000,
+                    cached_read_tokens=400,
+                    model_calls=2,
+                )
+            },
+        )
+        incomplete = self._row(
+            "2026-07-23T13:59:00+08:00",
+            "prompt-started",
+            {},
+            session_update="turn_started",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "grok-session-1" / "updates.jsonl"
+            self._write(path, [incomplete])
+            watcher = monitor.GrokUsageFileWatcher(root)
+
+            self.assertFalse(watcher.poll())
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(incomplete) + "\n")
+            self.assertEqual(watcher.poll_events(), [])
+            self.assertFalse(watcher.usage_changed)
+
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(completed) + "\n")
+            events = watcher.poll_events()
+
+            exported = client_usage_export.grok_usage_events_from_update_row(completed)
+            exported_ids = [client_usage_export.live_usage_event_id(event) for event in exported]
+            watcher.close()
+
+        self.assertEqual(len(events), 2)
+        self.assertTrue(watcher.usage_changed)
+        self.assertEqual(sum(int(event["total_tokens"]) for event in events), 1_000)
+        self.assertEqual([event["event_id"] for event in events], exported_ids)
+        self.assertTrue(all(event["provider"] == "Grok local" for event in events))
+        self.assertTrue(all(event["route"] == "grok-local" for event in events))
+
+    def test_grok_live_events_never_match_cockpit_markers(self) -> None:
+        when = datetime(2026, 7, 23, 14, 0, tzinfo=timezone.utc)
+        usage = {
+            "when": when,
+            "route": "grok-local",
+            "session_id": "grok-session",
+            "total_tokens": 1_000,
+            "input_tokens": 900,
+            "cached_tokens": 0,
+            "output_tokens": 100,
+        }
+        marker = {
+            "when": when,
+            "label": "Codex local - account@example.com",
+            "total_tokens": 1_000,
+            "input_tokens": 900,
+            "cached_tokens": 0,
+            "output_tokens": 100,
+        }
+
+        self.assertEqual(monitor._match_live_cockpit_markers([usage], [marker]), {})
+
+    def test_unknown_grok_live_model_does_not_borrow_codex_average_cost(self) -> None:
+        usage = {
+            "route": "grok-local",
+            "total_tokens": 1_000,
+            "input_tokens": 900,
+            "cached_tokens": 0,
+            "output_tokens": 100,
+        }
+        with patch.object(monitor, "_load_live_model_prices", return_value={}):
+            cost = monitor.estimate_live_usage_cost(
+                usage,
+                "grok-unknown",
+                fallback_cost_per_token=0.001,
+            )
+
+        self.assertEqual(cost, 0.0)
 
 
 class ClientUsageSyncStatusTests(unittest.TestCase):

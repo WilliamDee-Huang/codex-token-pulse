@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import hashlib
 import heapq
 import json
 import logging
@@ -991,6 +992,7 @@ def ranking_account_display_name(account_name: str) -> str:
     aliases = {
         "api-service-local": "API \u670d\u52a1",
         "claude local": "Claude",
+        "grok local": "Grok",
         "local client": "\u5ba2\u6237\u7aef",
         "local client logs": "\u5ba2\u6237\u7aef\u65e5\u5fd7",
     }
@@ -1396,6 +1398,8 @@ def estimate_live_usage_cost(
             + cached_input * cache_rate
             + output_tokens * output_rate,
         )
+    if str(usage.get("route") or "").strip().lower() == "grok-local":
+        return 0.0
     return max(0.0, total_tokens * max(0.0, float(fallback_cost_per_token or 0.0)))
 
 
@@ -2606,6 +2610,304 @@ def _live_token_usage(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+GROK_TURN_COMPLETED_BYTES_RE = re.compile(
+    rb'"sessionUpdate"\s*:\s*"turn_completed"'
+)
+
+
+def _grok_usage_int(row: dict[str, Any], key: str) -> int:
+    try:
+        return max(0, int(row.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _split_grok_token_count(total: int, parts: int, index: int) -> int:
+    total = max(0, int(total or 0))
+    parts = max(1, int(parts or 1))
+    quotient, remainder = divmod(total, parts)
+    return quotient + (1 if 0 <= index < remainder else 0)
+
+
+def _grok_update_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    return _parse_time(str(value or ""))
+
+
+def _grok_live_events_from_update_row(
+    row: dict[str, Any],
+    fallback_session_id: str = "",
+) -> list[dict[str, Any]]:
+    params = row.get("params")
+    if not isinstance(params, dict):
+        return []
+    update = params.get("update")
+    if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
+        return []
+    usage = update.get("usage")
+    if not isinstance(usage, dict):
+        return []
+    when = _grok_update_timestamp(row.get("timestamp"))
+    if when is None:
+        return []
+
+    session_id = str(params.get("sessionId") or fallback_session_id or "").strip()
+    prompt_id = str(update.get("prompt_id") or "").strip()
+    if not prompt_id:
+        identity_payload = {
+            "session_id": session_id,
+            "timestamp": row.get("timestamp"),
+            "usage": usage,
+        }
+        prompt_id = "fallback-" + hashlib.sha256(
+            json.dumps(
+                identity_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="ignore")
+        ).hexdigest()
+
+    model_usage = usage.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        fallback_model = str(
+            usage.get("model")
+            or update.get("model")
+            or update.get("model_id")
+            or "grok"
+        ).strip() or "grok"
+        model_usage = {fallback_model: usage}
+
+    events: list[dict[str, Any]] = []
+    event_offset = 0
+    for raw_model, raw_detail in sorted(model_usage.items(), key=lambda item: str(item[0])):
+        if not isinstance(raw_detail, dict):
+            continue
+        model = str(raw_model or "grok").strip() or "grok"
+        raw_input = _grok_usage_int(raw_detail, "inputTokens")
+        output_tokens = _grok_usage_int(raw_detail, "outputTokens")
+        total_tokens = _grok_usage_int(raw_detail, "totalTokens")
+        if total_tokens <= 0:
+            total_tokens = raw_input + output_tokens
+        if total_tokens <= 0:
+            continue
+
+        output_tokens = min(output_tokens, total_tokens)
+        input_tokens = max(0, total_tokens - output_tokens)
+        cache_read = _grok_usage_int(raw_detail, "cachedReadTokens")
+        cache_creation = _grok_usage_int(raw_detail, "cacheCreationTokens")
+        if cache_read <= 0 and cache_creation <= 0:
+            cache_read = _grok_usage_int(raw_detail, "cachedTokens")
+        cached_tokens = min(input_tokens, cache_read + cache_creation)
+        uncached_input = max(0, input_tokens - cached_tokens)
+        model_calls = max(1, _grok_usage_int(raw_detail, "modelCalls"))
+
+        for call_index in range(model_calls):
+            call_when = when + timedelta(microseconds=event_offset)
+            event_offset += 1
+            call_cached = _split_grok_token_count(
+                cached_tokens,
+                model_calls,
+                call_index,
+            )
+            call_input = call_cached + _split_grok_token_count(
+                uncached_input,
+                model_calls,
+                call_index,
+            )
+            call_output = _split_grok_token_count(
+                output_tokens,
+                model_calls,
+                call_index,
+            )
+            call_total = call_input + call_output
+            if call_total <= 0:
+                continue
+            request_key = f"grok:{session_id}:{prompt_id}:{model}:{call_index}"
+            events.append(
+                {
+                    "when": call_when,
+                    "provider": "Grok local",
+                    "model": model,
+                    "session_id": session_id,
+                    "request_key": request_key,
+                    "route": "grok-local",
+                    "total_tokens": call_total,
+                    "input_tokens": call_input,
+                    "cached_tokens": call_cached,
+                    "output_tokens": call_output,
+                    "event_id": _live_usage_event_id(
+                        call_when,
+                        session_id,
+                        call_input,
+                        call_cached,
+                        call_output,
+                    ),
+                }
+            )
+    return events
+
+
+class GrokUsageFileWatcher:
+    """Watch Grok Build turn completions without reading CPAMP state."""
+
+    def __init__(
+        self,
+        sessions_root: Path,
+        max_read_bytes: int = LIVE_USAGE_WATCH_READ_BYTES,
+    ) -> None:
+        self.sessions_root = sessions_root
+        self.max_read_bytes = max(4096, int(max_read_bytes))
+        self._files: dict[Path, tuple[int, int]] = {}
+        self._seen_event_ids: dict[str, None] = {}
+        self._last_full_scan_at = float("-inf")
+        self._last_activity_at = time.monotonic()
+        self._primed = False
+        self.usage_changed = False
+        self._directory_changes: WindowsDirectoryChangeSignal | None = None
+        native_setting = os.environ.get("TOKEN_PULSE_NATIVE_FILE_WATCH", "auto").strip().lower()
+        native_enabled = native_setting not in {"0", "false", "no", "off"}
+        if native_enabled and os.name == "nt":
+            try:
+                sessions_root.resolve().relative_to((Path.home() / ".grok").resolve())
+                is_default_root = True
+            except (OSError, ValueError):
+                is_default_root = native_setting in {"1", "true", "yes", "on"}
+            if is_default_root:
+                signal = WindowsDirectoryChangeSignal(sessions_root)
+                if signal.available:
+                    self._directory_changes = signal
+
+    def close(self) -> None:
+        if self._directory_changes is not None:
+            self._directory_changes.close()
+            self._directory_changes = None
+
+    def _read_region(self, path: Path, start: int, end: int) -> bytes:
+        if end <= 0:
+            return b""
+        overlap = min(self.max_read_bytes, LIVE_USAGE_WATCH_OVERLAP_BYTES)
+        read_start = max(0, min(start, end) - overlap)
+        read_start = max(read_start, end - self.max_read_bytes)
+        try:
+            with path.open("rb") as handle:
+                handle.seek(read_start)
+                return handle.read(max(0, end - read_start))
+        except OSError:
+            return b""
+
+    def _full_scan_paths(self) -> set[Path]:
+        try:
+            return set(self.sessions_root.rglob("updates.jsonl"))
+        except OSError:
+            return set()
+
+    def next_poll_interval_ms(self, now: float | None = None) -> int:
+        current = time.monotonic() if now is None else float(now)
+        idle_seconds = max(0.0, current - self._last_activity_at)
+        if idle_seconds <= LIVE_USAGE_WATCH_HOT_SECONDS:
+            return LIVE_USAGE_WATCH_INTERVAL_MS
+        if idle_seconds <= LIVE_USAGE_WATCH_IDLE_SECONDS:
+            return LIVE_USAGE_WATCH_IDLE_INTERVAL_MS
+        return LIVE_USAGE_WATCH_COLD_INTERVAL_MS
+
+    def _extract_live_events(self, path: Path, data: bytes) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for raw_line in data.splitlines():
+            try:
+                row = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            for event in _grok_live_events_from_update_row(row, path.parent.name):
+                event_id = str(event.get("event_id") or "")
+                if not event_id or event_id in self._seen_event_ids:
+                    continue
+                self._seen_event_ids[event_id] = None
+                events.append(event)
+        while len(self._seen_event_ids) > 16_384:
+            self._seen_event_ids.pop(next(iter(self._seen_event_ids)))
+        return events
+
+    def poll_events(self) -> list[dict[str, Any]]:
+        live_events: list[dict[str, Any]] = []
+        was_primed = self._primed
+        now = time.monotonic()
+        paths = set(self._files)
+        native_overflow = False
+        if self._directory_changes is not None:
+            notified_paths, native_overflow = self._directory_changes.drain()
+            paths.update(
+                path
+                for path in notified_paths
+                if path.name.casefold() == "updates.jsonl"
+            )
+        full_scan_due = (
+            not was_primed
+            or native_overflow
+            or now - self._last_full_scan_at >= LIVE_USAGE_WATCH_FULL_SCAN_SECONDS
+        )
+        if full_scan_due:
+            scanned_paths = self._full_scan_paths()
+            paths.update(scanned_paths)
+            self._last_full_scan_at = now
+            for missing in set(self._files) - scanned_paths:
+                self._files.pop(missing, None)
+
+        usage_changed = False
+        activity_detected = False
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                self._files.pop(path, None)
+                continue
+            size = max(0, int(stat.st_size))
+            current = (size, int(stat.st_mtime_ns))
+            previous = self._files.get(path)
+            self._files[path] = current
+            if previous == current:
+                continue
+            if was_primed:
+                activity_detected = True
+            if not was_primed:
+                data = self._read_region(path, max(0, size - self.max_read_bytes), size)
+                self._extract_live_events(path, data)
+                continue
+            if previous is None:
+                scan_start = max(0, size - self.max_read_bytes)
+            elif size > previous[0]:
+                scan_start = previous[0]
+            else:
+                scan_start = max(0, size - self.max_read_bytes)
+            data = self._read_region(path, scan_start, size)
+            if GROK_TURN_COMPLETED_BYTES_RE.search(data) is None:
+                continue
+            usage_changed = True
+            live_events.extend(self._extract_live_events(path, data))
+
+        if activity_detected:
+            self._last_activity_at = now
+        self._primed = True
+        self.usage_changed = usage_changed
+        live_events.sort(
+            key=lambda event: (
+                event.get("when") or datetime.min.replace(tzinfo=timezone.utc),
+                str(event.get("event_id") or ""),
+            )
+        )
+        return live_events
+
+    def poll(self) -> bool:
+        self.poll_events()
+        return self.usage_changed
+
+
 def _live_request_boundary_at(row: dict[str, Any]) -> datetime | None:
     payload = row.get("payload")
     if not isinstance(payload, dict):
@@ -3259,6 +3561,8 @@ def _match_live_cockpit_markers(
     candidates_by_marker: dict[int, list[tuple[tuple[int, int, float], int]]] = {}
     for usage_index, usage in enumerate(usages):
         if not usage:
+            continue
+        if str(usage.get("route") or "").strip().lower() == "grok-local":
             continue
         for marker in markers:
             score = _live_cockpit_match_score(usage, marker)
@@ -4616,6 +4920,7 @@ def build_local_monitor_state(
         )
         latest_request = {
             "kind": client_latest.get("kind") or "success",
+            "provider": provider_name,
             "model": client_latest.get("model") or "-",
             "created_at": client_latest.get("created_at"),
             "source": "LOCAL",
@@ -4637,6 +4942,7 @@ def build_local_monitor_state(
     elif updated_at:
         latest_request = {
             "kind": "success",
+            "provider": latest_account_name,
             "model": "Codex",
             "created_at": updated_at,
             "source": "LOCAL",
@@ -5247,6 +5553,10 @@ class Sub2APIClient:
 
         display_latest = latest
         display_latest_account_name = latest_account_name
+        if isinstance(display_latest, dict):
+            display_latest = dict(display_latest)
+            if latest_account_name:
+                display_latest.setdefault("provider", latest_account_name)
         client_latest = client_usage.get("latest_request") if isinstance(client_usage, dict) else {}
         if show_local_activity and isinstance(client_latest, dict) and client_latest.get("created_at"):
             provider_name = str(client_latest.get("provider") or "Local client")
@@ -5256,6 +5566,7 @@ class Sub2APIClient:
             )
             local_latest = {
                 "kind": client_latest.get("kind") or "success",
+                "provider": provider_name,
                 "model": client_latest.get("model") or "-",
                 "created_at": client_latest.get("created_at"),
                 "source": "LOCAL",
@@ -5453,8 +5764,13 @@ class FloatingMonitorApp:
         self._last_auth_identity = ""
         self._capture_auth_switch(refresh_active=False)
         self._live_usage_watcher = CodexUsageFileWatcher(Path.home() / ".codex" / "sessions")
+        self._grok_usage_watcher = GrokUsageFileWatcher(Path.home() / ".grok" / "sessions")
         try:
             self._live_usage_watcher.poll()
+        except Exception:
+            pass
+        try:
+            self._grok_usage_watcher.poll()
         except Exception:
             pass
         self._live_usage_overlay: dict[str, Any] | None = None
@@ -8282,7 +8598,12 @@ class FloatingMonitorApp:
             if speed_badge:
                 model = f"{model} / {speed_badge}"
             created = req.get("created_at", "")
-            raw_acct = self.state.latest_account_name or "-"
+            request_provider = req.get("provider")
+            raw_acct = (
+                str(request_provider).strip() or "-"
+                if request_provider is not None
+                else (self.state.latest_account_name or "-")
+            )
             acct = ranking_account_display_name(raw_acct)
             acct_type = account_type_label(name=raw_acct)
             status_text = "\u9519\u8bef" if kind == "error" else ("\u6210\u529f" if kind else "-")
@@ -9383,6 +9704,7 @@ class FloatingMonitorApp:
         if isinstance(event_when, datetime):
             self.state.latest_request = {
                 "kind": "success",
+                "provider": provider,
                 "model": str(latest_event.get("model") or "-"),
                 "created_at": event_when.astimezone(CN_TZ).isoformat(
                     timespec="seconds"
@@ -9590,6 +9912,7 @@ class FloatingMonitorApp:
                 self.state.latest_account_name = provider
                 self.state.latest_request = {
                     "kind": "success",
+                    "provider": provider,
                     "model": model or str(event.get("model") or "-"),
                     "created_at": event["when"]
                     .astimezone(CN_TZ)
@@ -9860,6 +10183,59 @@ class FloatingMonitorApp:
             latest_when = _parse_time(str(summary.get("latest_at") or ""))
             latest_provider = ""
             latest_model = str(summary.get("latest_model") or "")
+            explicit_latest = payload.get("latest_request")
+            if isinstance(explicit_latest, dict):
+                explicit_when = _parse_time(
+                    str(
+                        explicit_latest.get("created_at")
+                        or explicit_latest.get("latest_at")
+                        or ""
+                    )
+                )
+                explicit_provider = str(
+                    explicit_latest.get("provider") or ""
+                ).strip()
+                explicit_model = str(explicit_latest.get("model") or "")
+                if explicit_when is not None:
+                    latest_when = explicit_when
+                    latest_provider = explicit_provider
+                    latest_model = explicit_model or latest_model
+            # A catch-up summary carries the newest model/time but historically
+            # did not carry its provider.  Recover the provider from the
+            # provider bucket at that same timestamp so a previous Grok event
+            # cannot be paired with a newer Codex model.
+            provider_latest_candidates: list[tuple[datetime, str, str]] = []
+            for provider_name, provider in provider_targets.items():
+                provider_at = _parse_time(str(provider.get("latest_at") or ""))
+                if provider_at is None:
+                    continue
+                provider_latest_candidates.append(
+                    (
+                        provider_at,
+                        provider_name,
+                        str(provider.get("latest_model") or ""),
+                    )
+                )
+            if provider_latest_candidates and not latest_provider:
+                provider_latest_candidates.sort(key=lambda item: item[0])
+                matching = provider_latest_candidates
+                if latest_when is not None:
+                    matching = [
+                        item
+                        for item in provider_latest_candidates
+                        if abs((item[0] - latest_when).total_seconds()) <= 1.5
+                    ]
+                if matching:
+                    provider_at, latest_provider, provider_model = max(
+                        matching,
+                        key=lambda item: (
+                            item[0],
+                            bool(latest_model and item[2] == latest_model),
+                        ),
+                    )
+                    if latest_when is None or provider_at > latest_when:
+                        latest_when = provider_at
+                    latest_model = provider_model or latest_model
             records = getattr(self, "_live_usage_event_records", {})
             tail_tokens = 0
             tail_events: list[dict[str, Any]] = []
@@ -9886,6 +10262,8 @@ class FloatingMonitorApp:
                 target["cached_input_tokens"] += cached
                 target["output_tokens"] += output
                 provider_name = str(event.get("provider") or "").strip()
+                if not provider_name and str(event.get("route") or "").strip().lower() != "grok-local":
+                    provider_name = "Codex local - api-service-local"
                 if provider_name:
                     provider = provider_targets.setdefault(
                         provider_name,
@@ -9910,6 +10288,31 @@ class FloatingMonitorApp:
                     latest_when = when
                     latest_provider = provider_name
                     latest_model = str(event.get("model") or latest_model)
+
+            # Rows in the payload retain event-level provider/model identity.
+            # They fill the gap when older exporters omit latest_at on provider
+            # buckets, while the provider bucket remains authoritative when it
+            # has a timestamp matching the summary.
+            if not latest_provider:
+                row_candidates: list[tuple[datetime, str, str]] = []
+                for row in rows:
+                    row_when = _parse_time(str(row.get("when") or ""))
+                    if row_when is None:
+                        continue
+                    row_provider = str(row.get("provider") or "").strip()
+                    if not row_provider and str(row.get("route") or "").strip().lower() != "grok-local":
+                        row_provider = "Codex local - api-service-local"
+                    row_candidates.append(
+                        (row_when, row_provider, str(row.get("model") or ""))
+                    )
+                if row_candidates:
+                    row_when, row_provider, row_model = max(
+                        row_candidates,
+                        key=lambda item: item[0],
+                    )
+                    if latest_when is None or row_when >= latest_when - timedelta(seconds=1):
+                        latest_provider = row_provider
+                        latest_model = row_model or latest_model
 
             client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
             authoritative_tokens = max(0, int(client_usage.get("tokens") or 0))
@@ -9984,14 +10387,20 @@ class FloatingMonitorApp:
             self._apply_live_usage_overlay(self.state)
             self._complete_live_usage_verification(through)
             if latest_when is not None:
+                request_provider = latest_provider or (
+                    "Codex local - api-service-local"
+                    if bool(client_usage.get("api_service_routed"))
+                    else ""
+                )
                 self.state.latest_request = {
                     "kind": "success",
+                    "provider": request_provider,
                     "model": latest_model or "-",
                     "created_at": latest_when.astimezone(CN_TZ).isoformat(timespec="seconds"),
                     "source": "CLIENT",
                 }
-            if latest_provider:
-                self.state.latest_account_name = latest_provider
+                if request_provider:
+                    self.state.latest_account_name = request_provider
             self._persist_live_usage_checkpoint(force=True)
             self._last_live_reconcile_at = time.monotonic()
             self._draw()
@@ -10099,13 +10508,32 @@ class FloatingMonitorApp:
         def _worker() -> None:
             markers: list[dict[str, Any]] | None = None
             try:
-                events = self._live_usage_watcher.poll_events()
-                changed = self._live_usage_watcher.token_count_changed
+                codex_events = self._live_usage_watcher.poll_events()
+                codex_changed = self._live_usage_watcher.token_count_changed
             except Exception:
-                events = []
-                changed = False
-            if events:
+                codex_events = []
+                codex_changed = False
+            try:
+                grok_events = self._grok_usage_watcher.poll_events()
+                grok_changed = self._grok_usage_watcher.usage_changed
+            except Exception:
+                grok_events = []
+                grok_changed = False
+            events = [*codex_events, *grok_events]
+            events.sort(
+                key=lambda event: (
+                    event.get("when") or datetime.min.replace(tzinfo=timezone.utc),
+                    str(event.get("event_id") or ""),
+                )
+            )
+            changed = codex_changed or grok_changed
+            if any(
+                str(event.get("route") or "").strip().lower() != "grok-local"
+                for event in events
+            ):
                 markers = self._prefetch_live_cockpit_markers()
+            elif events:
+                markers = []
             try:
                 self.root.after(
                     0,
@@ -10566,18 +10994,20 @@ class FloatingMonitorApp:
         elif getattr(self, "_pending_latest_event_id", "") == latest_event_id:
             self._pending_latest_event_id = ""
         if not (latest_pending and preserve_confirmed_latest):
+            request_provider = latest_provider or (
+                "Codex local - api-service-local" if api_service_current else ""
+            )
             self.state.latest_request = {
                 "kind": "success",
+                "provider": request_provider,
                 "model": latest_model or "-",
                 "created_at": latest_when,
                 "source": "CLIENT",
                 "event_id": latest_event_id,
                 "session_id": str(latest_event.get("session_id") or ""),
             }
-            if latest_provider:
-                self.state.latest_account_name = latest_provider
-            elif api_service_current:
-                self.state.latest_account_name = "Codex local - api-service-local"
+            if request_provider:
+                self.state.latest_account_name = request_provider
         if animate and hasattr(self, "root"):
             self._ensure_pulse_animation()
         self._apply_live_usage_overlay(self.state)
@@ -10701,6 +11131,7 @@ class FloatingMonitorApp:
         state.latest_account_name = provider
         state.latest_request.update(
             {
+                "provider": provider,
                 "model": str(
                     latest_event.get("model")
                     or state.latest_request.get("model")
@@ -10713,6 +11144,26 @@ class FloatingMonitorApp:
                 "session_id": str(latest_event.get("session_id") or ""),
             }
         )
+
+    def _synchronize_latest_request_identity(self, state: MonitorState) -> None:
+        """Keep the account label and model attached to one latest request."""
+        request = state.latest_request
+        if not isinstance(request, dict) or not request.get("created_at"):
+            return
+        if "provider" in request:
+            provider = str(request.get("provider") or "").strip()
+            if provider:
+                state.latest_account_name = provider
+            elif isinstance(state.client_usage, dict) and state.client_usage.get(
+                "api_service_routed"
+            ):
+                provider = "Codex local - api-service-local"
+                request["provider"] = provider
+                state.latest_account_name = provider
+            return
+        provider = str(state.latest_account_name or "").strip()
+        if provider:
+            request["provider"] = provider
 
     def _authoritative_state_covers_live_overlay(self, state: MonitorState) -> bool:
         overlay = self._live_usage_overlay
@@ -10814,7 +11265,10 @@ class FloatingMonitorApp:
             self._refresh_live_usage_async()
         finally:
             try:
-                interval_ms = self._live_usage_watcher.next_poll_interval_ms()
+                interval_ms = min(
+                    self._live_usage_watcher.next_poll_interval_ms(),
+                    self._grok_usage_watcher.next_poll_interval_ms(),
+                )
             except Exception:
                 interval_ms = LIVE_USAGE_WATCH_COLD_INTERVAL_MS
             try:
@@ -11022,7 +11476,9 @@ class FloatingMonitorApp:
         ):
             return False
 
-        result.latest_request = dict(previous_request)
+        preserved_request = dict(previous_request)
+        preserved_request.setdefault("provider", previous_provider)
+        result.latest_request = preserved_request
         result.latest_account_name = str(self.state.latest_account_name or "")
         return True
 
@@ -11091,6 +11547,7 @@ class FloatingMonitorApp:
             else:
                 self._apply_live_usage_overlay(result)
             self._apply_live_latest_request_overlay(result)
+            self._synchronize_latest_request_identity(result)
             self.state = result
             if result.usage_source == "local":
                 self._last_quota_refresh_at = time.monotonic()
@@ -11408,6 +11865,9 @@ class FloatingMonitorApp:
         live_watcher = getattr(self, "_live_usage_watcher", None)
         if isinstance(live_watcher, CodexUsageFileWatcher):
             live_watcher.close()
+        grok_watcher = getattr(self, "_grok_usage_watcher", None)
+        if isinstance(grok_watcher, GrokUsageFileWatcher):
+            grok_watcher.close()
         for name in (
             "_live_active_executor",
             "_live_usage_executor",

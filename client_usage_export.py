@@ -295,6 +295,8 @@ CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
 CLAUDE_USAGE_DEDUPE_SCHEMA = 2
 COCKPIT_USAGE_DEDUPE_SCHEMA = 1
+GROK_USAGE_DEDUPE_SCHEMA = 1
+GROK_LOCAL_LABEL = "Grok local"
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
 API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "300"))
 COCKPIT_AFFINITY_TURN_MATCH_SECONDS = max(
@@ -643,7 +645,7 @@ def extract_online_price_details(payload: Any) -> dict[str, dict[str, float]]:
         if not isinstance(row, dict):
             continue
         provider = str(row.get("litellm_provider") or "").strip().lower()
-        if provider and provider not in {"openai", "anthropic"}:
+        if provider and provider not in {"openai", "anthropic", "xai"}:
             continue
         detail: dict[str, float] = {}
         for field_name in ONLINE_TOKEN_COST_FIELDS:
@@ -659,7 +661,7 @@ def extract_online_price_details(payload: Any) -> dict[str, dict[str, float]]:
         if not name:
             continue
         prices[name] = detail
-        if name.startswith(("openai/", "anthropic/")):
+        if name.startswith(("openai/", "anthropic/", "xai/")):
             prices.setdefault(name.split("/", 1)[1], detail)
     return prices
 
@@ -5539,6 +5541,200 @@ def codex_hourly_from_events(events: list[UsageEvent]) -> list[dict[str, Any]]:
     return buckets
 
 
+def grok_update_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=LOCAL_TZ).replace(tzinfo=None)
+        except (OSError, OverflowError, ValueError):
+            return None
+    return parse_dt(value)
+
+
+def split_grok_token_count(total: int, parts: int, index: int) -> int:
+    total = max(0, int(total or 0))
+    parts = max(1, int(parts or 1))
+    quotient, remainder = divmod(total, parts)
+    return quotient + (1 if 0 <= index < remainder else 0)
+
+
+def grok_usage_events_from_update_row(
+    row: dict[str, Any],
+    fallback_session_id: str = "",
+) -> list[UsageEvent]:
+    params = row.get("params")
+    if not isinstance(params, dict):
+        return []
+    update = params.get("update")
+    if not isinstance(update, dict) or update.get("sessionUpdate") != "turn_completed":
+        return []
+    usage = update.get("usage")
+    if not isinstance(usage, dict):
+        return []
+    when = grok_update_timestamp(row.get("timestamp"))
+    if when is None:
+        return []
+
+    session_id = str(params.get("sessionId") or fallback_session_id or "").strip()
+    prompt_id = str(update.get("prompt_id") or "").strip()
+    if not prompt_id:
+        identity_payload = {
+            "session_id": session_id,
+            "timestamp": row.get("timestamp"),
+            "usage": usage,
+        }
+        prompt_id = "fallback-" + hashlib.sha256(
+            json.dumps(
+                identity_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="ignore")
+        ).hexdigest()
+    model_usage = usage.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        fallback_model = str(
+            usage.get("model")
+            or update.get("model")
+            or update.get("model_id")
+            or "grok"
+        ).strip() or "grok"
+        model_usage = {fallback_model: usage}
+
+    events: list[UsageEvent] = []
+    event_offset = 0
+    for raw_model, raw_detail in sorted(model_usage.items(), key=lambda item: str(item[0])):
+        if not isinstance(raw_detail, dict):
+            continue
+        model = str(raw_model or "grok").strip() or "grok"
+        raw_input = max(0, usage_int(raw_detail, "inputTokens"))
+        output_tokens = max(0, usage_int(raw_detail, "outputTokens"))
+        total_tokens = max(0, usage_int(raw_detail, "totalTokens"))
+        if total_tokens <= 0:
+            total_tokens = raw_input + output_tokens
+        if total_tokens <= 0:
+            continue
+
+        output_tokens = min(output_tokens, total_tokens)
+        input_tokens = max(0, total_tokens - output_tokens)
+        cache_read = max(0, usage_int(raw_detail, "cachedReadTokens"))
+        cache_creation = max(0, usage_int(raw_detail, "cacheCreationTokens"))
+        if cache_read <= 0 and cache_creation <= 0:
+            cache_read = max(0, usage_int(raw_detail, "cachedTokens"))
+        cached_tokens = min(input_tokens, cache_read + cache_creation)
+        uncached_input = max(0, input_tokens - cached_tokens)
+        model_calls = max(1, usage_int(raw_detail, "modelCalls"))
+
+        for call_index in range(model_calls):
+            call_when = when + timedelta(microseconds=event_offset)
+            event_offset += 1
+            event = UsageEvent(
+                when=call_when,
+                model=model,
+                input_tokens=split_grok_token_count(
+                    uncached_input,
+                    model_calls,
+                    call_index,
+                ),
+                cached_tokens=split_grok_token_count(
+                    cached_tokens,
+                    model_calls,
+                    call_index,
+                ),
+                output_tokens=split_grok_token_count(
+                    output_tokens,
+                    model_calls,
+                    call_index,
+                ),
+                session_id=session_id,
+                request_key=(
+                    f"grok:{session_id}:{prompt_id}:{model}:{call_index}"
+                ),
+                route="grok-local",
+                request_at=call_when,
+                account_at=when,
+            )
+            if event.total_tokens > 0:
+                events.append(event)
+    return events
+
+
+def iter_recent_grok_updates(root: Path, start: datetime) -> list[Path]:
+    if not root.exists():
+        return []
+    earliest_mtime = start.replace(tzinfo=LOCAL_TZ).timestamp()
+    paths: list[Path] = []
+    try:
+        candidates = root.rglob("updates.jsonl")
+        for path in candidates:
+            try:
+                if path.stat().st_mtime < earliest_mtime:
+                    continue
+            except OSError:
+                continue
+            paths.append(path)
+    except OSError:
+        return []
+    return sorted(paths, key=lambda path: str(path).casefold())
+
+
+def scan_grok_events(root: Path, start: datetime, end: datetime) -> list[UsageEvent]:
+    grouped: dict[str, tuple[datetime, UsageEvent]] = {}
+    for path in iter_recent_grok_updates(root, start):
+        try:
+            handle = path.open("r", encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        fallback_session_id = path.parent.name
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                for event in grok_usage_events_from_update_row(row, fallback_session_id):
+                    identity = event.request_key or live_usage_event_id(event)
+                    existing = grouped.get(identity)
+                    if existing is None:
+                        grouped[identity] = (event.when, event)
+                        continue
+                    first_when, best = existing
+                    if event.total_tokens > best.total_tokens:
+                        best = event
+                    grouped[identity] = (min(first_when, event.when), best)
+
+    events: list[UsageEvent] = []
+    for first_when, best in grouped.values():
+        if first_when < start or first_when >= end:
+            continue
+        if best.when != first_when:
+            best = replace(best, when=first_when, request_at=first_when)
+        events.append(best)
+    events.sort(key=lambda event: (event.when, event.request_key))
+    return events
+
+
+def bucket_from_grok_events(events: list[UsageEvent]) -> UsageBucket:
+    return bucket_from_codex_events(events)
+
+
+def scan_grok(root: Path, start: datetime, end: datetime) -> UsageBucket:
+    return bucket_from_grok_events(scan_grok_events(root, start, end))
+
+
+def scan_grok_daily_buckets(
+    root: Path,
+    start: datetime,
+    end: datetime,
+) -> dict[date, UsageBucket]:
+    buckets: dict[date, UsageBucket] = {}
+    for event in scan_grok_events(root, start, end):
+        bucket = buckets.setdefault(event.when.date(), UsageBucket())
+        add_codex_event_to_bucket(bucket, event)
+    return buckets
+
+
 def merge_hourly_buckets(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged = [
         {"hour": hour, "requests": 0, "tokens": 0, "cost": 0.0}
@@ -7486,6 +7682,20 @@ def backfill_usage_history_details(home: Path, sessions_root: Path) -> int:
                 multipliers.get(label, 1.0),
                 bucket_time=usage_event_attribution_time(event),
             )
+    grok_by_day = scan_grok_daily_buckets(
+        home / ".grok" / "sessions",
+        start,
+        end,
+    )
+    for grok_day, grok_bucket in grok_by_day.items():
+        key = grok_day.isoformat()
+        if key not in wanted:
+            continue
+        target = buckets_by_day.setdefault(key, {}).setdefault(
+            GROK_LOCAL_LABEL,
+            UsageBucket(),
+        )
+        add_bucket(target, grok_bucket)
 
     updated = 0
     for key in wanted:
@@ -7738,6 +7948,7 @@ def build_historical_usage_rows(
             )
 
     claude_by_day = scan_claude_daily_buckets(home / ".claude" / "projects", start, end)
+    grok_by_day = scan_grok_daily_buckets(home / ".grok" / "sessions", start, end)
     updated_at = now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
     rows: dict[str, dict[str, Any]] = {}
     for target_day in target_days:
@@ -7758,6 +7969,10 @@ def build_historical_usage_rows(
         if claude.total_tokens > 0 or claude.requests > 0:
             providers.append(bucket_to_dict("Claude local", claude))
             add_bucket(total, claude)
+        grok = grok_by_day.get(target_day, UsageBucket())
+        if grok.total_tokens > 0 or grok.requests > 0:
+            providers.append(bucket_to_dict(GROK_LOCAL_LABEL, grok))
+            add_bucket(total, grok)
         temporary_output = {
             "today": bucket_to_dict("Client local", total),
             "providers": providers,
@@ -7784,6 +7999,7 @@ def build_historical_usage_rows(
             "source": "local-backfill",
             "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
             "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
+            "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
             "requests": int(total_row.get("requests") or 0),
             "tokens": int(total_row.get("tokens") or 0),
             "input_tokens": int(total_row.get("input_tokens") or 0),
@@ -8805,9 +9021,11 @@ def build_live_catchup_payload(
             "schema": 1,
             "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
             "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
+            "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
             "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "events": [],
+            "latest_request": {},
         }
 
     day_start = datetime.combine(since.date(), datetime.min.time())
@@ -8893,6 +9111,44 @@ def build_live_catchup_payload(
     if claude.requests or claude.total_tokens or claude.cost:
         add_bucket(total, claude)
         provider_totals.append(bucket_to_dict("Claude local", claude))
+    grok_events = scan_grok_events(home / ".grok" / "sessions", day_start, through)
+    grok = bucket_from_grok_events(grok_events)
+    if grok.requests or grok.total_tokens or grok.cost:
+        add_bucket(total, grok)
+        provider_totals.append(bucket_to_dict(GROK_LOCAL_LABEL, grok))
+
+    # Keep the provider/model pair together for the monitor's live catch-up.
+    # The aggregate summary has a model and timestamp but no provider, which
+    # is ambiguous when Grok and Codex finish close together.
+    latest_request_provider = ""
+    latest_request_model = ""
+    latest_request_at: datetime | None = None
+
+    def consider_latest_request(provider_name: str, bucket: UsageBucket) -> None:
+        nonlocal latest_request_provider, latest_request_model, latest_request_at
+        if bucket.latest_at is None:
+            return
+        if latest_request_at is None or bucket.latest_at > latest_request_at:
+            latest_request_at = bucket.latest_at
+            latest_request_provider = provider_name
+            latest_request_model = bucket.latest_model
+
+    for provider_name, bucket in provider_buckets.items():
+        consider_latest_request(provider_name, bucket)
+    consider_latest_request("Claude local", claude)
+    consider_latest_request(GROK_LOCAL_LABEL, grok)
+    latest_request = {
+        "provider": latest_request_provider,
+        "model": latest_request_model,
+        "created_at": (
+            latest_request_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+            if latest_request_at is not None and latest_request_at.tzinfo is None
+            else latest_request_at.isoformat(timespec="seconds")
+            if latest_request_at is not None
+            else ""
+        ),
+        "kind": "success" if latest_request_at is not None else "",
+    }
 
     rows: list[dict[str, Any]] = []
     for provider, events in attributed.items():
@@ -8923,16 +9179,44 @@ def build_live_catchup_payload(
                     "cost": round(event_bucket.cost, 12),
                 }
             )
+    for event in grok_events:
+        if not since < event.when < through:
+            continue
+        event_bucket = UsageBucket()
+        add_codex_event_to_bucket(event_bucket, event)
+        aware_when = (
+            event.when
+            if event.when.tzinfo is not None
+            else event.when.replace(tzinfo=LOCAL_TZ)
+        )
+        rows.append(
+            {
+                "event_id": live_usage_event_id(event),
+                "when": aware_when.isoformat(timespec="microseconds"),
+                "provider": GROK_LOCAL_LABEL,
+                "model": event.model,
+                "session_id": event.session_id,
+                "request_key": event.request_key,
+                "route": event.route,
+                "total_tokens": event.total_tokens,
+                "input_tokens": event.input_tokens + event.cached_tokens,
+                "cached_tokens": event.cached_tokens,
+                "output_tokens": event.output_tokens,
+                "cost": round(event_bucket.cost, 12),
+            }
+        )
     rows.sort(key=lambda row: (str(row.get("when") or ""), str(row.get("event_id") or "")))
     return {
         "schema": 1,
         "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
         "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
+        "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
         "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "events": rows,
         "summary": bucket_to_dict("Client live catch-up", total),
         "providers": provider_totals,
+        "latest_request": latest_request,
         "fallback_events": int(fallback_events),
         "unresolved_events": int(unresolved_events),
     }
@@ -9102,6 +9386,9 @@ def main() -> int:
     claude_root = home / ".claude" / "projects"
     claude_events = scan_claude_events(claude_root, start, scan_end)
     claude = bucket_from_claude_events(claude_events)
+    grok_root = home / ".grok" / "sessions"
+    grok_events = scan_grok_events(grok_root, start, scan_end)
+    grok = bucket_from_grok_events(grok_events)
     hourly_codex_events = [
         event
         for events in attributed_events.values()
@@ -9110,6 +9397,7 @@ def main() -> int:
     hourly_today = merge_hourly_buckets(
         codex_hourly_from_events(hourly_codex_events),
         claude_hourly_from_events(claude_events),
+        codex_hourly_from_events(grok_events),
     )
     mark_codex_failure_hours(
         hourly_today,
@@ -9179,9 +9467,12 @@ def main() -> int:
             if args.include_30d and name in cached_30d_windows:
                 provider["window_30d"] = cached_30d_windows[name]
         codex_providers.append(provider)
-    providers = codex_providers + [bucket_to_dict("Claude local", claude)]
+    providers = codex_providers + [
+        bucket_to_dict("Claude local", claude),
+        bucket_to_dict(GROK_LOCAL_LABEL, grok),
+    ]
     total = UsageBucket()
-    for bucket in (codex, claude):
+    for bucket in (codex, claude, grok):
         total.requests += bucket.requests
         total.input_tokens += bucket.input_tokens
         total.cached_input_tokens += bucket.cached_input_tokens
@@ -9200,7 +9491,10 @@ def main() -> int:
         account_markers,
         session_account_labels,
     )
-    latest_candidates = [("Claude local", claude)]
+    latest_candidates = [
+        ("Claude local", claude),
+        (GROK_LOCAL_LABEL, grok),
+    ]
     codex_latest_at = parse_dt(codex_latest_request.get("created_at"))
     if codex_latest_at is not None:
         latest_dt = codex_latest_at
@@ -9241,14 +9535,26 @@ def main() -> int:
                 recent_attributed,
                 lookback_account_markers,
             )
-            latest_provider = str(recent_latest_request.get("provider") or "")
-            latest_model = str(recent_latest_request.get("model") or "")
-            latest_at = str(recent_latest_request.get("created_at") or "")
+            recent_dt = parse_dt(recent_latest_request.get("created_at"))
+            if recent_dt is not None:
+                latest_dt = recent_dt
+                latest_provider = str(recent_latest_request.get("provider") or "")
+                latest_model = str(recent_latest_request.get("model") or "")
+                latest_at = str(recent_latest_request.get("created_at") or "")
+        lookback_grok = scan_grok(grok_root, lookback_start, scan_end)
+        if lookback_grok.latest_at is not None and (
+            latest_dt is None or lookback_grok.latest_at > latest_dt
+        ):
+            latest_dt = lookback_grok.latest_at
+            latest_provider = GROK_LOCAL_LABEL
+            latest_model = lookback_grok.latest_model
+            latest_at = latest_at_text(lookback_grok)
 
     output = {
         "schema": 1,
         "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
         "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
+        "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
         "source": "client-jsonl",
         "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "date": day.isoformat(),
@@ -9315,9 +9621,10 @@ def main() -> int:
     if args.backfill_history_details:
         backfill_usage_history_details(home, codex_sessions_root)
     logger.info(
-        "export run finished in %.1fs: codex_events=%d providers=%d ledger_entries=%d verdicts=%d",
+        "export run finished in %.1fs: codex_events=%d grok_events=%d providers=%d ledger_entries=%d verdicts=%d",
         (datetime.now() - now).total_seconds(),
         len(codex_events),
+        len(grok_events),
         len(providers),
         len(attribution_ledger),
         len(attribution_verdicts),
