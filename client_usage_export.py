@@ -279,6 +279,15 @@ COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS = max(
     60,
     int(os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_CACHE_SECONDS", "600")),
 )
+COCKPIT_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS = max(
+    5,
+    int(
+        os.environ.get(
+            "CLIENT_USAGE_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS",
+            "10",
+        )
+    ),
+)
 COCKPIT_OFFICIAL_QUOTA_TIMEOUT_SECONDS = max(
     1.0,
     env_float("CLIENT_USAGE_OFFICIAL_QUOTA_TIMEOUT_SECONDS", 4.0),
@@ -309,7 +318,7 @@ COCKPIT_AFFINITY_TURN_AMBIGUITY_SECONDS = max(
 )
 COCKPIT_AFFINITY_EVENT_MATCH_SECONDS = max(
     0.01,
-    env_float("CLIENT_USAGE_COCKPIT_AFFINITY_EVENT_MATCH_SECONDS", 0.1),
+    env_float("CLIENT_USAGE_COCKPIT_AFFINITY_EVENT_MATCH_SECONDS", 0.25),
 )
 COCKPIT_FINAL_TURN_START_MATCH_SECONDS = max(
     COCKPIT_AFFINITY_EVENT_MATCH_SECONDS,
@@ -4129,7 +4138,12 @@ def cockpit_official_quota_by_account(
         except (TypeError, ValueError):
             checked_epoch = 0.0
         cache_age = now_epoch - checked_epoch if checked_epoch > 0 else float("inf")
-        if 0 <= cache_age < COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS:
+        cache_seconds = (
+            COCKPIT_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS
+            if isinstance(cached, dict) and cached.get("refresh_failed")
+            else COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS
+        )
+        if 0 <= cache_age < cache_seconds:
             quota = cached.get("quota") if isinstance(cached, dict) else None
             if isinstance(quota, dict):
                 result[account_id] = quota
@@ -6947,7 +6961,6 @@ def cockpit_consistent_temporal_affinity_turn_anchors(
     )
     event_epochs = [item[0] for item in timed_events]
     event_by_id = {id(event): event for _epoch, _turn_key, event in timed_events}
-    accounts_by_request: dict[str, set[str]] = {}
     failed_requests = {
         item.request_id
         for item in affinity_events
@@ -6957,39 +6970,41 @@ def cockpit_consistent_temporal_affinity_turn_anchors(
             for fragment in COCKPIT_FAILED_AFFINITY_ACTION_FRAGMENTS
         )
     }
-    for item in affinity_events:
-        account_id = normalize_cockpit_auth_id(item.account_id)
-        if (
-            not item.request_id
-            or item.action not in COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS
-            or not usable_cockpit_account_label(item.label)
-            or not account_id
-        ):
-            continue
-        accounts_by_request.setdefault(item.request_id, set()).add(account_id)
-
     final_by_request: dict[str, AccountMarker] = {}
     for marker in account_markers:
-        if marker.kind != "request" or not marker.request_id:
+        if (
+            marker.kind != "request"
+            or not marker.request_id
+            or not account_marker_has_recorded_usage(marker)
+            or not usable_cockpit_account_label(marker.label)
+        ):
             continue
         previous = final_by_request.get(marker.request_id)
         if previous is None or marker.when > previous.when:
             final_by_request[marker.request_id] = marker
 
+    accounts_by_request: dict[str, set[str]] = {}
+    for item in affinity_events:
+        account_id = normalize_cockpit_auth_id(item.account_id)
+        if (
+            not item.request_id
+            or item.action not in COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS
+            or not account_id
+        ):
+            continue
+        accounts_by_request.setdefault(item.request_id, set()).add(account_id)
+
     event_match_seconds = COCKPIT_AFFINITY_EVENT_MATCH_SECONDS
-    stable_items = [
+    route_items = [
         item
         for item in affinity_events
-        if item.request_id not in failed_requests
+        if item.request_id
         and item.action in COCKPIT_STABLE_NATIVE_AFFINITY_ACTIONS
-        and usable_cockpit_account_label(item.label)
         and normalize_cockpit_auth_id(item.account_id)
-        and accounts_by_request.get(item.request_id)
-        == {normalize_cockpit_auth_id(item.account_id)}
     ]
 
     claims_by_item: dict[int, list[tuple[float, str, UsageEvent]]] = {}
-    for item_index, item in enumerate(stable_items):
+    for item_index, item in enumerate(route_items):
         center = account_marker_epoch(item.when)
         left = bisect_left(event_epochs, center - event_match_seconds)
         right = bisect_right(event_epochs, center + event_match_seconds)
@@ -7020,19 +7035,36 @@ def cockpit_consistent_temporal_affinity_turn_anchors(
         item_owner[item_index] = id(turn_claims[0][2])
 
     candidates_by_event: dict[int, list[tuple[float, str, str, str]]] = {}
-    for item_index, item in enumerate(stable_items):
+    for item_index, item in enumerate(route_items):
         owner_id = item_owner.get(item_index)
         if owner_id is None:
             continue
-        account_id = normalize_cockpit_auth_id(item.account_id)
-        label = item.label
         final_marker = final_by_request.get(item.request_id)
         if final_marker is not None:
-            final_account_id = normalize_cockpit_auth_id(final_marker.account_id)
-            if final_account_id and final_account_id != account_id:
-                continue
-            if usable_cockpit_account_label(final_marker.label):
-                label = final_marker.label
+            # request_logs is the final routing outcome. Its account must win
+            # over opaque API-key route ids and over any failed initial account.
+            label = final_marker.label
+            account_id = (
+                normalize_cockpit_auth_id(final_marker.account_id)
+                or f"request:{item.request_id}"
+            )
+        else:
+            route_account_id = normalize_cockpit_auth_id(item.account_id)
+            request_accounts = accounts_by_request.get(item.request_id, set())
+            route_is_concrete = (
+                item.request_id not in failed_requests
+                and request_accounts == {route_account_id}
+                and usable_cockpit_account_label(item.label)
+            )
+            if route_is_concrete:
+                label = item.label
+                account_id = route_account_id
+            else:
+                # A new request exists, but its final account is not known yet.
+                # Emit an explicit boundary so the previous request's account
+                # cannot leak forward through the rest of the Codex turn.
+                label = API_SERVICE_AGGREGATE_LABEL
+                account_id = ""
         owner = event_by_id.get(owner_id)
         if owner is None:
             continue
@@ -7044,69 +7076,72 @@ def cockpit_consistent_temporal_affinity_turn_anchors(
     anchors: dict[str, list[tuple[datetime, AccountMarker]]] = {}
     for turn_key, turn_events in events_by_turn.items():
         ordered_turn_events = sorted(turn_events, key=lambda item: item.when)
-        matched_event_ids = {
-            id(event)
-            for event in ordered_turn_events
-            if candidates_by_event.get(id(event))
-        }
+        all_event_ids = {id(event) for event in ordered_turn_events}
         account_coverage: dict[str, set[int]] = {}
         for event in ordered_turn_events:
-            for _delta, _label, _request_id, account_id in candidates_by_event.get(
+            for _delta, label, _request_id, account_id in candidates_by_event.get(
                 id(event),
                 [],
             ):
-                account_coverage.setdefault(account_id, set()).add(id(event))
+                if account_id and not is_api_service_mirror_label(label):
+                    account_coverage.setdefault(account_id, set()).add(id(event))
         fully_covering_accounts = {
             account_id
             for account_id, covered_event_ids in account_coverage.items()
-            if matched_event_ids and covered_event_ids == matched_event_ids
+            if all_event_ids and covered_event_ids == all_event_ids
         }
-        enough_consistent_evidence = (
-            len(matched_event_ids) >= COCKPIT_AFFINITY_MIN_STABLE_EVENTS
-            or len(ordered_turn_events) == 1
-        )
-        if len(fully_covering_accounts) == 1 and enough_consistent_evidence:
+        if len(fully_covering_accounts) == 1:
             account_id = next(iter(fully_covering_accounts))
-            first_event = next(
-                event
-                for event in ordered_turn_events
-                if any(
-                    candidate[3] == account_id
-                    for candidate in candidates_by_event.get(id(event), [])
-                )
-            )
+            first_event = ordered_turn_events[0]
             account_candidates = [
                 candidate
-                for candidate in candidates_by_event[id(first_event)]
+                for candidate in candidates_by_event.get(id(first_event), [])
                 if candidate[3] == account_id
             ]
-            _delta, label, request_id, _account_id = min(account_candidates)
-            marker = AccountMarker(
-                when=first_event.when,
-                label=label,
-                kind="affinity",
-                request_id=request_id,
-                account_id=account_id,
-            )
-            anchors[turn_key] = [(first_event.when, marker)]
-            continue
+            if account_candidates:
+                _delta, label, request_id, _account_id = min(account_candidates)
+                anchors[turn_key] = [
+                    (
+                        first_event.when,
+                        AccountMarker(
+                            when=first_event.when,
+                            label=label,
+                            kind="affinity",
+                            request_id=request_id,
+                            account_id=account_id,
+                        ),
+                    )
+                ]
+                continue
 
         last_state: tuple[str, str] | None = None
         for event in ordered_turn_events:
             candidates = candidates_by_event.get(id(event), [])
-            accounts = {candidate[3] for candidate in candidates}
-            if len(accounts) > 1:
+            if not candidates:
+                continue
+            concrete_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate[3]
+                and not is_api_service_mirror_label(candidate[1])
+            ]
+            concrete_accounts = {
+                candidate[3]
+                for candidate in concrete_candidates
+            }
+            has_unresolved_candidate = len(concrete_candidates) != len(candidates)
+            if has_unresolved_candidate or len(concrete_accounts) != 1:
                 state = (API_SERVICE_AGGREGATE_LABEL, "")
                 marker = AccountMarker(
                     when=event.when,
                     label=API_SERVICE_AGGREGATE_LABEL,
                     kind="affinity-ambiguous",
                 )
-            elif len(accounts) == 1:
-                account_id = next(iter(accounts))
+            else:
+                account_id = next(iter(concrete_accounts))
                 account_candidates = [
                     candidate
-                    for candidate in candidates
+                    for candidate in concrete_candidates
                     if candidate[3] == account_id
                 ]
                 _delta, label, request_id, _account_id = min(account_candidates)
@@ -7118,8 +7153,6 @@ def cockpit_consistent_temporal_affinity_turn_anchors(
                     request_id=request_id,
                     account_id=account_id,
                 )
-            else:
-                continue
             if state == last_state:
                 continue
             anchors.setdefault(turn_key, []).append((event.when, marker))
@@ -7273,8 +7306,6 @@ def resolve_api_service_event_accounts(
     for turn_key, anchors in consistent_affinity_anchors.items():
         existing_anchors = anchors_by_turn.setdefault(turn_key, [])
         for anchor in anchors:
-            if anchor[1].kind == "affinity-ambiguous" and existing_anchors:
-                continue
             existing_anchors.append(anchor)
         anchors_by_turn[turn_key].sort(
             key=lambda item: (

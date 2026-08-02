@@ -9665,7 +9665,14 @@ class FloatingMonitorApp:
         self,
         sessions: list[dict[str, Any]],
     ) -> bool:
-        """Use exact final Cockpit evidence to repair only the live request label."""
+        """Repair the live request label without booking provisional usage.
+
+        A final Cockpit marker remains the only evidence that can assign Token
+        usage to an account.  While that marker is still pending, a unique route
+        hint from the same active turn is nevertheless useful for the recent
+        request card.  Keep that hint display-only so a later Cockpit reselect
+        can replace it without moving any Token between accounts.
+        """
         if self.state is None or not isinstance(self.state.latest_request, dict):
             return False
         latest_event_id = str(getattr(self, "_pending_latest_event_id", "") or "")
@@ -9683,23 +9690,102 @@ class FloatingMonitorApp:
         if not latest_session_id:
             return False
 
-        providers = {
-            provider
+        matching_sessions = [
+            session
             for session in sessions
             if isinstance(session, dict)
-            and session.get("provider_confirmed") is True
             and str(session.get("session_id") or "") == latest_session_id
+            and session.get("active", True)
+        ]
+        confirmed_providers = {
+            provider
+            for session in matching_sessions
+            if session.get("provider_confirmed") is True
             and str(session.get("usage_event_id") or "") == latest_event_id
             and (provider := _concrete_live_provider(session.get("provider")))
         }
-        if len(providers) != 1:
+
+        provider = ""
+        provisional = False
+        confirmation_source = ""
+        if len(confirmed_providers) == 1:
+            provider = confirmed_providers.pop()
+        elif not confirmed_providers:
+            event_when = latest_event.get("when")
+            provisional_rows: list[tuple[str, str]] = []
+            for session in matching_sessions:
+                if session.get("provider_provisional") is not True:
+                    continue
+                candidate = _concrete_live_provider(session.get("provider"))
+                if not candidate:
+                    continue
+                turn_started_at = _parse_time(
+                    str(
+                        session.get("turn_started_at")
+                        or session.get("started_at")
+                        or ""
+                    )
+                )
+                if (
+                    not isinstance(event_when, datetime)
+                    or turn_started_at is None
+                    or event_when < turn_started_at
+                ):
+                    continue
+                source = str(session.get("provider_confirmation_source") or "")
+                if source not in {
+                    "active_route_hint",
+                    "same_turn_route_hint",
+                    "same_turn_cached_account",
+                }:
+                    continue
+                provisional_rows.append((candidate, source))
+            provisional_providers = {candidate for candidate, _source in provisional_rows}
+            if len(provisional_providers) == 1:
+                provider = provisional_providers.pop()
+                provisional = True
+                confirmation_source = max(
+                    (
+                        source
+                        for candidate, source in provisional_rows
+                        if candidate == provider
+                    ),
+                    key=lambda source: {
+                        "active_route_hint": 3,
+                        "same_turn_route_hint": 2,
+                        "same_turn_cached_account": 1,
+                    }.get(source, 0),
+                )
+
+        current_request = self.state.latest_request
+        current_is_this_event = (
+            str(current_request.get("event_id") or "") == latest_event_id
+        )
+        if not provider:
+            if not (
+                current_is_this_event
+                and current_request.get("provider_provisional") is True
+            ):
+                return False
+            current_request["provider"] = "Codex local - api-service-local"
+            current_request.pop("provider_provisional", None)
+            current_request.pop("provider_confirmation_source", None)
+            current_request["attribution_pending"] = True
+            latest_event.pop("attribution_display_provisional_provider", None)
+            return True
+
+        display_key = (
+            "attribution_display_provisional_provider"
+            if provisional
+            else "attribution_display_resolved_provider"
+        )
+        if (
+            _concrete_live_provider(latest_event.get(display_key)) == provider
+            and current_is_this_event
+            and _concrete_live_provider(current_request.get("provider")) == provider
+            and bool(current_request.get("provider_provisional")) == provisional
+        ):
             return False
-        provider = providers.pop()
-        if _concrete_live_provider(
-            latest_event.get("attribution_display_resolved_provider")
-        ) == provider:
-            return False
-        self.state.latest_account_name = provider
         event_when = latest_event.get("when")
         if isinstance(event_when, datetime):
             self.state.latest_request = {
@@ -9713,14 +9799,33 @@ class FloatingMonitorApp:
                 "event_id": latest_event_id,
                 "session_id": latest_session_id,
             }
-        self._pending_latest_event_id = ""
-        latest_event["attribution_display_resolved_provider"] = provider
-        append_attribution_diagnostic(
-            "display_resolved",
-            latest_event,
-            provider=provider,
-            resolution_source="confirmed_active_session",
-        )
+            if provisional:
+                self.state.latest_request.update(
+                    {
+                        "attribution_pending": True,
+                        "provider_provisional": True,
+                        "provider_confirmation_source": confirmation_source,
+                    }
+                )
+        if provisional:
+            latest_event["attribution_display_provisional_provider"] = provider
+            append_attribution_diagnostic(
+                "display_provisional",
+                latest_event,
+                provider=provider,
+                resolution_source=confirmation_source,
+            )
+        else:
+            self.state.latest_account_name = provider
+            self._pending_latest_event_id = ""
+            latest_event["attribution_display_resolved_provider"] = provider
+            latest_event.pop("attribution_display_provisional_provider", None)
+            append_attribution_diagnostic(
+                "display_resolved",
+                latest_event,
+                provider=provider,
+                resolution_source="confirmed_active_session",
+            )
         return True
 
     def _reconcile_pending_live_events_with_markers(

@@ -4732,7 +4732,7 @@ class WindowSemanticsTests(unittest.TestCase):
         )
         opener.open.assert_called_once()
 
-    def test_official_quota_failure_retains_last_percent_as_stale(self) -> None:
+    def test_official_quota_failure_retains_stale_percent_then_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             auth_dir = (
@@ -4785,9 +4785,32 @@ class WindowSemanticsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             accounts = {account_id: {"plan_type": "plus"}}
+            recovered_quota = client_usage_export.official_quota_from_usage_response(
+                {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "primary_window": {
+                            "limit_window_seconds": 7 * 24 * 60 * 60,
+                            "reset_at": checked_at.timestamp() + 2 * 24 * 60 * 60,
+                            "used_percent": 60,
+                        },
+                        "secondary_window": None,
+                    },
+                },
+                checked_at + timedelta(seconds=11),
+            )
             with (
                 patch.object(client_usage_export, "COCKPIT_OFFICIAL_QUOTA_CACHE_PATH", cache_path),
-                patch.object(client_usage_export, "fetch_cockpit_official_quota", return_value=None) as fetch,
+                patch.object(
+                    client_usage_export,
+                    "COCKPIT_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS",
+                    10,
+                ),
+                patch.object(
+                    client_usage_export,
+                    "fetch_cockpit_official_quota",
+                    side_effect=[None, recovered_quota],
+                ) as fetch,
             ):
                 failed = client_usage_export.cockpit_official_quota_by_account(
                     root,
@@ -4797,16 +4820,23 @@ class WindowSemanticsTests(unittest.TestCase):
                 cached = client_usage_export.cockpit_official_quota_by_account(
                     root,
                     accounts,
-                    checked_at + timedelta(minutes=1),
+                    checked_at + timedelta(seconds=9),
+                )
+                recovered = client_usage_export.cockpit_official_quota_by_account(
+                    root,
+                    accounts,
+                    checked_at + timedelta(seconds=11),
                 )
 
-            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(fetch.call_count, 2)
             self.assertEqual(failed[account_id]["window_7d"]["remaining_percent"], 26.0)
             self.assertTrue(failed[account_id]["window_7d"]["quota_stale"])
             self.assertEqual(cached, failed)
+            self.assertEqual(recovered[account_id]["window_7d"]["remaining_percent"], 40.0)
+            self.assertFalse(recovered[account_id]["window_7d"]["quota_stale"])
             saved = json.loads(cache_path.read_text(encoding="utf-8"))["accounts"][account_id]
-            self.assertTrue(saved["refresh_failed"])
-            self.assertEqual(saved["quota"]["window_7d"]["remaining_percent"], 26.0)
+            self.assertNotIn("refresh_failed", saved)
+            self.assertEqual(saved["quota"]["window_7d"]["remaining_percent"], 40.0)
 
     def test_missing_auth_retains_expired_cached_percent_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -5545,6 +5575,126 @@ class QuotaFingerprintAttributionTests(unittest.TestCase):
         self.assertEqual(resolved, {quota_label: [event]})
         self.assertEqual(session_accounts["quota-session"], quota_label)
         self.assertEqual(unresolved, 0)
+
+    def test_final_request_id_resolves_opaque_api_route_and_stops_at_new_request(self) -> None:
+        turn_started_at = datetime(2026, 8, 2, 15, 0, 0)
+        api_first = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=10),
+            model="gpt-test",
+            input_tokens=9_000,
+            cached_tokens=8_000,
+            output_tokens=100,
+            session_id="opaque-api-session",
+            account_at=turn_started_at,
+        )
+        api_final = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=20),
+            model="gpt-test",
+            input_tokens=10_000,
+            cached_tokens=9_000,
+            output_tokens=200,
+            session_id="opaque-api-session",
+            account_at=turn_started_at,
+        )
+        pending = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=30),
+            model="gpt-test",
+            input_tokens=11_000,
+            cached_tokens=10_000,
+            output_tokens=300,
+            session_id="opaque-api-session",
+            account_at=turn_started_at,
+        )
+        switched = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=40),
+            model="gpt-test",
+            input_tokens=12_000,
+            cached_tokens=11_000,
+            output_tokens=400,
+            session_id="opaque-api-session",
+            account_at=turn_started_at,
+        )
+        api_label = "Codex local - api-key-example"
+        plus_label = "Codex local - plus@example.com"
+        api_marker = client_usage_export.AccountMarker(
+            when=api_final.when + timedelta(seconds=1),
+            label=api_label,
+            total_tokens=api_final.total_tokens,
+            request_id="api-request",
+            account_id="codex_apikey_manifest_id",
+        )
+        plus_marker = client_usage_export.AccountMarker(
+            when=switched.when + timedelta(seconds=1),
+            label=plus_label,
+            total_tokens=switched.total_tokens,
+            request_id="plus-request",
+            account_id="plus-id",
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=api_first.when + timedelta(milliseconds=120),
+                request_id="api-request",
+                account_id="codex:apikey:opaque-hash",
+                label="",
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=api_final.when + timedelta(milliseconds=130),
+                request_id="api-request",
+                account_id="codex:apikey:opaque-hash",
+                label="",
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=pending.when + timedelta(milliseconds=140),
+                request_id="pending-request",
+                account_id="codex:apikey:opaque-hash",
+                label="",
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=switched.when + timedelta(milliseconds=150),
+                request_id="plus-request",
+                account_id="plus-id",
+                label=plus_label,
+                action="cache hit",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {
+                    client_usage_export.API_SERVICE_AGGREGATE_LABEL: [
+                        api_first,
+                        api_final,
+                        pending,
+                        switched,
+                    ]
+                },
+                [api_marker, plus_marker],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[api_label], [api_first, api_final])
+        self.assertEqual(
+            resolved[client_usage_export.API_SERVICE_AGGREGATE_LABEL],
+            [pending],
+        )
+        self.assertEqual(resolved[plus_label], [switched])
+        self.assertEqual(session_accounts[switched.session_id], plus_label)
+        self.assertEqual(unresolved, 1)
+        self.assertEqual(
+            sum(
+                event.total_tokens
+                for provider_events in resolved.values()
+                for event in provider_events
+            ),
+            sum(
+                event.total_tokens
+                for event in (api_first, api_final, pending, switched)
+            ),
+        )
 
     def test_exact_usage_marker_still_overrides_quota_fingerprint(self) -> None:
         quota_label = "Codex local - quota-owner@example.com"
@@ -8370,6 +8520,105 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         self.assertEqual(provider, "")
         self.assertEqual(model, "gpt-route")
+
+    def test_provisional_active_route_repairs_pending_request_display_only(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        event_when = datetime.now(timezone.utc)
+        app.state.latest_request = {
+            "event_id": "event-live",
+            "session_id": "session-live",
+            "provider": "Codex local - api-service-local",
+            "model": "gpt-test",
+        }
+        pending_event = {
+            "event_id": "event-live",
+            "session_id": "session-live",
+            "model": "gpt-test",
+            "when": event_when,
+            "attribution_pending": True,
+        }
+        app._pending_latest_event_id = "event-live"
+        app._live_usage_event_records = {"event-live": pending_event}
+        app._live_usage_overlay = {"providers": {}}
+        provisional_session = {
+            "session_id": "session-live",
+            "usage_event_id": "older-cumulative-snapshot",
+            "provider": "Codex local - routed@example.com",
+            "provider_confirmed": False,
+            "provider_provisional": True,
+            "provider_confirmation_source": "active_route_hint",
+            "turn_started_at": (event_when - timedelta(seconds=5)).isoformat(),
+            "active": True,
+        }
+
+        with patch.object(monitor, "append_attribution_diagnostic") as diagnostic:
+            changed = app._promote_pending_latest_account_from_sessions(
+                [provisional_session]
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            app.state.latest_request["provider"],
+            "Codex local - routed@example.com",
+        )
+        self.assertTrue(app.state.latest_request["provider_provisional"])
+        self.assertTrue(app.state.latest_request["attribution_pending"])
+        self.assertEqual(
+            app.state.latest_account_name,
+            "Codex local - api-service-local",
+        )
+        self.assertTrue(pending_event["attribution_pending"])
+        self.assertNotIn("provider", pending_event)
+        self.assertEqual(app._live_usage_overlay["providers"], {})
+        self.assertEqual(app._pending_latest_event_id, "event-live")
+        diagnostic.assert_called_once()
+        self.assertEqual(diagnostic.call_args.args[0], "display_provisional")
+
+    def test_provisional_pending_request_follows_reselect_and_can_be_cleared(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.latest_account_name = "Codex local - api-service-local"
+        event_when = datetime.now(timezone.utc)
+        app.state.latest_request = {
+            "event_id": "event-live",
+            "session_id": "session-live",
+            "provider": "Codex local - api-service-local",
+        }
+        pending_event = {
+            "event_id": "event-live",
+            "session_id": "session-live",
+            "model": "gpt-test",
+            "when": event_when,
+            "attribution_pending": True,
+        }
+        app._pending_latest_event_id = "event-live"
+        app._live_usage_event_records = {"event-live": pending_event}
+        route = {
+            "session_id": "session-live",
+            "provider": "Codex local - first@example.com",
+            "provider_provisional": True,
+            "provider_confirmation_source": "active_route_hint",
+            "turn_started_at": (event_when - timedelta(seconds=5)).isoformat(),
+            "active": True,
+        }
+
+        self.assertTrue(app._promote_pending_latest_account_from_sessions([route]))
+        route["provider"] = "Codex local - second@example.com"
+        self.assertTrue(app._promote_pending_latest_account_from_sessions([route]))
+        self.assertEqual(
+            app.state.latest_request["provider"],
+            "Codex local - second@example.com",
+        )
+        self.assertTrue(app._promote_pending_latest_account_from_sessions([]))
+        self.assertEqual(
+            app.state.latest_request["provider"],
+            "Codex local - api-service-local",
+        )
+        self.assertNotIn("provider_provisional", app.state.latest_request)
+        self.assertTrue(pending_event["attribution_pending"])
+        self.assertEqual(app._pending_latest_event_id, "event-live")
 
     def test_confirmed_active_event_repairs_pending_latest_request_label_only(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
