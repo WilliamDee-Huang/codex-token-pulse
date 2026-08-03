@@ -2896,7 +2896,7 @@ class LatestRequestFallbackTests(unittest.TestCase):
             account_id="final-long-id",
         )
         affinity = client_usage_export.CockpitAffinityEvent(
-            when=turn_started_at + timedelta(milliseconds=350),
+            when=turn_started_at + timedelta(milliseconds=450),
             request_id=marker.request_id,
             source="execution_session_id",
             account_id=marker.account_id,
@@ -3218,6 +3218,614 @@ class LatestRequestFallbackTests(unittest.TestCase):
         self.assertTrue(events[1].confirmed)
         self.assertEqual(events[1].label, "Codex local - plus@example.com")
         self.assertEqual(events[1].account_id, "codex_plus")
+
+    def test_cockpit_auth_result_resolves_opaque_api_key_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cockpit = root / ".antigravity_cockpit"
+            logs = cockpit / "logs"
+            logs.mkdir(parents=True)
+            account_id = "codex_apikey_8311cc24"
+            account_label = "Codex local - api-key-8311cc24"
+            (cockpit / "codex_accounts.json").write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "id": account_id,
+                                "email": "api-key-8311cc24",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            auth_at = datetime(2026, 8, 2, 15, 20, 6, 200000)
+            initial_route_at = auth_at - timedelta(seconds=20)
+            route_at = auth_at + timedelta(milliseconds=850)
+            usage_at = route_at - timedelta(milliseconds=100)
+            auth_result = {
+                "type": "auth_result",
+                "requestId": "request-api",
+                "model": "gpt-test",
+                "authId": "codex:apikey:opaque-route",
+                "accountId": account_id,
+                "accountEmail": "api-key-8311cc24",
+                "success": True,
+                "authAvailable": True,
+            }
+            (logs / "codex-api.log.2026-08-02").write_text(
+                (
+                    f'{initial_route_at.isoformat()} WARN msg="session-affinity: cache hit | '
+                    "session=test auth=codex:apikey:opaque-route provider=mixed "
+                    'model=gpt-test" request_id=request-api\n'
+                    f"{auth_at.isoformat()} INFO [CodexLocalAccess][sidecar] "
+                    f"{json.dumps(auth_result, separators=(',', ':'))}\n"
+                    f'{route_at.isoformat()} WARN msg="session-affinity: cache hit | '
+                    "session=test auth=codex:apikey:opaque-route provider=mixed "
+                    'model=gpt-test" request_id=request-api\n'
+                ),
+                encoding="utf-8",
+            )
+
+            events = client_usage_export.scan_cockpit_codex_affinity_events(
+                root,
+                initial_route_at - timedelta(seconds=1),
+                route_at + timedelta(seconds=1),
+            )
+
+        self.assertEqual(len(events), 3)
+        structured = next(event for event in events if event.action == "auth result")
+        routes = [event for event in events if event.action == "cache hit"]
+        self.assertTrue(structured.confirmed)
+        self.assertEqual(structured.account_id, account_id)
+        self.assertEqual(structured.label, account_label)
+        self.assertTrue(all(route.confirmed for route in routes))
+        self.assertEqual({route.account_id for route in routes}, {account_id})
+        self.assertEqual({route.label for route in routes}, {account_label})
+
+        usage = client_usage_export.UsageEvent(
+            when=usage_at,
+            model="gpt-test",
+            input_tokens=900,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="api-session",
+            account_at=auth_at - timedelta(minutes=5),
+        )
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [usage]},
+                [],
+                affinity_events=events,
+            )
+        )
+
+        self.assertEqual(resolved[account_label], [usage])
+        self.assertEqual(session_accounts[usage.session_id], account_label)
+        self.assertEqual(unresolved, 0)
+
+    def test_failed_auth_result_does_not_confirm_opaque_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logs = root / ".antigravity_cockpit" / "logs"
+            logs.mkdir(parents=True)
+            auth_at = datetime(2026, 8, 2, 15, 20, 6, 200000)
+            route_at = auth_at + timedelta(milliseconds=100)
+            auth_result = {
+                "type": "auth_result",
+                "requestId": "request-failed",
+                "authId": "codex:apikey:opaque-route",
+                "accountId": "codex_apikey_failed",
+                "accountEmail": "api-key-failed",
+                "success": False,
+                "authAvailable": False,
+            }
+            (logs / "codex-api.log.2026-08-02").write_text(
+                (
+                    f"{auth_at.isoformat()} INFO [CodexLocalAccess][sidecar] "
+                    f"{json.dumps(auth_result, separators=(',', ':'))}\n"
+                    f'{route_at.isoformat()} WARN msg="session-affinity: cache hit | '
+                    "session=test auth=codex:apikey:opaque-route provider=mixed "
+                    'model=gpt-test" request_id=request-failed\n'
+                ),
+                encoding="utf-8",
+            )
+
+            events = client_usage_export.scan_cockpit_codex_affinity_events(
+                root,
+                auth_at - timedelta(seconds=1),
+                route_at + timedelta(seconds=1),
+            )
+
+        route = next(event for event in events if event.action == "cache hit")
+        self.assertFalse(route.confirmed)
+        self.assertEqual(route.account_id, "codex:apikey:opaque-route")
+        self.assertEqual(route.label, "")
+
+    def test_auth_result_enrichment_stops_at_reselect_boundary(self) -> None:
+        first_label = "Codex local - first@example.com"
+        second_label = "Codex local - second@example.com"
+        started_at = datetime(2026, 8, 2, 15, 20, 0)
+        events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=started_at,
+                request_id="request-reselect",
+                account_id="codex:apikey:opaque-route",
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=started_at + timedelta(seconds=1),
+                request_id="request-reselect",
+                source="auth_result",
+                account_id="first-id",
+                label=first_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=started_at + timedelta(seconds=2),
+                request_id="request-reselect",
+                account_id="codex:apikey:opaque-route",
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=started_at + timedelta(seconds=3),
+                request_id="request-reselect",
+                account_id="second-id",
+                label=second_label,
+                action="cache hit but auth unavailable, reselected",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=started_at + timedelta(seconds=4),
+                request_id="request-reselect",
+                source="auth_result",
+                account_id="second-id",
+                label=second_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=started_at + timedelta(seconds=5),
+                request_id="request-reselect",
+                account_id="codex:apikey:opaque-route",
+                action="cache hit",
+            ),
+        ]
+
+        client_usage_export.enrich_cockpit_affinity_from_auth_results(events)
+
+        stable = [event for event in events if event.action == "cache hit"]
+        self.assertEqual(
+            [(event.account_id, event.label) for event in stable],
+            [
+                ("first-id", first_label),
+                ("first-id", first_label),
+                ("second-id", second_label),
+            ],
+        )
+
+    def test_reused_request_id_keeps_earlier_api_key_segment(self) -> None:
+        api_label = "Codex local - api-key-8311cc24"
+        oauth_label = "Codex local - hails@example.com"
+        api_turn = datetime(2026, 8, 2, 20, 55, 20)
+        oauth_turn = datetime(2026, 8, 2, 21, 20, 10)
+        api_event = client_usage_export.UsageEvent(
+            when=api_turn + timedelta(seconds=11, milliseconds=691),
+            model="gpt-test",
+            input_tokens=90_000,
+            cached_tokens=80_000,
+            output_tokens=1_000,
+            session_id="api-key-turn",
+            account_at=api_turn,
+        )
+        oauth_event = client_usage_export.UsageEvent(
+            when=oauth_turn + timedelta(seconds=9, milliseconds=902),
+            model="gpt-test",
+            input_tokens=100_000,
+            cached_tokens=90_000,
+            output_tokens=2_000,
+            session_id="oauth-turn",
+            account_at=oauth_turn,
+        )
+        request_id = "2f63c07a"
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=api_event.when - timedelta(milliseconds=80),
+                request_id=request_id,
+                source="auth_result",
+                account_id="api-id",
+                label=api_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=api_event.when + timedelta(milliseconds=30),
+                request_id=request_id,
+                account_id="api-id",
+                label=api_label,
+                action="cache hit",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=datetime(2026, 8, 2, 21, 4, 11),
+                request_id=request_id,
+                account_id="oauth-id",
+                label=oauth_label,
+                action="cache hit but auth unavailable, reselected",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=oauth_event.when - timedelta(milliseconds=70),
+                request_id=request_id,
+                source="auth_result",
+                account_id="oauth-id",
+                label=oauth_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=oauth_event.when + timedelta(milliseconds=30),
+                request_id=request_id,
+                account_id="oauth-id",
+                label=oauth_label,
+                action="cache hit",
+            ),
+        ]
+        oauth_marker = client_usage_export.AccountMarker(
+            when=oauth_event.when + timedelta(milliseconds=100),
+            label=oauth_label,
+            total_tokens=oauth_event.total_tokens,
+            request_id=request_id,
+            account_id="oauth-id",
+        )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {
+                    client_usage_export.API_SERVICE_AGGREGATE_LABEL: [
+                        api_event,
+                        oauth_event,
+                    ]
+                },
+                [oauth_marker],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[api_label], [api_event])
+        self.assertEqual(resolved[oauth_label], [oauth_event])
+        self.assertEqual(session_accounts[api_event.session_id], api_label)
+        self.assertEqual(session_accounts[oauth_event.session_id], oauth_label)
+        self.assertEqual(unresolved, 0)
+
+    def test_failed_request_recovers_after_successful_api_key_auth(self) -> None:
+        turn_started_at = datetime(2026, 8, 2, 21, 40, 0)
+        api_label = "Codex local - api-key-8311cc24"
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=20),
+            model="gpt-test",
+            input_tokens=120_000,
+            cached_tokens=100_000,
+            output_tokens=2_000,
+            session_id="recovered-api-session",
+            account_at=turn_started_at,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=turn_started_at + timedelta(seconds=1),
+                request_id="aad4a595",
+                account_id="old-id",
+                label="Codex local - old@example.com",
+                action="cache hit but auth unavailable, reselected",
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when - timedelta(milliseconds=100),
+                request_id="aad4a595",
+                source="auth_result",
+                account_id="api-id",
+                label=api_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=30),
+                request_id="aad4a595",
+                account_id="api-id",
+                label=api_label,
+                action="cache hit",
+            ),
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[api_label], [event])
+        self.assertEqual(session_accounts[event.session_id], api_label)
+        self.assertEqual(unresolved, 0)
+
+    def test_future_conflicting_marker_cannot_override_confirmed_segment(self) -> None:
+        account_label = "Codex local - confirmed@example.com"
+        turn_started_at = datetime(2026, 8, 2, 22, 0, 0)
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=10),
+            model="gpt-test",
+            input_tokens=50_000,
+            cached_tokens=40_000,
+            output_tokens=1_000,
+            session_id="confirmed-segment",
+            account_at=turn_started_at,
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when - timedelta(milliseconds=50),
+                request_id="reused-request",
+                source="auth_result",
+                account_id="confirmed-id",
+                label=account_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=30),
+                request_id="reused-request",
+                account_id="confirmed-id",
+                label=account_label,
+                action="cache hit",
+            ),
+        ]
+        future_marker = client_usage_export.AccountMarker(
+            when=event.when + timedelta(minutes=20),
+            label="Codex local - future@example.com",
+            total_tokens=event.total_tokens,
+            request_id="reused-request",
+            account_id="future-id",
+        )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: [event]},
+                [future_marker],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[account_label], [event])
+        self.assertEqual(session_accounts[event.session_id], account_label)
+        self.assertEqual(unresolved, 0)
+
+    def test_similar_token_requests_keep_their_own_segment_markers(self) -> None:
+        started_at = datetime(2026, 8, 2, 22, 20, 0)
+        labels = [
+            "Codex local - first@example.com",
+            "Codex local - second@example.com",
+        ]
+        events = [
+            client_usage_export.UsageEvent(
+                when=started_at + timedelta(seconds=index * 2),
+                model="gpt-test",
+                input_tokens=99_000,
+                cached_tokens=0,
+                output_tokens=1_000,
+                session_id=f"similar-{index}",
+                account_at=started_at + timedelta(seconds=index * 2),
+            )
+            for index in range(2)
+        ]
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=40),
+                request_id=f"request-{index}",
+                source="auth_result",
+                account_id=f"account-{index}",
+                label=labels[index],
+                action="auth result",
+                confirmed=True,
+            )
+            for index, event in enumerate(events)
+        ]
+        affinity_events.extend(
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=60),
+                request_id=f"request-{index}",
+                account_id=f"account-{index}",
+                label=labels[index],
+                action="cache hit",
+            )
+            for index, event in enumerate(events)
+        )
+        markers = [
+            client_usage_export.AccountMarker(
+                when=event.when + timedelta(milliseconds=100),
+                label=labels[index],
+                total_tokens=event.total_tokens,
+                request_id=f"request-{index}",
+                account_id=f"account-{index}",
+            )
+            for index, event in enumerate(events)
+        ]
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: events},
+                markers,
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[labels[0]], [events[0]])
+        self.assertEqual(resolved[labels[1]], [events[1]])
+        self.assertEqual(session_accounts[events[0].session_id], labels[0])
+        self.assertEqual(session_accounts[events[1].session_id], labels[1])
+        self.assertEqual(unresolved, 0)
+
+    def test_confirmed_auth_results_disambiguate_close_concurrent_turns(self) -> None:
+        base = datetime(2026, 8, 2, 21, 24, 44, 267000)
+        labels = [
+            "Codex local - oauth@example.com",
+            "Codex local - api-key-8311cc24",
+        ]
+        events = [
+            client_usage_export.UsageEvent(
+                when=base + timedelta(milliseconds=index * 61),
+                model="gpt-test",
+                input_tokens=40_000 + index * 1_000,
+                cached_tokens=0,
+                output_tokens=100,
+                session_id=f"close-session-{index}",
+                account_at=base - timedelta(seconds=10 - index),
+            )
+            for index in range(2)
+        ]
+        affinity_events: list[client_usage_export.CockpitAffinityEvent] = []
+        for index, event in enumerate(events):
+            affinity_events.extend(
+                [
+                    client_usage_export.CockpitAffinityEvent(
+                        when=event.when - timedelta(milliseconds=1),
+                        request_id=f"close-request-{index}",
+                        source="auth_result",
+                        account_id=f"close-account-{index}",
+                        label=labels[index],
+                        action="auth result",
+                        confirmed=True,
+                    ),
+                    client_usage_export.CockpitAffinityEvent(
+                        when=event.when + timedelta(milliseconds=30),
+                        request_id=f"close-request-{index}",
+                        account_id=f"close-account-{index}",
+                        label=labels[index],
+                        action="cache hit",
+                    ),
+                ]
+            )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: events},
+                [],
+                affinity_events=affinity_events,
+            )
+        )
+
+        self.assertEqual(resolved[labels[0]], [events[0]])
+        self.assertEqual(resolved[labels[1]], [events[1]])
+        self.assertEqual(session_accounts[events[0].session_id], labels[0])
+        self.assertEqual(session_accounts[events[1].session_id], labels[1])
+        self.assertEqual(unresolved, 0)
+
+    def test_long_segments_keep_their_turn_during_close_concurrency(self) -> None:
+        base = datetime(2026, 8, 2, 21, 25, 42, 822000)
+        labels = [
+            "Codex local - stream-api@example.com",
+            "Codex local - stream-oauth@example.com",
+        ]
+        turn_starts = [base - timedelta(hours=3), base - timedelta(minutes=2)]
+        event_times = [
+            [base - timedelta(seconds=4), base - timedelta(seconds=2), base],
+            [
+                base - timedelta(seconds=3),
+                base - timedelta(seconds=1),
+                base + timedelta(milliseconds=31),
+            ],
+        ]
+        events: list[client_usage_export.UsageEvent] = []
+        affinity_events: list[client_usage_export.CockpitAffinityEvent] = []
+        for stream_index in range(2):
+            request_id = f"stream-request-{stream_index}"
+            for event_index, event_time in enumerate(event_times[stream_index]):
+                event = client_usage_export.UsageEvent(
+                    when=event_time,
+                    model="gpt-test",
+                    input_tokens=50_000 + stream_index * 1_000 + event_index,
+                    cached_tokens=0,
+                    output_tokens=100,
+                    session_id=f"stream-session-{stream_index}",
+                    account_at=turn_starts[stream_index],
+                )
+                events.append(event)
+                if event_index == 0:
+                    affinity_events.append(
+                        client_usage_export.CockpitAffinityEvent(
+                            when=event.when - timedelta(milliseconds=1),
+                            request_id=request_id,
+                            source="auth_result",
+                            account_id=f"stream-account-{stream_index}",
+                            label=labels[stream_index],
+                            action="auth result",
+                            confirmed=True,
+                        )
+                    )
+                route_offset = (
+                    53
+                    if stream_index == 0 and event_index == 2
+                    else 33
+                    if stream_index == 1 and event_index == 2
+                    else 30
+                )
+                affinity_events.append(
+                    client_usage_export.CockpitAffinityEvent(
+                        when=event.when + timedelta(milliseconds=route_offset),
+                        request_id=request_id,
+                        account_id=f"stream-account-{stream_index}",
+                        label=labels[stream_index],
+                        action="cache hit",
+                    )
+                )
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {client_usage_export.API_SERVICE_AGGREGATE_LABEL: events},
+                [],
+                affinity_events=affinity_events,
+            )
+        )
+
+        for stream_index, label in enumerate(labels):
+            expected = [
+                event
+                for event in events
+                if event.session_id == f"stream-session-{stream_index}"
+            ]
+            self.assertEqual(resolved[label], expected)
+            self.assertEqual(
+                session_accounts[f"stream-session-{stream_index}"],
+                label,
+            )
+        self.assertEqual(unresolved, 0)
+
+    def test_equally_close_confirmed_auth_results_remain_unresolved(self) -> None:
+        event = client_usage_export.UsageEvent(
+            when=datetime(2026, 8, 2, 22, 30, 0),
+            model="gpt-test",
+            input_tokens=1_000,
+            cached_tokens=0,
+            output_tokens=100,
+            session_id="ambiguous-auth-session",
+            account_at=datetime(2026, 8, 2, 22, 29, 50),
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=offset),
+                request_id=f"ambiguous-auth-{index}",
+                source="auth_result",
+                account_id=f"ambiguous-account-{index}",
+                label=f"Codex local - ambiguous-{index}@example.com",
+                action="auth result",
+                confirmed=True,
+            )
+            for index, offset in enumerate((-1, 1))
+        ]
+
+        markers = client_usage_export.cockpit_confirmed_auth_result_event_markers(
+            [event],
+            affinity_events,
+        )
+
+        self.assertEqual(markers, {})
 
     def test_cockpit_manifest_email_beats_internal_log_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5575,6 +6183,72 @@ class QuotaFingerprintAttributionTests(unittest.TestCase):
         self.assertEqual(resolved, {quota_label: [event]})
         self.assertEqual(session_accounts["quota-session"], quota_label)
         self.assertEqual(unresolved, 0)
+
+    def test_confirmed_auth_result_overrides_stale_quota_fingerprint(self) -> None:
+        turn_started_at = datetime(2026, 8, 2, 21, 18, 0)
+        stale_label = "Codex local - stale-quota@example.com"
+        api_label = "Codex local - api-key-8311cc24"
+        event = client_usage_export.UsageEvent(
+            when=turn_started_at + timedelta(seconds=16),
+            model="gpt-test",
+            input_tokens=20_000,
+            cached_tokens=200_000,
+            output_tokens=1_000,
+            session_id="quota-auth-result-session",
+            account_at=turn_started_at,
+            account_label_hint=stale_label,
+            account_hint_source="quota_fingerprint",
+        )
+        affinity_events = [
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when - timedelta(milliseconds=100),
+                request_id="api-request",
+                source="auth_result",
+                account_id="api-id",
+                label=api_label,
+                action="auth result",
+                confirmed=True,
+            ),
+            client_usage_export.CockpitAffinityEvent(
+                when=event.when + timedelta(milliseconds=50),
+                request_id="api-request",
+                account_id="api-id",
+                label=api_label,
+                action="cache hit",
+            ),
+        ]
+        event_id = client_usage_export.codex_event_id(event)
+        verdicts = {
+            event_id: {
+                "label": stale_label,
+                "tier": "cockpit_usage_row",
+                "at": "2026-08-02T21:18:16+08:00",
+            },
+            "unrelated-event": {
+                "label": "Codex local - unrelated@example.com",
+                "tier": "cockpit_usage_row",
+                "at": "2026-08-02T20:00:00+08:00",
+            },
+        }
+
+        resolved, session_accounts, unresolved = (
+            client_usage_export.resolve_api_service_event_accounts(
+                {stale_label: [event]},
+                [],
+                affinity_events=affinity_events,
+                verdicts=verdicts,
+            )
+        )
+
+        self.assertEqual(resolved[api_label], [event])
+        self.assertEqual(session_accounts[event.session_id], api_label)
+        self.assertEqual(unresolved, 0)
+        self.assertEqual(verdicts[event_id]["label"], api_label)
+        self.assertEqual(verdicts[event_id]["tier"], "affinity_confirmed")
+        self.assertEqual(
+            verdicts["unrelated-event"]["label"],
+            "Codex local - unrelated@example.com",
+        )
 
     def test_final_request_id_resolves_opaque_api_route_and_stops_at_new_request(self) -> None:
         turn_started_at = datetime(2026, 8, 2, 15, 0, 0)
