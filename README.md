@@ -86,14 +86,18 @@ TOKEN_MONITOR_MODE=local-codex
 
 ### 官方额度时间同步
 
-Token Pulse 会先读取 Cockpit 明文账号快照和 sidecar reserve 中的本地额度、重置时间；只有本地重置时间缺失或 stale 时，才使用 Cockpit 侧车维护的账号凭据请求 ChatGPT 官方 `wham/usage` 接口。程序只缓存解析后的 5h/7d/cycle 额度和重置时间，不会把 access token 写入日志、导出 JSON 或缓存文件。
+Token Pulse 会先读取 Cockpit 明文账号快照和 sidecar reserve 中的本地额度、重置时间，再按账号活跃状态分层请求 ChatGPT 官方 `wham/usage` 接口。程序只缓存解析后的 5h/7d/cycle 额度和重置时间，不会把 access token 写入日志、导出 JSON 或缓存文件。
 
-每个账号默认缓存 10 分钟；请求失败也会等待 10 分钟再重试，并继续显示最后一次成功的官方百分比或本地 reserve 百分比，同时标记“额度待刷新”，不会用空值清除旧额度。可通过环境变量调整或关闭：
+当前正在产生真实 Token 的账号和当前官方直连账号默认每 2 分钟重新请求一次官方额度，其他账号每 10 分钟刷新一次。请求失败会在 10 秒后重试，并继续显示最后一次成功的官方百分比或本地 reserve 百分比，同时标记“额度待刷新”，不会用空值清除旧额度。只有具有真实 usage 的 Cockpit 请求才会把账号标记为活跃，429/503 等零 Token 失败不会触发活跃账号刷新。
 
-Token 任务持续运行时会每 10 秒执行一次轻量额度同步：先读取 Cockpit 本地快照，再复用上述 10 分钟官方缓存。百分比或重置周期发生变化时会补做一次完整窗口统计；即使会话持续繁忙，完整账号窗口快照最多保留 10 分钟，避免百分比已更新而 Token/成本仍停在旧周期。
+官方额度请求优先使用账号自己的代理配置；进程没有代理环境时，Windows 版会回退读取当前用户的系统代理设置。这样从桌面快捷方式启动 Pulse 时，也不会因为没有继承终端的 `HTTP_PROXY/HTTPS_PROXY` 而让额度刷新静默超时。
+
+Token 任务持续运行时会每 10 秒检查一次是否有账号到达刷新时间；未到期时不会访问官方接口。最近 5 分钟内活跃的账号使用 2 分钟缓存，其他可读取凭据的账号使用 10 分钟缓存。百分比或重置周期发生变化时会补做一次完整窗口统计；即使会话持续繁忙，完整账号窗口快照最多保留 10 分钟，避免百分比已更新而 Token/成本仍停在旧周期。可通过环境变量调整：
 
 ```env
 CLIENT_USAGE_OFFICIAL_QUOTA_CACHE_SECONDS=600
+CLIENT_USAGE_OFFICIAL_QUOTA_ACTIVE_CACHE_SECONDS=120
+CLIENT_USAGE_OFFICIAL_QUOTA_ACTIVE_LOOKBACK_SECONDS=300
 CLIENT_USAGE_OFFICIAL_QUOTA_REFRESH=1
 TOKEN_PULSE_QUOTA_REFRESH_SECONDS=10
 TOKEN_PULSE_FULL_USAGE_MAX_STALE_SECONDS=600
@@ -174,9 +178,15 @@ SUB2API_MONITOR_USAGE_SOURCE=auto
 把旧数据降下来。导出失败或超时时，界面会明确提示正在显示上次缓存；如果今日数据已经写入、
 只是历史补录未完成，则今日统计仍会正常更新。
 
-遇到本地价格表未收录的新模型时，导出器会从结构化在线价格源查询并写入
-`client_usage_model_prices.json`。缓存默认有效 24 小时；网络不可用或在线源未收录该模型时，
-才会使用本地模型家族价格回退。可通过 `CLIENT_USAGE_MODEL_PRICE_URL` 替换价格源。
+遇到本地价格表未收录的新模型时，导出器会先查询 LiteLLM 价格表，再回退到 Models.dev
+官方目录，并把合并后的精确价格写入 `client_usage_model_prices.json`。Models.dev 只对
+`openai`、`anthropic`、`xai`、`deepseek` 建立无前缀别名；`opencode-go` 始终使用
+`opencode-go/<model>` 独立计价键。如果在线目录暂未提供对应的 OpenCode Go 精确条目，
+Kimi K3、DeepSeek V4 Pro/Flash 会使用 OpenCode Go 官方价格作为精确兜底；DeepSeek
+按请求发生时的 UTC 峰谷时段计费，不会回退到同名裸模型价格。
+其他第三方目录保留 `provider/model` 精确路由。缓存默认有效 24 小时；网络不可用或
+在线源未收录该模型时，才会使用本地模型家族价格回退。可通过 `CLIENT_USAGE_MODEL_PRICE_URL`
+替换 LiteLLM 源，通过 `CLIENT_USAGE_MODELS_DEV_PRICE_URL` 替换 Models.dev 源。
 
 成本估算会优先使用在线价格表中的完整 Token 规则：标准、Priority、Flex、Batch、
 缓存读取、缓存写入和输出价格。超过 272K 输入上下文时仍沿用当前 tier 的普通价格，

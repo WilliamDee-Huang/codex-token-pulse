@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import zlib
@@ -173,13 +174,46 @@ AUTH_SWITCH_EVENTS_PATH = Path(
     or APP_DIR / "client_usage_auth_switch_events.jsonl"
 )
 ATTRIBUTION_LEDGER_PATH = Path(os.environ.get("CLIENT_USAGE_ATTRIBUTION_LEDGER") or APP_DIR / "client_usage_attribution_ledger.json")
-USAGE_HISTORY_PATH = Path(os.environ.get("USAGE_HISTORY_JSON") or APP_DIR / "usage_history.json")
+USAGE_HISTORY_PATH = Path(
+    os.environ.get("TOKEN_PULSE_USAGE_HISTORY_JSON")
+    or os.environ.get("USAGE_HISTORY_JSON")
+    or os.environ.get("SUB2API_USAGE_HISTORY_JSON")
+    or APP_DIR / "usage_history.json"
+)
 MODEL_PRICE_CACHE_PATH = Path(
     os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE") or APP_DIR / "client_usage_model_prices.json"
 )
 CODEX_EVENT_CACHE_PATH = Path(
     os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE")
     or APP_DIR / "client_usage_codex_event_cache.json"
+)
+OPENCODEX_USAGE_CACHE_PATH = Path(
+    os.environ.get("CLIENT_USAGE_OPENCODEX_USAGE_CACHE")
+    or APP_DIR / "client_usage_opencodex_usage_cache.json"
+)
+OPENCODEX_ACCOUNT_TIMELINE_PATH = Path(
+    os.environ.get("CLIENT_USAGE_OPENCODEX_ACCOUNT_TIMELINE")
+    or APP_DIR / "client_usage_opencodex_account_timeline.json"
+)
+OPENCODEX_ACCOUNT_MAP_PATH = Path(
+    os.environ.get("CLIENT_USAGE_OPENCODEX_ACCOUNT_MAP")
+    or APP_DIR / "client_usage_opencodex_accounts.json"
+)
+OFFLINE_BACKFILL_LOCK_PATH = Path(
+    os.environ.get("CLIENT_USAGE_OFFLINE_BACKFILL_LOCK")
+    or APP_DIR / ".offline-history-backfill.lock"
+)
+OFFLINE_BACKFILL_STATUS_PATH = Path(
+    os.environ.get("CLIENT_USAGE_OFFLINE_BACKFILL_STATUS")
+    or APP_DIR / "client_usage_offline_backfill_status.json"
+)
+OFFLINE_BACKFILL_LEASE_SECONDS = max(
+    60,
+    int(os.environ.get("CLIENT_USAGE_OFFLINE_BACKFILL_LEASE_SECONDS", "300")),
+)
+OFFLINE_BACKFILL_CHECK_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("CLIENT_USAGE_OFFLINE_BACKFILL_CHECK_INTERVAL_SECONDS", "3600")),
 )
 
 
@@ -253,6 +287,7 @@ def attribution_ledger_write_lock(
 
 CODEX_EVENT_CACHE_SCHEMA = 2
 CODEX_COMPACT_ROW_SCHEMA = 3
+OPENCODEX_COMPACT_ROW_SCHEMA = 101
 CODEX_EVENT_CACHE_HASH_BYTES = max(
     1024,
     int(os.environ.get("CLIENT_USAGE_CODEX_EVENT_CACHE_HASH_BYTES", "4096")),
@@ -265,8 +300,16 @@ MODEL_PRICE_SOURCE_URL = os.environ.get(
     "CLIENT_USAGE_MODEL_PRICE_URL",
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
 )
+MODELS_DEV_PRICE_SOURCE_URL = os.environ.get(
+    "CLIENT_USAGE_MODELS_DEV_PRICE_URL",
+    "https://models.dev/api.json",
+)
 MODEL_PRICE_CACHE_SECONDS = int(os.environ.get("CLIENT_USAGE_MODEL_PRICE_CACHE_SECONDS", "86400"))
 MODEL_PRICE_FETCH_TIMEOUT_SECONDS = float(os.environ.get("CLIENT_USAGE_MODEL_PRICE_FETCH_TIMEOUT_SECONDS", "4"))
+MODEL_PRICE_REFRESH_COOLDOWN_SECONDS = max(
+    30,
+    int(os.environ.get("CLIENT_USAGE_MODEL_PRICE_REFRESH_COOLDOWN_SECONDS", "300")),
+)
 COCKPIT_OFFICIAL_QUOTA_CACHE_PATH = Path(
     os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_CACHE")
     or APP_DIR / "client_usage_official_quota_cache.json"
@@ -278,6 +321,19 @@ COCKPIT_OFFICIAL_QUOTA_URL = os.environ.get(
 COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS = max(
     60,
     int(os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_CACHE_SECONDS", "600")),
+)
+COCKPIT_OFFICIAL_QUOTA_ACTIVE_CACHE_SECONDS = max(
+    60,
+    int(os.environ.get("CLIENT_USAGE_OFFICIAL_QUOTA_ACTIVE_CACHE_SECONDS", "120")),
+)
+COCKPIT_OFFICIAL_QUOTA_ACTIVE_LOOKBACK_SECONDS = max(
+    60,
+    int(
+        os.environ.get(
+            "CLIENT_USAGE_OFFICIAL_QUOTA_ACTIVE_LOOKBACK_SECONDS",
+            "300",
+        )
+    ),
 )
 COCKPIT_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS = max(
     5,
@@ -302,11 +358,54 @@ COCKPIT_OFFICIAL_QUOTA_ENABLED = os.environ.get(
 ).strip().lower() not in {"0", "false", "no", "off"}
 CODEX_DEFAULT_MODEL = os.environ.get("CLIENT_USAGE_CODEX_DEFAULT_MODEL", "gpt-5.5")
 MAX_SINGLE_EVENT_TOKENS = int(os.environ.get("CLIENT_USAGE_MAX_SINGLE_EVENT_TOKENS", "2000000"))
+USAGE_ACCOUNTING_SCHEMA = 1
 CLAUDE_USAGE_DEDUPE_SCHEMA = 2
-COCKPIT_USAGE_DEDUPE_SCHEMA = 1
+COCKPIT_USAGE_DEDUPE_SCHEMA = 2
 GROK_USAGE_DEDUPE_SCHEMA = 1
+OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA = 1
 GROK_LOCAL_LABEL = "Grok local"
+GROK_SUBAGENT_LABEL = "Grok subagent"
+GROK_BUILD_USAGE_MODEL = "grok-4.6-build"
+GROK_CANONICAL_DEFAULT_MODELS = frozenset({"grok-4.6", "xai/grok-4.6"})
+GROK_CANONICAL_PRICING_MODEL = "xai/grok-4.6"
+OPENCODE_SUBAGENT_LABEL = "OpenCode subagent"
+EXTERNAL_CODEX_PROVIDER_LABELS = frozenset({GROK_SUBAGENT_LABEL, OPENCODE_SUBAGENT_LABEL})
 CODEX_ACCOUNT_MATCH_WINDOW_SECONDS = int(os.environ.get("CLIENT_USAGE_CODEX_ACCOUNT_MATCH_WINDOW_SECONDS", "600"))
+OPENCODEX_ACCOUNT_MATCH_WINDOW_SECONDS = max(
+    1.0,
+    env_float("CLIENT_USAGE_OPENCODEX_ACCOUNT_MATCH_WINDOW_SECONDS", 180.0),
+)
+OPENCODEX_RECONCILIATION_MATCH_WINDOW_SECONDS = max(
+    OPENCODEX_ACCOUNT_MATCH_WINDOW_SECONDS,
+    env_float("CLIENT_USAGE_OPENCODEX_RECONCILIATION_MATCH_WINDOW_SECONDS", 21_600.0),
+)
+OPENCODEX_RECONCILIATION_CLOCK_SKEW_SECONDS = max(
+    0.0,
+    env_float("CLIENT_USAGE_OPENCODEX_RECONCILIATION_CLOCK_SKEW_SECONDS", 60.0),
+)
+OPENCODEX_ACCOUNT_MATCH_AMBIGUITY_SECONDS = max(
+    0.0,
+    env_float("CLIENT_USAGE_OPENCODEX_ACCOUNT_MATCH_AMBIGUITY_SECONDS", 0.05),
+)
+OPENCODEX_CROSS_SESSION_MATCH_WINDOW_SECONDS = max(
+    1.0,
+    env_float("CLIENT_USAGE_OPENCODEX_CROSS_SESSION_MATCH_WINDOW_SECONDS", 30.0),
+)
+OPENCODEX_TURN_START_MATCH_SECONDS = max(
+    0.1,
+    env_float("CLIENT_USAGE_OPENCODEX_TURN_START_MATCH_SECONDS", 5.0),
+)
+OPENCODEX_ACCOUNT_TIMELINE_RETENTION_DAYS = max(
+    1,
+    int(os.environ.get("CLIENT_USAGE_OPENCODEX_TIMELINE_RETENTION_DAYS", "120")),
+)
+OPENCODEX_ACCOUNT_HINT_SOURCE = "opencodex_usage"
+OPENCODEX_UNRESOLVED_HINT_SOURCE = "opencodex_usage_unresolved"
+OPENCODEX_TURN_HINT_SOURCE = "opencodex_turn"
+OPENCODEX_USAGE_PROVENANCE = "opencodex_usage"
+TRUSTED_CODEX_ACCOUNT_HINT_SOURCES = frozenset(
+    {"quota_fingerprint", OPENCODEX_ACCOUNT_HINT_SOURCE, OPENCODEX_TURN_HINT_SOURCE}
+)
 API_SERVICE_ACTIVITY_MATCH_SECONDS = float(os.environ.get("CLIENT_USAGE_API_ACTIVITY_MATCH_SECONDS", "300"))
 COCKPIT_AFFINITY_TURN_MATCH_SECONDS = max(
     0.1,
@@ -397,6 +496,7 @@ API_SERVICE_VERDICT_TIER_RANKS = {
     "temporal": 1,
     "affinity_confirmed": 2,
     "cockpit_usage_row": 3,
+    "opencodex_usage_row": 4,
 }
 API_SERVICE_VERDICT_ARCHIVE_MIN_TIER = max(
     2,
@@ -438,6 +538,9 @@ COCKPIT_AFFINITY_LINE_RE = re.compile(
 
 _ONLINE_PRICE_TABLE: dict[str, tuple[float, float, float]] | None = None
 _ONLINE_PRICE_DETAILS: dict[str, dict[str, float]] | None = None
+_ONLINE_PRICE_FETCHED_AT: float | None = None
+_ONLINE_PRICE_LAST_ATTEMPT_AT: float | None = None
+_ONLINE_PRICE_CACHE_PATH: str | None = None
 
 
 @dataclass
@@ -450,6 +553,8 @@ class UsageBucket:
     cache_read_input_tokens: int = 0
     cost: float = 0.0
     models: dict[str, int] = field(default_factory=dict)
+    unpriced_tokens: int = 0
+    unpriced_models: dict[str, int] = field(default_factory=dict)
     latest_at: datetime | None = None
     latest_model: str = ""
     latest_app_speed: str = ""
@@ -469,6 +574,14 @@ class UsageBucket:
     def add_model(self, model: str, tokens: int) -> None:
         model = (model or "unknown").strip() or "unknown"
         self.models[model] = self.models.get(model, 0) + max(0, int(tokens or 0))
+
+    def add_unpriced_model(self, model: str, tokens: int) -> None:
+        token_count = max(0, int(tokens or 0))
+        if token_count <= 0:
+            return
+        model = (model or "unknown").strip() or "unknown"
+        self.unpriced_tokens += token_count
+        self.unpriced_models[model] = self.unpriced_models.get(model, 0) + token_count
 
     def mark_latest(
         self,
@@ -499,6 +612,7 @@ class UsageEvent:
     cost_multiplier: float | None = None
     pricing_tier: str = ""
     session_id: str = ""
+    conversation_id: str = ""
     request_key: str = ""
     route: str = ""
     request_at: datetime | None = None
@@ -506,10 +620,97 @@ class UsageEvent:
     quota_fingerprints: tuple[tuple[int, int], ...] = ()
     account_label_hint: str = ""
     account_hint_source: str = ""
+    pricing_model: str = ""
+    source_request_key: str = ""
+    usage_provenance: str = ""
+    reconciliation_status: str = ""
+    canonical_id: str = ""
+    supersedes_event_ids: tuple[str, ...] = ()
 
     @property
     def total_tokens(self) -> int:
         return max(0, self.input_tokens) + max(0, self.cached_tokens) + max(0, self.output_tokens)
+
+
+@dataclass(frozen=True)
+class OpenCodexAccountSnapshot:
+    when: datetime
+    label: str
+    plan_type: str = ""
+
+
+@dataclass(frozen=True)
+class OpenCodexUsageMarker:
+    request_at: datetime
+    when: datetime
+    model: str
+    input_tokens: int
+    cached_tokens: int
+    output_tokens: int
+    total_tokens: int
+    label: str = ""
+    account_log_label: str = ""
+    request_id: str = ""
+    conversation_id: str = ""
+    attempt_ordinal: int = 0
+    provider: str = ""
+    requested_model: str = ""
+    resolved_model: str = ""
+    response_service_tier: str = ""
+    requested_service_tier: str = ""
+    requested_speed_label: str = ""
+    pricing_tier: str = ""
+    pricing_model: str = ""
+    app_speed: str = ""
+    admission_kind: str = ""
+    inbound_protocol: str = ""
+    usage_status: str = ""
+    status: int = 0
+    route_kind: str = ""
+    source_instance: str = ""
+    provenance: str = OPENCODEX_USAGE_PROVENANCE
+
+
+@dataclass
+class OpenCodexReconciliationDiagnostics:
+    requests: dict[str, int] = field(
+        default_factory=lambda: {
+            "matched": 0,
+            "proxy_only": 0,
+            "local_only": 0,
+            "ambiguous": 0,
+            "conflict": 0,
+            "rejected": 0,
+        }
+    )
+    tokens: dict[str, int] = field(
+        default_factory=lambda: {
+            "matched": 0,
+            "proxy_only": 0,
+            "local_only": 0,
+            "ambiguous": 0,
+            "conflict": 0,
+            "rejected": 0,
+        }
+    )
+
+    def add(self, status: str, token_count: int) -> None:
+        if status not in self.requests:
+            return
+        self.requests[status] += 1
+        self.tokens[status] += max(0, int(token_count or 0))
+
+    def as_dict(self) -> dict[str, dict[str, int]]:
+        return {
+            "requests": dict(self.requests),
+            "tokens": dict(self.tokens),
+        }
+
+
+@dataclass
+class OpenCodexReconciliationResult:
+    events: list[UsageEvent]
+    diagnostics: OpenCodexReconciliationDiagnostics
 
 
 @dataclass
@@ -534,6 +735,9 @@ class ClaudeUsageEvent:
 
 
 def live_usage_event_id(event: UsageEvent) -> str:
+    canonical_id = str(event.canonical_id or "").strip()
+    if canonical_id:
+        return canonical_id
     when = event.when
     aware = when if when.tzinfo is not None else when.replace(tzinfo=LOCAL_TZ)
     timestamp_us = int(round(aware.timestamp() * 1_000_000))
@@ -660,32 +864,221 @@ ONLINE_TOKEN_COST_FIELDS = (
     "output_cost_per_token_above_272k_tokens_priority",
 )
 
+ONLINE_PRICE_PROVIDERS = frozenset({"openai", "anthropic", "xai", "deepseek"})
+ONLINE_PRICE_PROVIDER_PREFIXES = tuple(f"{provider}/" for provider in sorted(ONLINE_PRICE_PROVIDERS))
+MODEL_ROUTE_PREFIXES = frozenset({
+    "openai",
+    "anthropic",
+    "xai",
+    "deepseek",
+    "opencode-go",
+})
+CACHE_READ_COST_ALIASES = (
+    "cache_read_input_token_cost",
+    "input_cost_per_token_cache_hit",
+)
+MODELS_DEV_COST_FIELD_MAP = (
+    ("input", "input_cost_per_token"),
+    ("output", "output_cost_per_token"),
+    ("cache_read", "cache_read_input_token_cost"),
+    ("cache_write", "cache_creation_input_token_cost"),
+)
+
+# Keep provider-qualified OpenCode Go fallbacks exact for times when neither
+# online catalog has the route, so they cannot leak into bare model IDs.
+OPENCODE_GO_OFFICIAL_PRICES = {
+    "opencode-go/kimi-k3": {
+        "input_cost_per_token": 3.0,
+        "cache_read_input_token_cost": 0.30,
+        "output_cost_per_token": 15.0,
+    },
+    "opencode-go/deepseek-v4-pro": {
+        "input_cost_per_token": 0.66,
+        "cache_read_input_token_cost": 0.022,
+        "output_cost_per_token": 1.98,
+    },
+    "opencode-go/deepseek-v4-flash": {
+        "input_cost_per_token": 0.22,
+        "cache_read_input_token_cost": 0.007,
+        "output_cost_per_token": 0.66,
+    },
+}
+OPENCODE_GO_PEAK_PRICES = {
+    "opencode-go/deepseek-v4-pro": {
+        "input_cost_per_token": 1.32,
+        "cache_read_input_token_cost": 0.044,
+        "output_cost_per_token": 3.96,
+    },
+    "opencode-go/deepseek-v4-flash": {
+        "input_cost_per_token": 0.44,
+        "cache_read_input_token_cost": 0.014,
+        "output_cost_per_token": 1.32,
+    },
+}
+
+
+def model_price_candidates(model: str) -> tuple[str, ...]:
+    name = str(model or "").strip().lower()
+    if not name:
+        return ()
+    candidates = [name]
+    if "/" in name:
+        prefix, remainder = name.split("/", 1)
+        if prefix in MODEL_ROUTE_PREFIXES and prefix != "opencode-go" and remainder:
+            candidates.append(remainder)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _models_dev_provider_catalog(payload: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    catalog: dict[str, dict[str, Any]] = {}
+    for provider_id, row in payload.items():
+        if not isinstance(row, dict):
+            continue
+        models = row.get("models")
+        if not isinstance(models, dict) or not models:
+            continue
+        provider = str(row.get("id") or provider_id or "").strip().lower()
+        if provider:
+            catalog[provider] = row
+    return catalog
+
+
+def is_models_dev_price_payload(payload: Any) -> bool:
+    catalog = _models_dev_provider_catalog(payload)
+    if not catalog:
+        return False
+    return any(
+        isinstance(row, dict) and "litellm_provider" not in row
+        for row in catalog.values()
+    )
+
+
+def _positive_models_dev_million_cost(value: Any) -> float:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return amount if amount > 0 else 0.0
+
+
+def _models_dev_cost_to_token_fields(cost: Any) -> dict[str, float]:
+    if not isinstance(cost, dict):
+        return {}
+    detail: dict[str, float] = {}
+    for source_field, target_field in MODELS_DEV_COST_FIELD_MAP:
+        amount = _positive_models_dev_million_cost(cost.get(source_field))
+        if amount > 0:
+            detail[target_field] = amount
+    if detail.get("input_cost_per_token", 0) <= 0 or detail.get("output_cost_per_token", 0) <= 0:
+        return {}
+    return detail
+
+
+def _models_dev_route_names(provider: str, model_id: str) -> tuple[str, ...]:
+    names: list[str] = []
+    if provider in ONLINE_PRICE_PROVIDERS:
+        if model_id.startswith(f"{provider}/"):
+            remainder = model_id.split("/", 1)[1]
+            names.extend([model_id, remainder])
+        elif "/" in model_id:
+            remainder = model_id.rsplit("/", 1)[-1]
+            names.extend([model_id, f"{provider}/{remainder}", remainder])
+        else:
+            names.extend([model_id, f"{provider}/{model_id}"])
+    elif provider == "opencode-go":
+        remainder = model_id.rsplit("/", 1)[-1] if "/" in model_id else model_id
+        if remainder:
+            names.append(f"opencode-go/{remainder}")
+    elif provider in MODEL_ROUTE_PREFIXES:
+        return ()
+    else:
+        names.append(f"{provider}/{model_id}")
+        remainder = model_id.rsplit("/", 1)[-1]
+        if remainder:
+            names.append(f"{provider}/{remainder}")
+        prefix = model_id.split("/", 1)[0] if "/" in model_id else ""
+        if prefix and prefix not in MODEL_ROUTE_PREFIXES:
+            names.append(model_id)
+    return tuple(dict.fromkeys(name for name in names if name))
+
+
+def flatten_models_dev_price_payload(payload: Any) -> dict[str, dict[str, Any]]:
+    flattened: dict[str, dict[str, Any]] = {}
+    catalog = _models_dev_provider_catalog(payload)
+    official_providers = [
+        provider for provider in ("openai", "anthropic", "xai", "deepseek") if provider in catalog
+    ]
+    remaining_providers = [
+        provider for provider in catalog if provider not in set(official_providers)
+    ]
+    for provider in official_providers + remaining_providers:
+        row = catalog[provider]
+        models = row.get("models")
+        if not isinstance(models, dict):
+            continue
+        for raw_name, model_row in models.items():
+            if not isinstance(model_row, dict):
+                continue
+            detail = _models_dev_cost_to_token_fields(model_row.get("cost"))
+            if not detail:
+                continue
+            model_id = str(model_row.get("id") or raw_name or "").strip().lower()
+            if not model_id:
+                continue
+            token_costs = {
+                field_name: value / 1_000_000
+                for field_name, value in detail.items()
+            }
+            for name in _models_dev_route_names(provider, model_id):
+                if name in flattened:
+                    continue
+                flattened[name] = {
+                    "litellm_provider": provider,
+                    **token_costs,
+                }
+    return flattened
+
+
+def _positive_token_cost(row: dict[str, Any], field_name: str) -> float:
+    try:
+        value = float(row.get(field_name) or 0) * 1_000_000
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
+
 
 def extract_online_price_details(payload: Any) -> dict[str, dict[str, float]]:
     if not isinstance(payload, dict):
         return {}
+    if is_models_dev_price_payload(payload):
+        payload = flatten_models_dev_price_payload(payload)
     prices: dict[str, dict[str, float]] = {}
     for raw_name, row in payload.items():
         if not isinstance(row, dict):
             continue
         provider = str(row.get("litellm_provider") or "").strip().lower()
-        if provider and provider not in {"openai", "anthropic", "xai"}:
-            continue
         detail: dict[str, float] = {}
         for field_name in ONLINE_TOKEN_COST_FIELDS:
-            try:
-                value = float(row.get(field_name) or 0) * 1_000_000
-            except (TypeError, ValueError):
-                value = 0.0
+            value = _positive_token_cost(row, field_name)
             if value > 0:
                 detail[field_name] = value
+        cache_read = 0.0
+        for alias in CACHE_READ_COST_ALIASES:
+            cache_read = _positive_token_cost(row, alias)
+            if cache_read > 0:
+                detail["cache_read_input_token_cost"] = cache_read
+                break
         if detail.get("input_cost_per_token", 0) <= 0 or detail.get("output_cost_per_token", 0) <= 0:
             continue
         name = str(raw_name or "").strip().lower()
         if not name:
             continue
         prices[name] = detail
-        if name.startswith(("openai/", "anthropic/", "xai/")):
+        if provider in ONLINE_PRICE_PROVIDERS and name.startswith(f"{provider}/"):
+            prices.setdefault(name.split("/", 1)[1], detail)
+        elif not provider and name.startswith(ONLINE_PRICE_PROVIDER_PREFIXES):
             prices.setdefault(name.split("/", 1)[1], detail)
     return prices
 
@@ -701,116 +1094,320 @@ def extract_online_price_table(payload: Any) -> dict[str, tuple[float, float, fl
     }
 
 
-def load_online_price_table() -> dict[str, tuple[float, float, float]]:
-    global _ONLINE_PRICE_TABLE, _ONLINE_PRICE_DETAILS
-    if _ONLINE_PRICE_TABLE is not None and _ONLINE_PRICE_DETAILS is not None:
-        return _ONLINE_PRICE_TABLE
-
-    cached: dict[str, Any] = {}
-    try:
-        cached = json.loads(MODEL_PRICE_CACHE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        cached = {}
-    cached_details = extract_online_price_details(cached.get("models"))
-    cached_prices = {
+def _price_table_from_details(
+    details: dict[str, dict[str, float]],
+) -> dict[str, tuple[float, float, float]]:
+    return {
         name: (
             detail["input_cost_per_token"],
             detail.get("cache_read_input_token_cost", detail["input_cost_per_token"]),
             detail["output_cost_per_token"],
         )
-        for name, detail in cached_details.items()
+        for name, detail in details.items()
     }
+
+
+def _cache_models_from_details(
+    details: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    return {
+        name: {field_name: value / 1_000_000 for field_name, value in detail.items()}
+        for name, detail in details.items()
+    }
+
+
+def _price_cache_is_fresh(fetched_at: float, now_timestamp: float) -> bool:
+    return 0 <= now_timestamp - fetched_at < MODEL_PRICE_CACHE_SECONDS
+
+
+def _price_refresh_is_cooled_down(last_attempt_at: float, now_timestamp: float) -> bool:
+    return 0 <= now_timestamp - last_attempt_at < MODEL_PRICE_REFRESH_COOLDOWN_SECONDS
+
+
+def _read_model_price_cache() -> dict[str, Any]:
+    try:
+        cached = json.loads(MODEL_PRICE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return cached if isinstance(cached, dict) else {}
+
+
+def _write_model_price_cache(
+    details: dict[str, dict[str, float]],
+    fetched_at: float,
+    last_attempt_at: float,
+) -> None:
+    write_json_atomic(
+        MODEL_PRICE_CACHE_PATH,
+        {
+            "schema": 2,
+            "source": MODEL_PRICE_SOURCE_URL,
+            "fetched_at": fetched_at,
+            "last_attempt_at": last_attempt_at,
+            "models": _cache_models_from_details(details),
+        },
+    )
+
+
+def _remember_online_prices(
+    details: dict[str, dict[str, float]],
+    fetched_at: float | None,
+    last_attempt_at: float | None,
+) -> dict[str, tuple[float, float, float]]:
+    global _ONLINE_PRICE_TABLE, _ONLINE_PRICE_DETAILS
+    global _ONLINE_PRICE_FETCHED_AT, _ONLINE_PRICE_LAST_ATTEMPT_AT, _ONLINE_PRICE_CACHE_PATH
+    table = _price_table_from_details(details)
+    _ONLINE_PRICE_DETAILS = details
+    _ONLINE_PRICE_TABLE = table
+    _ONLINE_PRICE_FETCHED_AT = fetched_at
+    _ONLINE_PRICE_LAST_ATTEMPT_AT = last_attempt_at
+    try:
+        _ONLINE_PRICE_CACHE_PATH = str(MODEL_PRICE_CACHE_PATH.resolve())
+    except OSError:
+        _ONLINE_PRICE_CACHE_PATH = str(MODEL_PRICE_CACHE_PATH)
+    return table
+
+
+def _fetch_json_price_payload(url: str) -> dict[str, Any] | None:
+    req = request.Request(
+        url,
+        headers={"User-Agent": "token-floating-monitor/1.0"},
+    )
+    with request.urlopen(req, timeout=MODEL_PRICE_FETCH_TIMEOUT_SECONDS) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+def _fetch_online_price_payload() -> dict[str, Any] | None:
+    return _fetch_json_price_payload(MODEL_PRICE_SOURCE_URL)
+
+
+def _normalized_price_source_url(url: str) -> str:
+    return str(url or "").strip().rstrip("/")
+
+
+def _fetch_models_dev_price_payload() -> dict[str, Any] | None:
+    url = _normalized_price_source_url(MODELS_DEV_PRICE_SOURCE_URL)
+    if not url:
+        return None
+    if url == _normalized_price_source_url(MODEL_PRICE_SOURCE_URL):
+        return None
+    return _fetch_json_price_payload(url)
+
+
+def _merge_online_price_details(
+    primary: dict[str, dict[str, float]],
+    extra: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    merged = dict(primary)
+    for name, detail in extra.items():
+        merged.setdefault(name, detail)
+    return merged
+
+
+def opencode_go_official_price_details(
+    model: str,
+    when: datetime | None = None,
+) -> dict[str, float] | None:
+    name = str(model or "").strip().lower()
+    standard = OPENCODE_GO_OFFICIAL_PRICES.get(name)
+    if standard is None:
+        return None
+    if name not in OPENCODE_GO_PEAK_PRICES or not opencode_go_peak_at(when):
+        return dict(standard)
+    return dict(OPENCODE_GO_PEAK_PRICES[name])
+
+
+def opencode_go_peak_at(when: datetime | None) -> bool:
+    if when is None:
+        return False
+    aware = when if when.tzinfo is not None else when.replace(tzinfo=LOCAL_TZ)
+    utc_hour = aware.astimezone(timezone.utc).hour
+    return 1 <= utc_hour < 4 or 6 <= utc_hour < 10
+
+
+def apply_opencode_go_time_pricing(
+    model: str,
+    detail: dict[str, float],
+    when: datetime | None,
+) -> dict[str, float]:
+    name = str(model or "").strip().lower()
+    standard = OPENCODE_GO_OFFICIAL_PRICES.get(name)
+    peak = OPENCODE_GO_PEAK_PRICES.get(name)
+    if standard is None or peak is None or not opencode_go_peak_at(when):
+        return detail
+    adjusted = dict(detail)
+    for field_name, peak_price in peak.items():
+        standard_price = float(standard.get(field_name) or 0)
+        current_price = float(adjusted.get(field_name) or 0)
+        if standard_price > 0 and current_price > 0:
+            adjusted[field_name] = current_price * peak_price / standard_price
+    return adjusted
+
+
+def _refresh_online_price_table(
+    cached_details: dict[str, dict[str, float]],
+    fetched_at: float,
+    now_timestamp: float,
+) -> dict[str, tuple[float, float, float]]:
+    online_details: dict[str, dict[str, float]] = {}
+    try:
+        payload = _fetch_online_price_payload()
+        online_details = extract_online_price_details(payload)
+    except (OSError, ValueError, json.JSONDecodeError):
+        online_details = {}
+    try:
+        models_dev_payload = _fetch_models_dev_price_payload()
+        if models_dev_payload:
+            online_details = _merge_online_price_details(
+                online_details,
+                extract_online_price_details(models_dev_payload),
+            )
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    if online_details:
+        # A successful primary refresh must not erase provider-exact prices
+        # retained from a temporarily unavailable secondary source.
+        online_details = _merge_online_price_details(online_details, cached_details)
+        _write_model_price_cache(online_details, now_timestamp, now_timestamp)
+        return _remember_online_prices(online_details, now_timestamp, now_timestamp)
+    if cached_details:
+        try:
+            _write_model_price_cache(cached_details, fetched_at, now_timestamp)
+        except OSError:
+            pass
+        return _remember_online_prices(cached_details, fetched_at, now_timestamp)
+    return _remember_online_prices({}, fetched_at, now_timestamp)
+
+
+def load_online_price_table(*, force_refresh: bool = False) -> dict[str, tuple[float, float, float]]:
+    now_timestamp = datetime.now().timestamp()
+    try:
+        cache_path = str(MODEL_PRICE_CACHE_PATH.resolve())
+    except OSError:
+        cache_path = str(MODEL_PRICE_CACHE_PATH)
+    memory_ready = _ONLINE_PRICE_TABLE is not None and _ONLINE_PRICE_DETAILS is not None
+    injected_memory = memory_ready and _ONLINE_PRICE_CACHE_PATH is None
+    memory_matches_path = _ONLINE_PRICE_CACHE_PATH in {None, cache_path}
+    if injected_memory and not force_refresh:
+        return _ONLINE_PRICE_TABLE or {}
+    if memory_ready and memory_matches_path and not force_refresh:
+        return _ONLINE_PRICE_TABLE or {}
+    if (
+        force_refresh
+        and memory_ready
+        and memory_matches_path
+        and (_ONLINE_PRICE_LAST_ATTEMPT_AT or 0) > 0
+        and _price_refresh_is_cooled_down(_ONLINE_PRICE_LAST_ATTEMPT_AT or 0, now_timestamp)
+    ):
+        return _ONLINE_PRICE_TABLE or {}
+
+    cached = _read_model_price_cache()
+    cached_details = extract_online_price_details(cached.get("models"))
     try:
         fetched_at = float(cached.get("fetched_at") or 0)
     except (TypeError, ValueError):
         fetched_at = 0.0
-    now_timestamp = datetime.now().timestamp()
-    if int(cached.get("schema") or 0) >= 2 and cached_prices and 0 <= now_timestamp - fetched_at < MODEL_PRICE_CACHE_SECONDS:
-        _ONLINE_PRICE_DETAILS = cached_details
-        _ONLINE_PRICE_TABLE = cached_prices
-        return _ONLINE_PRICE_TABLE
-
     try:
-        req = request.Request(
-            MODEL_PRICE_SOURCE_URL,
-            headers={"User-Agent": "token-floating-monitor/1.0"},
-        )
-        with request.urlopen(req, timeout=MODEL_PRICE_FETCH_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        online_details = extract_online_price_details(payload)
-        if online_details:
-            online_prices = {
-                name: (
-                    detail["input_cost_per_token"],
-                    detail.get("cache_read_input_token_cost", detail["input_cost_per_token"]),
-                    detail["output_cost_per_token"],
-                )
-                for name, detail in online_details.items()
-            }
-            cache_models = {
-                name: {field_name: value / 1_000_000 for field_name, value in detail.items()}
-                for name, detail in online_details.items()
-            }
-            write_json_atomic(
-                MODEL_PRICE_CACHE_PATH,
-                {
-                    "schema": 2,
-                    "source": MODEL_PRICE_SOURCE_URL,
-                    "fetched_at": now_timestamp,
-                    "models": cache_models,
-                },
-            )
-            _ONLINE_PRICE_DETAILS = online_details
-            _ONLINE_PRICE_TABLE = online_prices
-            return _ONLINE_PRICE_TABLE
-    except (OSError, ValueError, json.JSONDecodeError):
-        pass
-
-    _ONLINE_PRICE_DETAILS = cached_details
-    _ONLINE_PRICE_TABLE = cached_prices
-    return _ONLINE_PRICE_TABLE
+        last_attempt_at = float(cached.get("last_attempt_at") or 0)
+    except (TypeError, ValueError):
+        last_attempt_at = fetched_at
+    schema_ok = int(cached.get("schema") or 0) >= 2
+    if (
+        not force_refresh
+        and schema_ok
+        and cached_details
+        and _price_cache_is_fresh(fetched_at, now_timestamp)
+    ):
+        return _remember_online_prices(cached_details, fetched_at, last_attempt_at)
+    if force_refresh and last_attempt_at > 0 and _price_refresh_is_cooled_down(last_attempt_at, now_timestamp):
+        if cached_details:
+            return _remember_online_prices(cached_details, fetched_at, last_attempt_at)
+        if memory_ready and memory_matches_path:
+            return _ONLINE_PRICE_TABLE or {}
+        return _remember_online_prices(cached_details, fetched_at, last_attempt_at)
+    return _refresh_online_price_table(cached_details, fetched_at, now_timestamp)
 
 
-def online_model_price(model: str) -> tuple[float, float, float] | None:
-    name = (model or "").strip().lower()
-    if not name:
+def _lookup_online_price_details(model: str) -> dict[str, float] | None:
+    candidates = model_price_candidates(model)
+    if not candidates:
         return None
-    prices = load_online_price_table()
-    for candidate in (name, name.split("/", 1)[-1]):
-        price = prices.get(candidate)
-        if price:
-            return price
-    return None
-
-
-def online_model_price_details(model: str) -> dict[str, float] | None:
-    name = (model or "").strip().lower()
-    if not name:
-        return None
-    load_online_price_table()
     details = _ONLINE_PRICE_DETAILS or {}
-    for candidate in (name, name.split("/", 1)[-1]):
+    for candidate in candidates:
         detail = details.get(candidate)
         if detail:
             return detail
     return None
 
 
-def model_price(model: str) -> tuple[float, float, float]:
+def _lookup_online_price(model: str) -> tuple[float, float, float] | None:
+    candidates = model_price_candidates(model)
+    if not candidates:
+        return None
+    prices = _ONLINE_PRICE_TABLE or {}
+    for candidate in candidates:
+        price = prices.get(candidate)
+        if price:
+            return price
+    return None
+
+
+def online_model_price(model: str) -> tuple[float, float, float] | None:
+    if not model_price_candidates(model):
+        return None
+    load_online_price_table()
+    price = _lookup_online_price(model)
+    if price:
+        return price
+    if _ONLINE_PRICE_CACHE_PATH is None:
+        return None
+    load_online_price_table(force_refresh=True)
+    return _lookup_online_price(model)
+
+
+def online_model_price_details(model: str) -> dict[str, float] | None:
+    if not model_price_candidates(model):
+        return None
+    load_online_price_table()
+    detail = _lookup_online_price_details(model)
+    if detail:
+        return detail
+    if _ONLINE_PRICE_CACHE_PATH is None:
+        return None
+    load_online_price_table(force_refresh=True)
+    return _lookup_online_price_details(model)
+
+
+def hardcoded_model_price(model: str) -> tuple[float, float, float] | None:
     name = (model or "").lower()
     for needle, price in PRICE_PER_MILLION:
         if needle in name:
             return price
-    online_price = online_model_price(name)
-    if online_price is not None:
-        return online_price
+    return None
+
+
+def fallback_family_model_price(model: str) -> tuple[float, float, float] | None:
+    name = (model or "").lower()
     if re.search(r"\bgpt-5(?:\.|\b)", name):
         return next(price for needle, price in PRICE_PER_MILLION if needle == "gpt-5.5")
-    return (0.0, 0.0, 0.0)
+    return None
 
 
-def local_model_price_details(model: str) -> dict[str, float]:
-    input_price, cache_price, output_price = model_price(model)
+def model_price(model: str) -> tuple[float, float, float]:
+    hardcoded = hardcoded_model_price(model)
+    if hardcoded is not None:
+        return hardcoded
+    online_price = online_model_price(model)
+    if online_price is not None:
+        return online_price
+    return fallback_family_model_price(model) or (0.0, 0.0, 0.0)
+
+
+def price_profile_from_rates(
+    rates: tuple[float, float, float],
+) -> dict[str, float]:
+    input_price, cache_price, output_price = rates
     multiplier = max(1.0, CODEX_FAST_COST_MULTIPLIER)
     return {
         "input_cost_per_token": input_price,
@@ -823,6 +1420,57 @@ def local_model_price_details(model: str) -> dict[str, float]:
         "output_cost_per_token_priority": output_price * multiplier,
     }
 
+
+def local_model_price_details(model: str) -> dict[str, float]:
+    return price_profile_from_rates(model_price(model))
+
+
+def resolve_model_price_details(
+    model: str,
+    pricing_model: str = "",
+    when: datetime | None = None,
+) -> tuple[dict[str, float], bool]:
+    lookup_model = str(pricing_model or model or "").strip() or str(model or "")
+    exact_candidates = tuple(
+        dict.fromkeys(
+            str(candidate or "").strip().lower()
+            for candidate in (lookup_model, model)
+            if str(candidate or "").strip().lower().startswith("opencode-go/")
+        )
+    )
+    if exact_candidates:
+        load_online_price_table()
+        for candidate in exact_candidates:
+            exact_online = (_ONLINE_PRICE_DETAILS or {}).get(candidate)
+            if exact_online is not None:
+                return apply_opencode_go_time_pricing(candidate, exact_online, when), True
+        if _ONLINE_PRICE_CACHE_PATH is not None:
+            load_online_price_table(force_refresh=True)
+            for candidate in exact_candidates:
+                exact_online = (_ONLINE_PRICE_DETAILS or {}).get(candidate)
+                if exact_online is not None:
+                    return apply_opencode_go_time_pricing(candidate, exact_online, when), True
+        for candidate in exact_candidates:
+            official = opencode_go_official_price_details(candidate, when=when)
+            if official is not None:
+                return official, True
+        return {}, False
+    online_details = online_model_price_details(lookup_model)
+    if online_details is None and lookup_model != model:
+        online_details = online_model_price_details(model)
+    if online_details is not None:
+        return online_details, True
+    online_rates = online_model_price(lookup_model)
+    if online_rates is None and lookup_model != model:
+        online_rates = online_model_price(model)
+    if online_rates is not None:
+        return price_profile_from_rates(online_rates), True
+    local_rates = hardcoded_model_price(lookup_model) or hardcoded_model_price(model)
+    if local_rates is None:
+        local_rates = fallback_family_model_price(lookup_model) or fallback_family_model_price(model)
+    if local_rates is None:
+        return {}, False
+    return price_profile_from_rates(local_rates), True
 
 def normalize_pricing_tier(value: Any) -> str:
     tier = str(value or "").strip().lower()
@@ -849,8 +1497,37 @@ def estimate_cost(
     output_tokens: int,
     cache_creation_tokens: int = 0,
     pricing_tier: str = "standard",
+    pricing_model: str = "",
+    when: datetime | None = None,
 ) -> float:
-    profile = online_model_price_details(model) or local_model_price_details(model)
+    cost, _resolved = estimate_cost_with_resolution(
+        model,
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        pricing_tier=pricing_tier,
+        pricing_model=pricing_model,
+        when=when,
+    )
+    return cost
+
+
+def estimate_cost_with_resolution(
+    model: str,
+    input_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+    cache_creation_tokens: int = 0,
+    pricing_tier: str = "standard",
+    pricing_model: str = "",
+    when: datetime | None = None,
+) -> tuple[float, bool]:
+    profile, resolved = resolve_model_price_details(
+        model,
+        pricing_model=pricing_model,
+        when=when,
+    )
     tier = normalize_pricing_tier(pricing_tier)
     input_count = max(0, input_tokens)
     cached_count = max(0, cached_tokens)
@@ -864,12 +1541,13 @@ def estimate_cost(
         cache_price = input_price
     if cache_creation_price <= 0:
         cache_creation_price = input_price
-    return (
+    cost = (
         input_count * input_price
         + cached_count * cache_price
         + cache_creation_count * cache_creation_price
         + output_count * output_price
     ) / 1_000_000
+    return cost, resolved
 
 
 def codex_speed_cost_multiplier(speed: str) -> float:
@@ -960,6 +1638,59 @@ def codex_model_name(model: str) -> str:
     return name
 
 
+def is_official_codex_quota_model(model: str) -> bool:
+    """Whether a local event can plausibly consume an OpenAI Codex quota.
+
+    A provider-qualified model name belongs to an external route even when the
+    local Codex session happens to retain the same account label. The fallback
+    is intentionally limited to the unqualified model families exposed by the
+    official Codex client; an exact quota fingerprint remains stronger evidence.
+    """
+    name = str(model or "").strip().lower()
+    if not name or "/" in name:
+        return False
+    return name.startswith(("gpt-", "o1", "o3", "o4", "o5", "codex-", "chatgpt-"))
+
+
+def external_codex_provider_label(model: str) -> str:
+    name = str(model or "").strip().lower()
+    if name.startswith("xai/"):
+        return GROK_SUBAGENT_LABEL
+    if name.startswith("opencode-go/"):
+        return OPENCODE_SUBAGENT_LABEL
+    return ""
+
+
+def is_external_codex_provider_label(label: str) -> bool:
+    return str(label or "").strip() in EXTERNAL_CODEX_PROVIDER_LABELS
+
+
+def is_codex_account_provider_name(name: str) -> bool:
+    label = str(name or "").strip()
+    if not label or is_external_codex_provider_label(label):
+        return False
+    if label in {GROK_LOCAL_LABEL, "Claude local"}:
+        return False
+    return label.startswith("Codex local") or label == UNASSIGNED_CODEX_LABEL
+
+
+def assign_external_codex_provider_label(
+    event: UsageEvent,
+    ledger: dict[str, str] | None,
+) -> str:
+    label = external_codex_provider_label(event.model)
+    if not label:
+        return ""
+    if ledger is not None:
+        stable_id = codex_event_id(event)
+        if stable_id:
+            ledger_assign(ledger, stable_id, label)
+        legacy_id = legacy_codex_event_id(event)
+        if legacy_id and legacy_id != stable_id:
+            ledger_assign(ledger, legacy_id, label)
+    return label
+
+
 NON_TURN_ERROR_KINDS = {"active_turn_not_steerable", "thread_rollback_failed"}
 
 
@@ -1015,7 +1746,17 @@ def add_codex_usage(
     bucket.output_tokens += output
     multiplier = max(1.0, cost_multiplier)
     pricing_tier = "priority" if multiplier > 1 else "standard"
-    bucket.cost += estimate_cost(model, uncached_input, cached_input, output, pricing_tier=pricing_tier)
+    cost, price_resolved = estimate_cost_with_resolution(
+        model,
+        uncached_input,
+        cached_input,
+        output,
+        pricing_tier=pricing_tier,
+        when=when,
+    )
+    bucket.cost += cost
+    if not price_resolved:
+        bucket.add_unpriced_model(model, total)
     bucket.add_model(model, total)
     bucket.mark_latest(when, model, "fast" if multiplier > 1 else "", multiplier)
 
@@ -1029,12 +1770,15 @@ def make_codex_event(
     app_speed: str = "",
     cost_multiplier: float | None = None,
     session_id: str = "",
+    conversation_id: str = "",
     request_key: str = "",
     route: str = "",
     request_at: datetime | None = None,
     account_at: datetime | None = None,
     pricing_tier: str = "",
     quota_fingerprints: tuple[tuple[int, int], ...] = (),
+    pricing_model: str = "",
+    usage_provenance: str = "",
 ) -> UsageEvent | None:
     if when is None:
         return None
@@ -1054,11 +1798,14 @@ def make_codex_event(
         cost_multiplier=cost_multiplier,
         pricing_tier=normalize_pricing_tier(pricing_tier or app_speed),
         session_id=str(session_id or "").strip(),
+        conversation_id=str(conversation_id or "").strip().casefold(),
         request_key=str(request_key or "").strip(),
         route=str(route or "").strip().lower(),
         request_at=request_at,
         account_at=account_at,
         quota_fingerprints=tuple(quota_fingerprints or ()),
+        pricing_model=str(pricing_model or "").strip(),
+        usage_provenance=str(usage_provenance or "").strip(),
     )
 
 
@@ -1075,13 +1822,18 @@ def add_codex_event_to_bucket(
     bucket.cached_input_tokens += event.cached_tokens
     bucket.output_tokens += event.output_tokens
     pricing_tier = event.pricing_tier or ("priority" if effective_multiplier > 1 else "standard")
-    bucket.cost += estimate_cost(
+    cost, price_resolved = estimate_cost_with_resolution(
         event.model,
         event.input_tokens,
         event.cached_tokens,
         event.output_tokens,
         pricing_tier=pricing_tier,
+        pricing_model=event.pricing_model,
+        when=event.when,
     )
+    bucket.cost += cost
+    if not price_resolved:
+        bucket.add_unpriced_model(event.model, event.total_tokens)
     bucket.add_model(event.model, event.total_tokens)
     event_speed = event.app_speed or ("fast" if effective_multiplier > 1 else "")
     bucket.mark_latest(bucket_time or event.when, event.model, event_speed, effective_multiplier)
@@ -1097,6 +1849,9 @@ def add_bucket(target: UsageBucket, source: UsageBucket) -> None:
     target.cost += source.cost
     for model, tokens in source.models.items():
         target.models[model] = target.models.get(model, 0) + tokens
+    target.unpriced_tokens += source.unpriced_tokens
+    for model, tokens in source.unpriced_models.items():
+        target.unpriced_models[model] = target.unpriced_models.get(model, 0) + tokens
     target.mark_latest(
         source.latest_at,
         source.latest_model,
@@ -1167,6 +1922,26 @@ def codex_quota_fingerprints(rate_limits: Any) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(fingerprints, reverse=True))
 
 
+def event_counts_toward_official_quota_window(
+    event: UsageEvent,
+    quota_window: Any,
+) -> bool:
+    """Keep quota cards tied to the official model family and reset window.
+
+    Cockpit's per-request usage is ideal when it exists. Local events can
+    arrive without a matching Cockpit row, however, so an unqualified official
+    Codex model is accepted as the bounded fallback. Provider-qualified
+    DeepSeek/Grok routes never inflate an OpenAI account's quota card, even
+    when they happen to carry the same official quota fingerprint.
+    """
+    if "/" in str(event.model or "") or external_codex_provider_label(event.model):
+        return False
+    fingerprint = quota_window_fingerprint(quota_window)
+    if fingerprint is not None and fingerprint in event.quota_fingerprints:
+        return True
+    return is_official_codex_quota_model(event.model)
+
+
 def parse_json_after_marker(text: str, marker: str) -> dict[str, Any] | None:
     pos = text.find(marker)
     if pos < 0:
@@ -1227,6 +2002,7 @@ def codex_event_from_log_fields(text: str, ts: Any) -> UsageEvent | None:
         route=detect_codex_route(text),
         request_at=when,
         pricing_tier=pricing_tier,
+        usage_provenance="codex-logs2",
     )
 
 
@@ -1292,7 +2068,13 @@ def compact_codex_cache_row(row: dict[str, Any]) -> dict[str, Any] | None:
             "timestamp": row.get("timestamp"),
             "payload": {
                 key: payload.get(key)
-                for key in ("id", "session_id", "forked_from_id", "timestamp")
+                for key in (
+                    "id",
+                    "session_id",
+                    "parent_thread_id",
+                    "forked_from_id",
+                    "timestamp",
+                )
                 if payload.get(key) is not None
             },
         }
@@ -1364,8 +2146,138 @@ def compact_codex_cache_row(row: dict[str, Any]) -> dict[str, Any] | None:
     return compact_row
 
 
+def compact_opencodex_usage_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Retain only final OpenAI routing evidence and reported usage fields."""
+    def token_value(source: dict[str, Any], key: str) -> int:
+        try:
+            return max(0, int(source.get(key) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    selected: dict[str, Any] = row
+    selected_usage = row.get("usage")
+    attempts = row.get("attempts")
+    if isinstance(attempts, list):
+        positive_attempts: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+        for position, attempt in enumerate(attempts):
+            if not isinstance(attempt, dict):
+                continue
+            attempt_usage = attempt.get("usage")
+            if not isinstance(attempt_usage, dict):
+                continue
+            reported = token_value(attempt_usage, "totalTokens")
+            components = max(
+                token_value(attempt_usage, "inputTokens"),
+                token_value(attempt_usage, "cachedInputTokens"),
+                token_value(attempt_usage, "outputTokens"),
+            )
+            if max(reported, components) <= 0:
+                continue
+            try:
+                ordinal = int(attempt.get("ordinal") or position + 1)
+            except (TypeError, ValueError, OverflowError):
+                ordinal = position + 1
+            positive_attempts.append((ordinal, position, attempt, attempt_usage))
+        if positive_attempts:
+            _ordinal, _position, selected, selected_usage = max(
+                positive_attempts,
+                key=lambda item: (item[0], item[1]),
+            )
+    if not isinstance(selected_usage, dict):
+        return None
+
+    provider = str(selected.get("provider") or row.get("provider") or "").strip().lower()
+    if provider != "openai" and not provider.startswith("openai-"):
+        return None
+    model = str(
+        selected.get("resolvedModel")
+        or selected.get("model")
+        or row.get("resolvedModel")
+        or row.get("model")
+        or row.get("requestedModel")
+        or ""
+    ).strip()
+    if not is_official_codex_quota_model(model):
+        return None
+
+    input_tokens = token_value(selected_usage, "inputTokens")
+    cached_tokens = token_value(selected_usage, "cachedInputTokens")
+    output_tokens = token_value(selected_usage, "outputTokens")
+    reported_total = token_value(selected_usage, "totalTokens")
+    if reported_total <= 0:
+        reported_total = token_value(selected, "totalTokens")
+    computed_total = input_tokens + output_tokens
+    if max(reported_total, input_tokens, cached_tokens, output_tokens) <= 0:
+        return None
+    if cached_tokens > input_tokens or computed_total <= 0:
+        return None
+    # The local Codex event stores uncached input and cached input separately;
+    # OpenCodex's inputTokens already includes cachedInputTokens.
+    total_tokens = computed_total
+    if reported_total > 0 and reported_total != computed_total:
+        return None
+    response_service_tier = str(
+        selected.get("responseServiceTier")
+        or row.get("responseServiceTier")
+        or ""
+    ).strip()
+    requested_service_tier = str(
+        selected.get("requestedServiceTier")
+        or row.get("requestedServiceTier")
+        or ""
+    ).strip()
+    requested_speed_label = str(
+        selected.get("requestedSpeedLabel")
+        or row.get("requestedSpeedLabel")
+        or ""
+    ).strip()
+    route_decision = row.get("routeDecision")
+    route_kind = (
+        str(route_decision.get("routeKind") or "").strip()
+        if isinstance(route_decision, dict)
+        else ""
+    )
+    try:
+        status = int(selected.get("status") or row.get("status") or 0)
+    except (TypeError, ValueError, OverflowError):
+        status = 0
+    return {
+        "timestamp": row.get("timestamp"),
+        "duration_ms": row.get("durationMs"),
+        "model": model,
+        "provider": provider,
+        "requested_model": row.get("requestedModel"),
+        "resolved_model": model,
+        "response_service_tier": response_service_tier,
+        "requested_service_tier": requested_service_tier,
+        "requested_speed_label": requested_speed_label,
+        "pricing_tier": normalize_pricing_tier(response_service_tier),
+        "pricing_model": (
+            selected.get("pricingModel")
+            or row.get("pricingModel")
+            or model
+        ),
+        "admission_kind": row.get("admissionKind"),
+        "inbound_protocol": row.get("inboundProtocol"),
+        "usage_status": selected.get("usageStatus") or row.get("usageStatus"),
+        "status": status,
+        "route_kind": route_kind,
+        "provenance": OPENCODEX_USAGE_PROVENANCE,
+        "account_log_label": selected.get("accountLogLabel") or row.get("accountLogLabel"),
+        "request_id": row.get("requestId"),
+        "conversation_id": row.get("conversationId"),
+        "attempt_ordinal": selected.get("ordinal") if selected is not row else 0,
+        "input_tokens": input_tokens - cached_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 class CodexEventRowCache:
     """Persistent append-only cache for scanner-relevant JSONL records."""
+
+    row_schema = CODEX_COMPACT_ROW_SCHEMA
 
     def __init__(self, cache_path: Path = CODEX_EVENT_CACHE_PATH) -> None:
         self.cache_path = cache_path
@@ -1391,6 +2303,10 @@ class CodexEventRowCache:
             return True
         except (OSError, ValueError):
             return False
+
+    @staticmethod
+    def _compact_row(row: dict[str, Any]) -> dict[str, Any] | None:
+        return compact_codex_cache_row(row)
 
     def _load(self) -> None:
         if self._loaded:
@@ -1488,8 +2404,13 @@ class CodexEventRowCache:
             return False
         return True
 
-    @staticmethod
-    def _read_complete_rows(path: Path, start: int, end: int) -> tuple[list[dict[str, Any]], int]:
+    @classmethod
+    def _read_complete_rows(
+        cls,
+        path: Path,
+        start: int,
+        end: int,
+    ) -> tuple[list[dict[str, Any]], int]:
         rows: list[dict[str, Any]] = []
         processed = max(0, int(start))
         try:
@@ -1513,7 +2434,7 @@ class CodexEventRowCache:
                     processed = handle.tell()
                     if not isinstance(row, dict):
                         continue
-                    compact = compact_codex_cache_row(row)
+                    compact = cls._compact_row(row)
                     if compact is not None:
                         rows.append(compact)
         except OSError:
@@ -1542,7 +2463,7 @@ class CodexEventRowCache:
         )
         if (
             entry is not None
-            and current_row_schema >= CODEX_COMPACT_ROW_SCHEMA
+            and current_row_schema >= self.row_schema
             and int(entry.get("size") or -1) == size
             and int(entry.get("mtime_ns") or -1) == modified_ns
         ):
@@ -1550,7 +2471,7 @@ class CodexEventRowCache:
 
         append = bool(
             entry is not None
-            and current_row_schema >= CODEX_COMPACT_ROW_SCHEMA
+            and current_row_schema >= self.row_schema
             and size > int(entry.get("size") or 0)
             and self._append_is_valid(path, entry, size)
         )
@@ -1567,7 +2488,7 @@ class CodexEventRowCache:
         boundary_start = max(0, processed - CODEX_EVENT_CACHE_HASH_BYTES)
         boundary_length = max(0, processed - boundary_start)
         self.entries[key] = {
-            "row_schema": CODEX_COMPACT_ROW_SCHEMA,
+            "row_schema": self.row_schema,
             "size": size,
             "mtime_ns": modified_ns,
             "processed_length": processed,
@@ -1690,8 +2611,22 @@ class CodexEventRowCache:
                 pass
 
 
+class OpenCodexUsageRowCache(CodexEventRowCache):
+    row_schema = OPENCODEX_COMPACT_ROW_SCHEMA
+
+    @staticmethod
+    def _is_default_codex_path(path: Path) -> bool:
+        return True
+
+    @staticmethod
+    def _compact_row(row: dict[str, Any]) -> dict[str, Any] | None:
+        return compact_opencodex_usage_row(row)
+
+
 _CODEX_EVENT_ROW_CACHE = CodexEventRowCache()
+_OPENCODEX_USAGE_ROW_CACHE = OpenCodexUsageRowCache(OPENCODEX_USAGE_CACHE_PATH)
 atexit.register(_CODEX_EVENT_ROW_CACHE.flush)
+atexit.register(_OPENCODEX_USAGE_ROW_CACHE.flush)
 
 
 def codex_relevant_rows_from_path(path: Path) -> list[dict[str, Any]]:
@@ -1708,6 +2643,22 @@ def codex_session_header_from_rows(rows: list[dict[str, Any]]) -> tuple[str, str
             str(payload.get("forked_from_id") or "").strip(),
         )
     return "", ""
+
+
+def codex_opencodex_conversation_id_from_rows(rows: list[dict[str, Any]]) -> str:
+    for row in rows:
+        if row.get("type") != "session_meta":
+            continue
+        payload = row.get("payload") or {}
+        source_id = str(
+            payload.get("session_id")
+            or payload.get("parent_thread_id")
+            or payload.get("id")
+            or ""
+        ).strip()
+        if source_id:
+            return hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:32]
+    return ""
 
 
 def codex_fork_replay_cutoff_from_rows(rows: list[dict[str, Any]]) -> datetime | None:
@@ -2161,6 +3112,7 @@ def scan_codex_events(
         current_model = CODEX_DEFAULT_MODEL
         seen: set[tuple[int, int, int, int]] = set()
         rows = codex_relevant_rows_from_path(path)
+        opencodex_conversation_id = codex_opencodex_conversation_id_from_rows(rows)
         session_id, parent_id = headers.get(path) or codex_session_header_from_rows(rows)
         parent_signatures: list[tuple[int, ...]] = []
         if parent_id:
@@ -2346,9 +3298,11 @@ def scan_codex_events(
                         output_tokens,
                         ts,
                         session_id=session_id,
+                        conversation_id=opencodex_conversation_id,
                         request_key=session_id,
                         account_at=active_turn_started_at,
                         quota_fingerprints=quota_fingerprints,
+                        usage_provenance="codex-rollout",
                     )
                     if event is not None:
                         events.append(event)
@@ -2380,9 +3334,11 @@ def scan_codex_events(
                     delta_output,
                     ts,
                     session_id=session_id,
+                    conversation_id=opencodex_conversation_id,
                     request_key=session_id,
                     account_at=active_turn_started_at,
                     quota_fingerprints=quota_fingerprints,
+                    usage_provenance="codex-rollout",
                 )
                 if event is not None:
                     events.append(event)
@@ -2594,6 +3550,7 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
             request_key=response_key or session_id,
             route=detect_codex_route(text),
             pricing_tier=pricing_tier,
+            usage_provenance="codex-logs2",
         )
         if event is None:
             continue
@@ -2603,26 +3560,150 @@ def scan_codex_logs2_events(home: Path, start: datetime, end: datetime) -> list[
     return events
 
 
+def usage_event_strong_identity_keys(event: UsageEvent) -> set[str]:
+    return {
+        str(value or "").strip().casefold()
+        for value in (
+            event.canonical_id,
+            event.request_key,
+            event.source_request_key,
+        )
+        if str(value or "").strip()
+    }
+
+
+def usage_event_physical_identity_keys(event: UsageEvent) -> set[str]:
+    identities = {
+        str(value or "").strip().casefold()
+        for value in (event.canonical_id, event.source_request_key)
+        if str(value or "").strip()
+    }
+    request_key = str(event.request_key or "").strip().casefold()
+    session_key = str(event.session_id or "").strip().casefold()
+    conversation_key = str(event.conversation_id or "").strip().casefold()
+    if request_key and request_key not in {session_key, conversation_key}:
+        identities.add(request_key)
+    return identities
+
+
+def usage_event_weak_identity_keys(event: UsageEvent) -> set[str]:
+    identities = {
+        str(value or "").strip().casefold()
+        for value in (event.conversation_id, event.session_id)
+        if str(value or "").strip()
+    }
+    session_id = str(event.session_id or "").strip()
+    if session_id:
+        identities.add(hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32])
+    return identities
+
+
+def usage_events_share_identity(first: UsageEvent, second: UsageEvent) -> bool:
+    first_strong = usage_event_strong_identity_keys(first)
+    second_strong = usage_event_strong_identity_keys(second)
+    if first_strong and second_strong:
+        return bool(first_strong.intersection(second_strong))
+    return bool(
+        usage_event_weak_identity_keys(first).intersection(
+            usage_event_weak_identity_keys(second)
+        )
+    )
+
+
+def usage_events_are_cross_source_aliases(first: UsageEvent, second: UsageEvent) -> bool:
+    """Bridge a rollout/logs_2 copy without collapsing real keyed concurrency."""
+    if opencodex_event_signature(first) != opencodex_event_signature(second):
+        return False
+    if abs((first.when - second.when).total_seconds()) > 1.0:
+        return False
+    provenances = {
+        str(first.usage_provenance or "").strip().casefold(),
+        str(second.usage_provenance or "").strip().casefold(),
+    }
+    if provenances != {"codex-rollout", "codex-logs2"}:
+        return False
+    first_weak = usage_event_weak_identity_keys(first)
+    second_weak = usage_event_weak_identity_keys(second)
+    if not first_weak.intersection(second_weak):
+        return False
+    first_strong = usage_event_strong_identity_keys(first)
+    second_strong = usage_event_strong_identity_keys(second)
+    if first_strong.intersection(second_strong):
+        return True
+    first_key = str(first.request_key or "").strip()
+    second_key = str(second.request_key or "").strip()
+    first_session = str(first.session_id or "").strip()
+    second_session = str(second.session_id or "").strip()
+    # Rollout token_count rows usually carry only the session identity while
+    # logs_2 carries the response/request id. Two distinct non-session request
+    # ids remain separate concurrent requests.
+    return bool(
+        (first_key and first_key == first_session and second_key != second_session)
+        or (second_key and second_key == second_session and first_key != first_session)
+    )
+
+
 def dedupe_usage_events(events: list[UsageEvent]) -> list[UsageEvent]:
-    seen: dict[tuple[int, str, int, int, int], int] = {}
+    seen: dict[tuple[str, int, int, int], list[int]] = {}
     result: list[UsageEvent] = []
+    cross_source_matched_indexes: set[int] = set()
     for event in sorted(events, key=lambda item: item.when):
+        event_second = int(event.when.replace(tzinfo=LOCAL_TZ).timestamp())
         key = (
-            int(event.when.replace(tzinfo=LOCAL_TZ).timestamp()),
             event.model,
             event.input_tokens,
             event.cached_tokens,
             event.output_tokens,
         )
-        if key in seen:
-            existing_idx = seen[key]
+        candidate_indexes = seen.get(key, [])
+        alias_indexes = [
+            existing_idx
+            for existing_idx in candidate_indexes
+            if existing_idx not in cross_source_matched_indexes
+            and usage_events_are_cross_source_aliases(event, result[existing_idx])
+        ]
+        identity_indexes = [
+            existing_idx
+            for existing_idx in candidate_indexes
+            if (
+                int(
+                    result[existing_idx].when.replace(tzinfo=LOCAL_TZ).timestamp()
+                )
+                == event_second
+                and (
+                    bool(
+                        usage_event_physical_identity_keys(event).intersection(
+                            usage_event_physical_identity_keys(result[existing_idx])
+                        )
+                    )
+                    or (
+                        event.when == result[existing_idx].when
+                        and usage_events_share_identity(event, result[existing_idx])
+                    )
+                )
+            )
+        ]
+        duplicate_indexes = alias_indexes or identity_indexes
+        if duplicate_indexes:
+            existing_idx = max(
+                duplicate_indexes,
+                key=lambda index: usage_event_info_score(result[index]),
+            )
             existing = result[existing_idx]
             existing_score = usage_event_info_score(existing)
             event_score = usage_event_info_score(event)
-            if event_score > existing_score:
+            provenances = {
+                str(existing.usage_provenance or "").strip().casefold(),
+                str(event.usage_provenance or "").strip().casefold(),
+            }
+            if provenances == {"codex-rollout", "codex-logs2"}:
+                cross_source_matched_indexes.add(existing_idx)
+                if str(event.usage_provenance or "").strip().casefold() == "codex-logs2":
+                    result[existing_idx] = event
+            elif event_score > existing_score:
                 result[existing_idx] = event
             continue
-        seen[key] = len(result)
+        seen.setdefault(key, []).append(len(result))
         result.append(event)
     return result
 
@@ -2707,6 +3788,8 @@ def usage_event_info_score(event: UsageEvent) -> int:
         score += 8
     if event.session_id:
         score += 4
+    if event.conversation_id:
+        score += 2
     if event.request_key:
         score += 2
     if event.cost_multiplier is not None:
@@ -2718,6 +3801,16 @@ def usage_event_info_score(event: UsageEvent) -> int:
     return score
 
 
+_LAST_OPENCODEX_RECONCILIATION_DIAGNOSTICS: dict[str, dict[str, int]] = {}
+
+
+def last_opencodex_reconciliation_diagnostics() -> dict[str, dict[str, int]]:
+    return {
+        key: dict(value)
+        for key, value in _LAST_OPENCODEX_RECONCILIATION_DIAGNOSTICS.items()
+    }
+
+
 def scan_all_codex_events(
     home: Path,
     sessions_root: Path,
@@ -2727,17 +3820,106 @@ def scan_all_codex_events(
     *,
     failure_events: list[CodexFailureEvent] | None = None,
 ) -> list[UsageEvent]:
+    global _LAST_OPENCODEX_RECONCILIATION_DIAGNOSTICS
+    reconciliation_padding = timedelta(
+        seconds=OPENCODEX_RECONCILIATION_MATCH_WINDOW_SECONDS
+    )
+    # Local token_count rows are written at or after completion. Scan forward
+    # for retrospective windows, while padding OpenCodex in both directions so
+    # a late local row just after midnight can suppress the prior day's proxy
+    # request without re-reading six hours of unrelated local rollouts.
+    local_scan_start = start
+    local_scan_end = end + reconciliation_padding
+    marker_scan_start = start - reconciliation_padding
+    marker_scan_end = end + reconciliation_padding
+    padded_failures: list[CodexFailureEvent] | None = (
+        [] if failure_events is not None else None
+    )
     events = scan_codex_events(
         sessions_root,
+        local_scan_start,
+        local_scan_end,
+        session_lifecycle=session_lifecycle,
+        failure_events=padded_failures,
+    )
+    events.extend(scan_codex_logs2_events(home, local_scan_start, local_scan_end))
+    route_markers = scan_codex_route_markers(home, local_scan_start, local_scan_end)
+    apply_codex_route_hints(events, route_markers)
+    events = dedupe_usage_events(events)
+    opencodex_markers = scan_opencodex_usage_markers(
+        home,
+        marker_scan_start,
+        marker_scan_end,
+    )
+    reconciled = reconcile_opencodex_usage_events(
+        events,
+        opencodex_markers,
         start,
         end,
-        session_lifecycle=session_lifecycle,
-        failure_events=failure_events,
     )
-    events.extend(scan_codex_logs2_events(home, start, end))
-    route_markers = scan_codex_route_markers(home, start, end)
-    apply_codex_route_hints(events, route_markers)
-    return dedupe_usage_events(events)
+    apply_opencodex_account_hints(
+        home,
+        reconciled.events,
+        start,
+        end,
+        markers=opencodex_markers,
+    )
+    _LAST_OPENCODEX_RECONCILIATION_DIAGNOSTICS = (
+        reconciled.diagnostics.as_dict()
+    )
+    if failure_events is not None and padded_failures is not None:
+        failure_events.extend(
+            failure
+            for failure in padded_failures
+            if start <= failure.when < end
+        )
+    return reconciled.events
+
+
+def local_codex_window_source_available(
+    home: Path,
+    sessions_root: Path,
+    start: datetime,
+    end: datetime,
+) -> bool:
+    """Tell an empty local scan apart from a missing local source.
+
+    A readable recent session JSONL or a readable ``logs_2.sqlite`` row in the
+    requested interval means the local event ledger covered this window even
+    when it produced no eligible usage rows. That explicit zero must not be
+    replaced with an older Cockpit total.
+    """
+    # The exporter always scans this canonical root.  Do not let an arbitrary
+    # test or diagnostics directory containing a JSONL turn into a false
+    # "covered local ledger" signal.
+    try:
+        canonical_sessions_root = (home / ".codex" / "sessions").resolve()
+        if sessions_root.resolve() != canonical_sessions_root:
+            return False
+    except OSError:
+        return False
+    try:
+        if iter_recent_jsonl(sessions_root, start):
+            return True
+    except OSError:
+        pass
+    db_path = home / ".codex" / "logs_2.sqlite"
+    if not db_path.is_file():
+        return False
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        start_epoch = int(start.replace(tzinfo=LOCAL_TZ).timestamp()) - 300
+        end_epoch = int(end.replace(tzinfo=LOCAL_TZ).timestamp()) + 300
+        return connection.execute(
+            "SELECT 1 FROM logs WHERE ts >= ? AND ts < ? LIMIT 1",
+            (start_epoch, end_epoch),
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def bucket_from_codex_events(events: list[UsageEvent]) -> UsageBucket:
@@ -2993,8 +4175,11 @@ def load_account_timeline() -> list[AccountMarker]:
     return markers
 
 
-def record_current_account_snapshot(home: Path, now: datetime) -> None:
-    label, _source_path, changed_at = current_codex_account_snapshot(home)
+def record_account_timeline_snapshot(
+    label: str,
+    changed_at: datetime | None,
+    now: datetime,
+) -> None:
     if not label or label == "Codex local":
         return
     markers = load_account_timeline()
@@ -3023,6 +4208,974 @@ def record_current_account_snapshot(home: Path, now: datetime) -> None:
             ],
         },
     )
+
+
+def record_current_account_snapshot(home: Path, now: datetime) -> None:
+    label, _source_path, changed_at = current_codex_account_snapshot(home)
+    record_account_timeline_snapshot(label, changed_at, now)
+
+
+def opencodex_root(home: Path) -> Path:
+    configured = os.environ.get("CLIENT_USAGE_OPENCODEX_DIR", "").strip()
+    return Path(configured).expanduser() if configured else home / ".opencodex"
+
+
+def opencodex_source_instance(home: Path) -> str:
+    try:
+        source = os.path.normcase(str(opencodex_root(home).resolve(strict=False)))
+    except OSError:
+        source = os.path.normcase(str(opencodex_root(home)))
+    return hashlib.sha256(source.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def opencodex_current_account_snapshot(home: Path) -> OpenCodexAccountSnapshot | None:
+    # OpenCodex's "main" route executes with the credential installed in
+    # ~/.codex/auth.json.  ~/.opencodex/auth.json describes OpenCodex-managed
+    # accounts and is not evidence of which credential completed the request.
+    path = home / ".codex" / "auth.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    identity = codex_auth_identity(data)
+    changed_at = file_mtime_local(path)
+    if not identity or changed_at is None:
+        return None
+    label = f"Codex local - {identity}"
+    if is_api_service_mirror_label(label):
+        return None
+    return OpenCodexAccountSnapshot(
+        when=changed_at,
+        label=label,
+    )
+
+
+def load_opencodex_account_timeline(
+    path: Path | None = None,
+) -> list[OpenCodexAccountSnapshot]:
+    timeline_path = path or OPENCODEX_ACCOUNT_TIMELINE_PATH
+    data = load_json_object(timeline_path)
+    records = data.get("records")
+    if not isinstance(records, list):
+        return []
+    snapshots: list[OpenCodexAccountSnapshot] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        when = parse_dt(item.get("at"))
+        label = usable_cockpit_account_label(item.get("label"))
+        if when is None or not label or is_api_service_mirror_label(label):
+            continue
+        snapshots.append(
+            OpenCodexAccountSnapshot(
+                when=when,
+                label=label,
+                plan_type=str(item.get("plan_type") or "").strip().lower(),
+            )
+        )
+    snapshots.sort(key=lambda item: item.when)
+    compact: list[OpenCodexAccountSnapshot] = []
+    for snapshot in snapshots:
+        if compact and compact[-1].label == snapshot.label:
+            continue
+        compact.append(snapshot)
+    return compact
+
+
+def record_current_opencodex_account_snapshot(home: Path, now: datetime) -> None:
+    record_opencodex_log_label_accounts(home, now)
+    current = opencodex_current_account_snapshot(home)
+    if current is not None:
+        record_account_timeline_snapshot(current.label, current.when, now)
+
+
+def opencodex_account_snapshots(
+    home: Path,
+    now: datetime,
+) -> list[OpenCodexAccountSnapshot]:
+    snapshots = [
+        OpenCodexAccountSnapshot(when=marker.when, label=marker.label)
+        for marker in load_account_timeline()
+        if marker.label
+        and marker.label != "Codex local"
+        and not is_api_service_mirror_label(marker.label)
+    ]
+    current = opencodex_current_account_snapshot(home)
+    if current is not None:
+        current_when = min(current.when, now + timedelta(minutes=5))
+        if not snapshots or snapshots[-1].label != current.label:
+            snapshots.append(replace(current, when=current_when))
+    snapshots.sort(key=lambda item: item.when)
+    return snapshots
+
+
+def opencodex_account_label_at(
+    when: datetime,
+    snapshots: list[OpenCodexAccountSnapshot],
+) -> str:
+    if not snapshots:
+        return ""
+    times = [item.when for item in snapshots]
+    position = bisect_right(times, when) - 1
+    return snapshots[position].label if position >= 0 else ""
+
+
+def discover_opencodex_log_label_accounts(
+    home: Path,
+) -> dict[str, tuple[str, str]]:
+    root = opencodex_root(home)
+    try:
+        paths = sorted(
+            root.glob("config.json*"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        paths = []
+    candidates: dict[str, dict[str, tuple[int, str]]] = {}
+    for path in paths:
+        try:
+            modified_ns = path.stat().st_mtime_ns
+            data = json.loads(path.read_text(encoding="utf-8-sig", errors="ignore"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        accounts = data.get("codexAccounts") if isinstance(data, dict) else None
+        if not isinstance(accounts, list):
+            continue
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            log_label = str(account.get("logLabel") or "").strip().casefold()
+            email = str(account.get("email") or "").strip()
+            if not log_label or log_label == "main" or not usable_cockpit_identity(email):
+                continue
+            label = cockpit_account_label("", email, "")
+            plan_type = str(
+                account.get("planType") or account.get("plan") or ""
+            ).strip().lower()
+            by_account = candidates.setdefault(log_label, {})
+            previous = by_account.get(label)
+            if previous is None or modified_ns > previous[0]:
+                by_account[label] = (modified_ns, plan_type)
+    result: dict[str, tuple[str, str]] = {}
+    for log_label, by_account in candidates.items():
+        if len(by_account) != 1:
+            continue
+        label, (_modified_ns, plan_type) = next(iter(by_account.items()))
+        result[log_label] = (label, plan_type)
+    return result
+
+
+def load_opencodex_persisted_log_label_accounts(
+    path: Path | None = None,
+) -> dict[str, tuple[str, str]]:
+    data = load_json_object(path or OPENCODEX_ACCOUNT_MAP_PATH)
+    accounts = data.get("accounts")
+    if not isinstance(accounts, dict):
+        return {}
+    result: dict[str, tuple[str, str]] = {}
+    for raw_log_label, item in accounts.items():
+        log_label = str(raw_log_label or "").strip().casefold()
+        if not re.fullmatch(r"p[0-9a-f]{6}", log_label) or not isinstance(item, dict):
+            continue
+        label = usable_cockpit_account_label(item.get("label"))
+        if not label or is_api_service_mirror_label(label):
+            continue
+        result[log_label] = (
+            label,
+            str(item.get("plan_type") or "").strip().lower(),
+        )
+    return result
+
+
+def opencodex_log_label_accounts(home: Path) -> dict[str, tuple[str, str]]:
+    discovered = discover_opencodex_log_label_accounts(home)
+    try:
+        use_persisted = (
+            home.resolve() == Path.home().resolve()
+            or bool(os.environ.get("CLIENT_USAGE_OPENCODEX_ACCOUNT_MAP"))
+        )
+    except OSError:
+        use_persisted = False
+    if not use_persisted:
+        return discovered
+    persisted = load_opencodex_persisted_log_label_accounts()
+    for log_label, account in persisted.items():
+        current = discovered.get(log_label)
+        if current is None:
+            discovered[log_label] = account
+        elif current[0] != account[0]:
+            discovered.pop(log_label, None)
+    return discovered
+
+
+def record_opencodex_log_label_accounts(home: Path, now: datetime) -> None:
+    try:
+        is_real_home = (
+            home.resolve() == Path.home().resolve()
+            or bool(os.environ.get("CLIENT_USAGE_OPENCODEX_ACCOUNT_MAP"))
+        )
+    except OSError:
+        is_real_home = False
+    if not is_real_home:
+        return
+    discovered = discover_opencodex_log_label_accounts(home)
+    if not discovered:
+        return
+    path = OPENCODEX_ACCOUNT_MAP_PATH
+    try:
+        with attribution_ledger_write_lock(path):
+            persisted = load_opencodex_persisted_log_label_accounts(path)
+            for log_label, account in discovered.items():
+                previous = persisted.get(log_label)
+                if previous is not None and previous[0] != account[0]:
+                    persisted.pop(log_label, None)
+                    continue
+                persisted[log_label] = account
+            write_json_atomic(
+                path,
+                {
+                    "schema": 1,
+                    "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+                    "accounts": {
+                        log_label: {
+                            "label": account[0],
+                            "plan_type": account[1],
+                        }
+                        for log_label, account in sorted(persisted.items())
+                    },
+                },
+            )
+    except (OSError, TimeoutError) as exc:
+        logger.warning("OpenCodex account map save deferred: %s", exc)
+
+
+def opencodex_anonymous_account_label(account_log_label: str) -> str:
+    normalized = str(account_log_label or "").strip().casefold()
+    if not re.fullmatch(r"p[0-9a-f]{6}", normalized):
+        return ""
+    return f"Codex local - OpenCodex-{normalized}"
+
+
+def opencodex_usage_rows(home: Path) -> list[dict[str, Any]]:
+    path = opencodex_root(home) / "usage.jsonl"
+    if not path.exists():
+        return []
+    try:
+        real_home = home.resolve() == Path.home().resolve()
+    except OSError:
+        real_home = False
+    if real_home or os.environ.get("CLIENT_USAGE_OPENCODEX_DIR"):
+        return _OPENCODEX_USAGE_ROW_CACHE.rows_for_path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    rows, _processed = OpenCodexUsageRowCache._read_complete_rows(path, 0, size)
+    return rows
+
+
+def scan_opencodex_usage_markers(
+    home: Path,
+    start: datetime,
+    end: datetime,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+    snapshots: list[OpenCodexAccountSnapshot] | None = None,
+    log_label_accounts: dict[str, tuple[str, str]] | None = None,
+) -> list[OpenCodexUsageMarker]:
+    source_rows = opencodex_usage_rows(home) if rows is None else rows
+    account_snapshots = (
+        opencodex_account_snapshots(home, end) if snapshots is None else snapshots
+    )
+    named_accounts = (
+        opencodex_log_label_accounts(home)
+        if log_label_accounts is None
+        else log_label_accounts
+    )
+    source_instance = opencodex_source_instance(home)
+    lower = start - timedelta(seconds=OPENCODEX_ACCOUNT_MATCH_WINDOW_SECONDS)
+    upper = end + timedelta(seconds=OPENCODEX_ACCOUNT_MATCH_WINDOW_SECONDS)
+    markers: list[OpenCodexUsageMarker] = []
+    seen_requests: set[tuple[Any, ...]] = set()
+    for row in source_rows:
+        request_at = ms_to_local_datetime(row.get("timestamp"))
+        if request_at is None:
+            continue
+        try:
+            duration_ms = max(0, min(86_400_000, int(row.get("duration_ms") or 0)))
+            input_tokens = max(0, int(row.get("input_tokens") or 0))
+            cached_tokens = max(0, int(row.get("cached_tokens") or 0))
+            output_tokens = max(0, int(row.get("output_tokens") or 0))
+            total_tokens = max(0, int(row.get("total_tokens") or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        when = request_at + timedelta(milliseconds=duration_ms)
+        if when < lower or when > upper or total_tokens <= 0:
+            continue
+        account_log_label = str(row.get("account_log_label") or "").strip()
+        normalized_log_label = account_log_label.casefold()
+        if normalized_log_label == "main":
+            label = opencodex_account_label_at(request_at, account_snapshots)
+        else:
+            label = named_accounts.get(normalized_log_label, ("", ""))[0]
+            if not label:
+                label = opencodex_anonymous_account_label(normalized_log_label)
+        request_id = str(row.get("request_id") or "").strip()
+        try:
+            attempt_ordinal = max(0, int(row.get("attempt_ordinal") or 0))
+        except (TypeError, ValueError, OverflowError):
+            attempt_ordinal = 0
+        try:
+            status = int(row.get("status") or 0)
+        except (TypeError, ValueError, OverflowError):
+            status = 0
+        response_service_tier = str(row.get("response_service_tier") or "").strip()
+        pricing_tier = normalize_pricing_tier(
+            row.get("pricing_tier") or response_service_tier
+        )
+        app_speed = codex_service_tier_to_speed(response_service_tier)
+        dedupe_key: tuple[Any, ...]
+        if request_id:
+            dedupe_key = ("request", request_id, attempt_ordinal)
+        else:
+            dedupe_key = (
+                "usage",
+                local_epoch_ms(request_at),
+                str(row.get("model") or "").casefold(),
+                input_tokens,
+                cached_tokens,
+                output_tokens,
+                account_log_label.casefold(),
+            )
+        if dedupe_key in seen_requests:
+            continue
+        seen_requests.add(dedupe_key)
+        markers.append(
+            OpenCodexUsageMarker(
+                request_at=request_at,
+                when=when,
+                model=str(row.get("model") or "").strip(),
+                input_tokens=input_tokens,
+                cached_tokens=cached_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                label=label,
+                account_log_label=account_log_label,
+                request_id=request_id,
+                conversation_id=str(row.get("conversation_id") or "").strip(),
+                attempt_ordinal=attempt_ordinal,
+                provider=str(row.get("provider") or "").strip().lower(),
+                requested_model=str(row.get("requested_model") or "").strip(),
+                resolved_model=str(
+                    row.get("resolved_model") or row.get("model") or ""
+                ).strip(),
+                response_service_tier=response_service_tier,
+                requested_service_tier=str(
+                    row.get("requested_service_tier") or ""
+                ).strip(),
+                requested_speed_label=str(
+                    row.get("requested_speed_label") or ""
+                ).strip(),
+                pricing_tier=pricing_tier,
+                pricing_model=str(
+                    row.get("pricing_model")
+                    or row.get("resolved_model")
+                    or row.get("model")
+                    or ""
+                ).strip(),
+                app_speed=app_speed,
+                admission_kind=str(row.get("admission_kind") or "").strip(),
+                inbound_protocol=str(row.get("inbound_protocol") or "").strip(),
+                usage_status=str(row.get("usage_status") or "").strip(),
+                status=status,
+                route_kind=str(row.get("route_kind") or "").strip(),
+                source_instance=source_instance,
+                provenance=str(
+                    row.get("provenance") or OPENCODEX_USAGE_PROVENANCE
+                ).strip(),
+            )
+        )
+    return markers
+
+
+def opencodex_model_key(value: Any) -> str:
+    model = str(value or "").strip().casefold()
+    return model.removeprefix("openai/")
+
+
+def opencodex_event_signature(event: UsageEvent) -> tuple[str, int, int, int, int]:
+    return (
+        opencodex_model_key(event.model),
+        max(0, event.input_tokens),
+        max(0, event.cached_tokens),
+        max(0, event.output_tokens),
+        event.total_tokens,
+    )
+
+
+def opencodex_marker_signature(
+    marker: OpenCodexUsageMarker,
+) -> tuple[str, int, int, int, int]:
+    return (
+        opencodex_model_key(marker.model),
+        marker.input_tokens,
+        marker.cached_tokens,
+        marker.output_tokens,
+        marker.total_tokens,
+    )
+
+
+def opencodex_conversation_id_for_event(event: UsageEvent) -> str:
+    explicit = str(event.conversation_id or "").strip().casefold()
+    if explicit:
+        return explicit
+    session_id = str(event.session_id or "").strip()
+    if not session_id:
+        return ""
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+
+
+def opencodex_marker_request_key(marker: OpenCodexUsageMarker) -> str:
+    instance = str(marker.source_instance or "default").strip().casefold() or "default"
+    request_id = str(marker.request_id or "").strip()
+    if request_id:
+        return f"opencodex:{instance}:{request_id}:{max(0, marker.attempt_ordinal)}"
+    parts = (
+        str(local_epoch_ms(marker.request_at)),
+        str(local_epoch_ms(marker.when)),
+        marker.conversation_id.strip().casefold(),
+        *[str(value) for value in opencodex_marker_signature(marker)],
+        marker.account_log_label.strip().casefold(),
+    )
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
+    return f"opencodex:{instance}:usage:{digest}"
+
+
+def opencodex_marker_route_evidence(marker: OpenCodexUsageMarker) -> bool:
+    return bool(
+        marker.request_id
+        or marker.account_log_label
+        or marker.route_kind
+        or marker.provider.startswith("openai")
+    )
+
+
+def opencodex_proxy_rejection_reason(marker: OpenCodexUsageMarker) -> str:
+    protocol = marker.inbound_protocol.strip().casefold()
+    if protocol and protocol != "responses":
+        return "unsupported_inbound_protocol"
+    conversation_id = marker.conversation_id.strip()
+    route_kind = marker.route_kind.strip().casefold()
+    admission_kind = marker.admission_kind.strip().casefold()
+    if not conversation_id and (
+        "probe" in admission_kind
+        or route_kind in {"model-probe", "models", "probe", "health-check"}
+    ):
+        return "conversationless_probe"
+    return ""
+
+
+def opencodex_canonical_usage_event(
+    marker: OpenCodexUsageMarker,
+    local_event: UsageEvent | None = None,
+    *,
+    status: str,
+) -> UsageEvent:
+    canonical_key = opencodex_marker_request_key(marker)
+    model = marker.resolved_model or marker.model
+    pricing_tier = marker.pricing_tier or normalize_pricing_tier(
+        marker.response_service_tier
+    )
+    app_speed = marker.app_speed or codex_service_tier_to_speed(
+        marker.response_service_tier
+    )
+    account_label = marker.label or API_SERVICE_AGGREGATE_LABEL
+    account_source = (
+        OPENCODEX_ACCOUNT_HINT_SOURCE
+        if marker.label
+        else OPENCODEX_UNRESOLVED_HINT_SOURCE
+    )
+    if local_event is None:
+        conversation_id = marker.conversation_id.strip().casefold()
+        return UsageEvent(
+            when=marker.when,
+            model=codex_model_name(model),
+            input_tokens=max(0, marker.input_tokens),
+            cached_tokens=max(0, marker.cached_tokens),
+            output_tokens=max(0, marker.output_tokens),
+            app_speed=normalize_codex_speed(app_speed),
+            cost_multiplier=codex_speed_cost_multiplier(app_speed),
+            pricing_tier=pricing_tier,
+            session_id=f"opencodex:{conversation_id}" if conversation_id else "",
+            conversation_id=conversation_id,
+            request_key=canonical_key,
+            route="opencodex",
+            request_at=marker.request_at,
+            account_at=marker.request_at,
+            account_label_hint=account_label,
+            account_hint_source=account_source,
+            pricing_model=marker.pricing_model or model,
+            usage_provenance=marker.provenance or OPENCODEX_USAGE_PROVENANCE,
+            reconciliation_status=status,
+            canonical_id=canonical_key,
+        )
+
+    superseded_event_id = live_usage_event_id(local_event)
+    event = replace(local_event)
+    event.when = marker.when
+    event.model = codex_model_name(model)
+    event.input_tokens = max(0, marker.input_tokens)
+    event.cached_tokens = max(0, marker.cached_tokens)
+    event.output_tokens = max(0, marker.output_tokens)
+    event.app_speed = normalize_codex_speed(app_speed)
+    event.cost_multiplier = codex_speed_cost_multiplier(app_speed)
+    event.pricing_tier = pricing_tier
+    event.source_request_key = local_event.source_request_key or local_event.request_key
+    event.request_key = canonical_key
+    event.route = local_event.route or "opencodex"
+    event.request_at = marker.request_at
+    if not event.conversation_id:
+        event.conversation_id = marker.conversation_id.strip().casefold()
+    event.account_label_hint = account_label
+    event.account_hint_source = account_source
+    event.pricing_model = marker.pricing_model or model
+    event.usage_provenance = marker.provenance or OPENCODEX_USAGE_PROVENANCE
+    event.reconciliation_status = status
+    event.canonical_id = canonical_key
+    event.supersedes_event_ids = tuple(
+        dict.fromkeys(
+            (
+                *local_event.supersedes_event_ids,
+                *(
+                    (superseded_event_id,)
+                    if superseded_event_id and superseded_event_id != canonical_key
+                    else ()
+                ),
+            )
+        )
+    )
+    return event
+
+
+def _opencodex_pair_candidates(
+    local_events: list[UsageEvent],
+    markers: list[OpenCodexUsageMarker],
+    local_indexes: set[int],
+    marker_indexes: set[int],
+    max_seconds: float,
+    *,
+    require_conversation: bool,
+) -> tuple[list[tuple[float, datetime, int, int]], set[int], set[int]]:
+    pairs: list[tuple[float, datetime, int, int]] = []
+    by_local: dict[int, list[tuple[float, int]]] = {}
+    by_marker: dict[int, list[tuple[float, int]]] = {}
+    local_by_signature: dict[tuple[str, int, int, int, int], list[int]] = {}
+    for local_index in local_indexes:
+        event = local_events[local_index]
+        if external_codex_provider_label(event.model) or event.route == "official":
+            continue
+        local_by_signature.setdefault(opencodex_event_signature(event), []).append(
+            local_index
+        )
+    for marker_index in marker_indexes:
+        marker = markers[marker_index]
+        for local_index in local_by_signature.get(
+            opencodex_marker_signature(marker), []
+        ):
+            event = local_events[local_index]
+            event_conversation = opencodex_conversation_id_for_event(event)
+            marker_conversation = marker.conversation_id.strip().casefold()
+            if require_conversation:
+                if not event_conversation or event_conversation != marker_conversation:
+                    continue
+            else:
+                if event_conversation and marker_conversation:
+                    continue
+                if event.route == "official" or not opencodex_marker_route_evidence(marker):
+                    continue
+            completion_delay = (event.when - marker.when).total_seconds()
+            allowed_marker_lag = min(
+                OPENCODEX_RECONCILIATION_CLOCK_SKEW_SECONDS,
+                max_seconds,
+            )
+            if completion_delay < -allowed_marker_lag or completion_delay > max_seconds:
+                continue
+            distance = abs(completion_delay)
+            pairs.append((distance, event.when, local_index, marker_index))
+            by_local.setdefault(local_index, []).append((distance, marker_index))
+            by_marker.setdefault(marker_index, []).append((distance, local_index))
+
+    ambiguous_local: set[int] = set()
+    ambiguous_marker: set[int] = set()
+    for local_index, candidates in by_local.items():
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        if (
+            len(candidates) > 1
+            and abs(candidates[1][0] - candidates[0][0])
+            <= OPENCODEX_ACCOUNT_MATCH_AMBIGUITY_SECONDS
+        ):
+            ambiguous_local.add(local_index)
+    for marker_index, candidates in by_marker.items():
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        if (
+            len(candidates) > 1
+            and abs(candidates[1][0] - candidates[0][0])
+            <= OPENCODEX_ACCOUNT_MATCH_AMBIGUITY_SECONDS
+        ):
+            ambiguous_marker.add(marker_index)
+    return pairs, ambiguous_local, ambiguous_marker
+
+
+def reconcile_opencodex_usage_events(
+    local_events: list[UsageEvent],
+    markers: list[OpenCodexUsageMarker],
+    start: datetime,
+    end: datetime,
+) -> OpenCodexReconciliationResult:
+    diagnostics = OpenCodexReconciliationDiagnostics()
+    if not markers:
+        events = [event for event in local_events if start <= event.when < end]
+        for event in events:
+            event.reconciliation_status = event.reconciliation_status or "local_only"
+            diagnostics.add("local_only", event.total_tokens)
+        return OpenCodexReconciliationResult(events=events, diagnostics=diagnostics)
+
+    unique_markers: list[OpenCodexUsageMarker] = []
+    marker_position_by_key: dict[str, int] = {}
+    conflict_keys: set[str] = set()
+    for marker in sorted(markers, key=lambda item: (item.when, item.request_at)):
+        canonical_key = opencodex_marker_request_key(marker)
+        previous_position = marker_position_by_key.get(canonical_key)
+        if previous_position is None:
+            marker_position_by_key[canonical_key] = len(unique_markers)
+            unique_markers.append(marker)
+            continue
+        previous = unique_markers[previous_position]
+        if opencodex_marker_signature(previous) != opencodex_marker_signature(marker):
+            conflict_keys.add(canonical_key)
+        if (marker.when, marker.request_at) >= (previous.when, previous.request_at):
+            unique_markers[previous_position] = marker
+    markers = unique_markers
+
+    available_local = {
+        index
+        for index, event in enumerate(local_events)
+        if not external_codex_provider_label(event.model)
+    }
+    available_markers = set(range(len(markers)))
+    matched_pairs: list[tuple[int, int, str]] = []
+
+    local_by_request: dict[str, list[int]] = {}
+    for local_index in available_local:
+        event = local_events[local_index]
+        for value in (event.request_key, event.source_request_key):
+            request_key = str(value or "").strip().casefold()
+            if request_key:
+                local_by_request.setdefault(request_key, []).append(local_index)
+    for marker_index, marker in enumerate(markers):
+        request_id = marker.request_id.strip().casefold()
+        if not request_id:
+            continue
+        candidates = [
+            local_index
+            for local_index in local_by_request.get(request_id, [])
+            if local_index in available_local
+            and local_events[local_index].route != "official"
+            and -OPENCODEX_RECONCILIATION_CLOCK_SKEW_SECONDS
+            <= (local_events[local_index].when - marker.when).total_seconds()
+            <= OPENCODEX_RECONCILIATION_MATCH_WINDOW_SECONDS
+        ]
+        if not candidates:
+            continue
+        marker_signature = opencodex_marker_signature(marker)
+        candidates.sort(
+            key=lambda local_index: (
+                opencodex_event_signature(local_events[local_index]) != marker_signature,
+                abs((local_events[local_index].when - marker.when).total_seconds()),
+                local_events[local_index].when,
+                local_index,
+            )
+        )
+        local_index = candidates[0]
+        canonical_key = opencodex_marker_request_key(marker)
+        status = (
+            "conflict"
+            if canonical_key in conflict_keys
+            or opencodex_event_signature(local_events[local_index]) != marker_signature
+            else "matched"
+        )
+        matched_pairs.append((local_index, marker_index, status))
+        available_local.remove(local_index)
+        available_markers.remove(marker_index)
+
+    pairs, ambiguous_local, ambiguous_marker = _opencodex_pair_candidates(
+        local_events,
+        markers,
+        available_local,
+        available_markers,
+        OPENCODEX_RECONCILIATION_MATCH_WINDOW_SECONDS,
+        require_conversation=True,
+    )
+    for _distance, _when, local_index, marker_index in sorted(pairs):
+        if local_index not in available_local or marker_index not in available_markers:
+            continue
+        canonical_key = opencodex_marker_request_key(markers[marker_index])
+        if canonical_key in conflict_keys:
+            status = "conflict"
+        elif local_index in ambiguous_local or marker_index in ambiguous_marker:
+            status = "ambiguous"
+        else:
+            status = "matched"
+        matched_pairs.append((local_index, marker_index, status))
+        available_local.remove(local_index)
+        available_markers.remove(marker_index)
+
+    fallback_pairs, _ambiguous_local, _ambiguous_marker = _opencodex_pair_candidates(
+        local_events,
+        markers,
+        available_local,
+        available_markers,
+        OPENCODEX_CROSS_SESSION_MATCH_WINDOW_SECONDS,
+        require_conversation=False,
+    )
+    fallback_by_local: dict[int, list[int]] = {}
+    fallback_by_marker: dict[int, list[int]] = {}
+    for _distance, _when, local_index, marker_index in fallback_pairs:
+        fallback_by_local.setdefault(local_index, []).append(marker_index)
+        fallback_by_marker.setdefault(marker_index, []).append(local_index)
+    for _distance, _when, local_index, marker_index in sorted(fallback_pairs):
+        if local_index not in available_local or marker_index not in available_markers:
+            continue
+        if len(fallback_by_local.get(local_index, [])) != 1:
+            continue
+        if len(fallback_by_marker.get(marker_index, [])) != 1:
+            continue
+        canonical_key = opencodex_marker_request_key(markers[marker_index])
+        status = "conflict" if canonical_key in conflict_keys else "matched"
+        matched_pairs.append((local_index, marker_index, status))
+        available_local.remove(local_index)
+        available_markers.remove(marker_index)
+
+    canonical_events: list[UsageEvent] = []
+    for local_index, marker_index, status in matched_pairs:
+        marker = markers[marker_index]
+        event = opencodex_canonical_usage_event(
+            marker,
+            local_events[local_index],
+            status=status,
+        )
+        if start <= event.when < end:
+            canonical_events.append(event)
+            diagnostics.add(status, event.total_tokens)
+    for marker_index in sorted(available_markers):
+        marker = markers[marker_index]
+        if not (start <= marker.when < end):
+            continue
+        if opencodex_proxy_rejection_reason(marker):
+            diagnostics.add("rejected", marker.total_tokens)
+            continue
+        canonical_key = opencodex_marker_request_key(marker)
+        status = "conflict" if canonical_key in conflict_keys else "proxy_only"
+        event = opencodex_canonical_usage_event(marker, status=status)
+        canonical_events.append(event)
+        diagnostics.add(status, event.total_tokens)
+    for local_index in sorted(available_local):
+        event = local_events[local_index]
+        if not (start <= event.when < end):
+            continue
+        event.reconciliation_status = event.reconciliation_status or "local_only"
+        canonical_events.append(event)
+        diagnostics.add("local_only", event.total_tokens)
+
+    external_indexes = {
+        index
+        for index, event in enumerate(local_events)
+        if external_codex_provider_label(event.model)
+    }
+    for local_index in sorted(external_indexes):
+        event = local_events[local_index]
+        if not (start <= event.when < end):
+            continue
+        event.reconciliation_status = event.reconciliation_status or "local_only"
+        canonical_events.append(event)
+        diagnostics.add("local_only", event.total_tokens)
+    canonical_events.sort(key=lambda event: (event.when, event.request_key, event.model))
+    return OpenCodexReconciliationResult(
+        events=canonical_events,
+        diagnostics=diagnostics,
+    )
+
+
+def apply_opencodex_account_hints(
+    home: Path,
+    events: list[UsageEvent],
+    start: datetime,
+    end: datetime,
+    *,
+    markers: list[OpenCodexUsageMarker] | None = None,
+) -> int:
+    if not events:
+        return 0
+    usage_markers = (
+        scan_opencodex_usage_markers(home, start, end)
+        if markers is None
+        else markers
+    )
+    if not usage_markers:
+        return 0
+    events_by_signature: dict[tuple[str, int, int, int, int], list[int]] = {}
+    for index, event in enumerate(events):
+        if external_codex_provider_label(event.model):
+            continue
+        events_by_signature.setdefault(opencodex_event_signature(event), []).append(index)
+    markers_by_signature: dict[tuple[str, int, int, int, int], list[int]] = {}
+    for index, marker in enumerate(usage_markers):
+        markers_by_signature.setdefault(opencodex_marker_signature(marker), []).append(index)
+
+    matched = 0
+    for signature, event_indexes in events_by_signature.items():
+        marker_indexes = markers_by_signature.get(signature)
+        if not marker_indexes:
+            continue
+        candidates_by_event: dict[int, list[tuple[float, int]]] = {}
+        pairs: list[tuple[float, datetime, int, int]] = []
+        for event_index in event_indexes:
+            event = events[event_index]
+            event_conversation_id = opencodex_conversation_id_for_event(event)
+            for marker_index in marker_indexes:
+                marker = usage_markers[marker_index]
+                marker_conversation_id = marker.conversation_id.strip().casefold()
+                if (
+                    marker_conversation_id
+                    and event_conversation_id
+                    and marker_conversation_id != event_conversation_id
+                ):
+                    continue
+                match_window = (
+                    OPENCODEX_ACCOUNT_MATCH_WINDOW_SECONDS
+                    if marker_conversation_id
+                    and marker_conversation_id == event_conversation_id
+                    else OPENCODEX_CROSS_SESSION_MATCH_WINDOW_SECONDS
+                )
+                distance = abs((event.when - marker.when).total_seconds())
+                if distance > match_window:
+                    continue
+                candidates_by_event.setdefault(event_index, []).append(
+                    (distance, marker_index)
+                )
+                pairs.append((distance, event.when, event_index, marker_index))
+        ambiguous_events: set[int] = set()
+        for event_index, candidates in candidates_by_event.items():
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            if len(candidates) < 2:
+                continue
+            first_distance, first_index = candidates[0]
+            second_distance, second_index = candidates[1]
+            first_label = usage_markers[first_index].label
+            second_label = usage_markers[second_index].label
+            if (
+                abs(second_distance - first_distance)
+                <= OPENCODEX_ACCOUNT_MATCH_AMBIGUITY_SECONDS
+                and first_label != second_label
+            ):
+                ambiguous_events.add(event_index)
+        used_events: set[int] = set()
+        used_markers: set[int] = set()
+        for _distance, _when, event_index, marker_index in sorted(pairs):
+            if (
+                event_index in ambiguous_events
+                or event_index in used_events
+                or marker_index in used_markers
+            ):
+                continue
+            event = events[event_index]
+            marker = usage_markers[marker_index]
+            if marker.label:
+                event.account_label_hint = marker.label
+                event.account_hint_source = OPENCODEX_ACCOUNT_HINT_SOURCE
+            else:
+                event.account_label_hint = API_SERVICE_AGGREGATE_LABEL
+                event.account_hint_source = OPENCODEX_UNRESOLVED_HINT_SOURCE
+            used_events.add(event_index)
+            used_markers.add(marker_index)
+            matched += 1
+
+    markers_by_conversation: dict[str, list[OpenCodexUsageMarker]] = {}
+    for marker in usage_markers:
+        conversation_id = marker.conversation_id.strip().casefold()
+        if conversation_id:
+            markers_by_conversation.setdefault(conversation_id, []).append(marker)
+    directly_anchored_turns = {
+        turn_key
+        for event in events
+        if event.account_hint_source in {
+            OPENCODEX_ACCOUNT_HINT_SOURCE,
+            OPENCODEX_UNRESOLVED_HINT_SOURCE,
+        }
+        and (turn_key := api_service_event_turn_key(event))
+    }
+    for event in events:
+        if event.account_hint_source or external_codex_provider_label(event.model):
+            continue
+        if api_service_event_turn_key(event) in directly_anchored_turns:
+            continue
+        conversation_id = opencodex_conversation_id_for_event(event)
+        conversation_markers = markers_by_conversation.get(conversation_id, [])
+        if not conversation_markers:
+            continue
+        turn_start = api_service_event_turn_start(event)
+        route_confirmed = False
+        for marker in conversation_markers:
+            if opencodex_model_key(marker.model) != opencodex_model_key(event.model):
+                continue
+            completion_near = (
+                abs((event.when - marker.when).total_seconds())
+                <= OPENCODEX_CROSS_SESSION_MATCH_WINDOW_SECONDS
+            )
+            turn_near = (
+                turn_start is not None
+                and abs((turn_start - marker.request_at).total_seconds())
+                <= OPENCODEX_TURN_START_MATCH_SECONDS
+            )
+            if completion_near or turn_near:
+                route_confirmed = True
+                break
+        if route_confirmed:
+            event.account_label_hint = API_SERVICE_AGGREGATE_LABEL
+            event.account_hint_source = OPENCODEX_UNRESOLVED_HINT_SOURCE
+
+    anchors_by_turn: dict[str, list[tuple[datetime, str]]] = {}
+    for event in events:
+        if event.account_hint_source not in {
+            OPENCODEX_ACCOUNT_HINT_SOURCE,
+            OPENCODEX_UNRESOLVED_HINT_SOURCE,
+        }:
+            continue
+        turn_key = api_service_event_turn_key(event)
+        if not turn_key:
+            continue
+        label = event.account_label_hint or API_SERVICE_AGGREGATE_LABEL
+        anchors_by_turn.setdefault(turn_key, []).append((event.when, label))
+    for anchors in anchors_by_turn.values():
+        anchors.sort(key=lambda item: item[0])
+    for event in events:
+        if event.account_hint_source in {
+            OPENCODEX_ACCOUNT_HINT_SOURCE,
+            OPENCODEX_UNRESOLVED_HINT_SOURCE,
+        } or external_codex_provider_label(event.model):
+            continue
+        turn_key = api_service_event_turn_key(event)
+        anchors = anchors_by_turn.get(turn_key)
+        if not anchors:
+            continue
+        anchor_times = [item[0] for item in anchors]
+        position = bisect_right(anchor_times, event.when) - 1
+        if position < 0:
+            position = 0
+        event.account_label_hint = anchors[position][1]
+        event.account_hint_source = OPENCODEX_TURN_HINT_SOURCE
+    return matched
 
 
 def account_label_for_event(
@@ -3857,20 +6010,23 @@ def official_quota_window_payload(
             reset_after = 0.0
         if reset_after > 0:
             reset_at = checked_at.timestamp() + reset_after
+    if remaining_percent is None:
+        return None
     window = quota_window_payload(
         remaining_percent,
         reset_at,
         False,
         max(1, round(window_seconds / 60)),
     )
+    if not window.get("resets_at"):
+        return None
     window.update(
         {
             "quota_source": "official-wham",
             "quota_snapshot_at": checked_at.isoformat(timespec="seconds"),
+            "quota_reset_unavailable": False,
         }
     )
-    if window.get("resets_at"):
-        window["quota_reset_unavailable"] = False
     return window
 
 
@@ -3882,7 +6038,7 @@ def official_quota_from_usage_response(
     if not isinstance(payload, dict):
         return None
     rate_limit = payload.get("rate_limit")
-    if not isinstance(rate_limit, dict):
+    if not isinstance(rate_limit, dict) or not rate_limit:
         return None
     checked_at = checked_at or datetime.now(LOCAL_TZ)
     seven_day_seconds = 7 * 24 * 60 * 60
@@ -3895,6 +6051,7 @@ def official_quota_from_usage_response(
     cycle: dict[str, Any] = {"quota_available": False, "quota_stale": False}
     short_window_present = False
     seven_day_present = False
+    cycle_present = False
     for raw_window, fallback_seconds in windows:
         parsed = official_quota_window_payload(raw_window, fallback_seconds, checked_at)
         if parsed is None:
@@ -3911,6 +6068,9 @@ def official_quota_from_usage_response(
             seven_day_present = True
         else:
             cycle = parsed
+            cycle_present = True
+    if not (short_window_present or seven_day_present or cycle_present):
+        return None
     plan_type = str(payload.get("plan_type") or fallback_plan_type or "").strip().lower()
     if plan_type == "plus" and seven_day_present and not short_window_present:
         five_hour = {
@@ -3942,25 +6102,130 @@ def quota_row_needs_official_refresh(quota: Any) -> bool:
     return any(window.get("quota_stale") or not window.get("resets_at") for window in available_windows)
 
 
-def stale_official_quota_snapshot(quota: Any) -> dict[str, dict[str, Any]] | None:
+def quota_window_has_usable_value(window: Any) -> bool:
+    if not isinstance(window, dict):
+        return False
+    return bool(
+        window.get("quota_unlimited")
+        or window.get("quota_available")
+        or window.get("remaining_percent") is not None
+        or window.get("utilization") is not None
+    )
+
+
+def quota_window_is_live(window: Any) -> bool:
+    if not isinstance(window, dict) or window.get("quota_stale"):
+        return False
+    if window.get("quota_unlimited"):
+        return True
+    return bool(window.get("quota_available") and window.get("resets_at"))
+
+
+def quota_window_source_rank(window: Any) -> int:
+    if not isinstance(window, dict):
+        return -1
+    source = str(window.get("quota_source") or "").strip()
+    if source == "official-wham":
+        return 2
+    if source == "sidecar-reserve":
+        return 1
+    return 0
+
+
+def quota_window_snapshot_epoch(window: Any, fallback: float = 0.0) -> float:
+    if not isinstance(window, dict):
+        return fallback
+    parsed = parse_dt(window.get("quota_snapshot_at"))
+    if parsed is None:
+        return fallback
+    return parsed.replace(tzinfo=LOCAL_TZ).timestamp()
+
+
+def prefer_quota_window(
+    current: Any,
+    incoming: Any,
+    current_success: float = 0.0,
+    incoming_success: float = 0.0,
+) -> dict[str, Any]:
+    current_window = current if isinstance(current, dict) else None
+    incoming_window = incoming if isinstance(incoming, dict) else None
+    if current_window is None and incoming_window is None:
+        return {"quota_available": False, "quota_stale": False}
+    if incoming_window is None:
+        return dict(current_window)
+    if current_window is None:
+        return dict(incoming_window)
+
+    current_live = quota_window_is_live(current_window)
+    incoming_live = quota_window_is_live(incoming_window)
+    if current_live and not incoming_live:
+        return dict(current_window)
+    if incoming_live and not current_live:
+        return dict(incoming_window)
+
+    current_usable = quota_window_has_usable_value(current_window)
+    incoming_usable = quota_window_has_usable_value(incoming_window)
+    current_rank = quota_window_source_rank(current_window)
+    incoming_rank = quota_window_source_rank(incoming_window)
+    if incoming_rank != current_rank:
+        if incoming_rank > current_rank and incoming_usable:
+            return dict(incoming_window)
+        if current_rank > incoming_rank and current_usable:
+            return dict(current_window)
+        if incoming_usable:
+            return dict(incoming_window)
+        if current_usable:
+            return dict(current_window)
+
+    current_epoch = quota_window_snapshot_epoch(current_window, current_success)
+    incoming_epoch = quota_window_snapshot_epoch(incoming_window, incoming_success)
+    if incoming_epoch > current_epoch and (incoming_usable or not current_usable):
+        return dict(incoming_window)
+    if current_epoch > incoming_epoch and (current_usable or not incoming_usable):
+        return dict(current_window)
+    if incoming_usable:
+        return dict(incoming_window)
+    if current_usable:
+        return dict(current_window)
+    if incoming_epoch >= current_epoch:
+        return dict(incoming_window)
+    return dict(current_window)
+
+
+def merge_quota_rows(current: Any, incoming: Any) -> dict[str, dict[str, Any]]:
+    current_row = current if isinstance(current, dict) else {}
+    incoming_row = incoming if isinstance(incoming, dict) else {}
+    merged: dict[str, dict[str, Any]] = {}
+    for window_key in ("window_5h", "window_7d", "window_cycle"):
+        merged[window_key] = prefer_quota_window(
+            current_row.get(window_key),
+            incoming_row.get(window_key),
+        )
+    return merged
+
+
+def mark_quota_snapshot_stale(quota: Any) -> dict[str, Any] | None:
     if not isinstance(quota, dict):
         return None
-    stale: dict[str, dict[str, Any]] = {}
-    has_last_known_value = False
+    stale = dict(quota)
     for window_key in ("window_5h", "window_7d", "window_cycle"):
         raw_window = quota.get(window_key)
         if not isinstance(raw_window, dict):
             continue
         window = dict(raw_window)
-        if (
-            window.get("quota_available")
-            or window.get("quota_unlimited")
-            or window.get("remaining_percent") is not None
-            or window.get("utilization") is not None
-        ):
-            has_last_known_value = True
         window["quota_stale"] = True
         stale[window_key] = window
+    return stale
+
+
+def stale_official_quota_snapshot(quota: Any) -> dict[str, dict[str, Any]] | None:
+    stale = mark_quota_snapshot_stale(quota)
+    if stale is None:
+        return None
+    has_last_known_value = any(
+        quota_window_has_usable_value(stale.get(window_key))
+        for window_key in ("window_5h", "window_7d", "window_cycle")
+    )
     return stale if has_last_known_value else None
 
 
@@ -3971,6 +6236,201 @@ def load_official_quota_cache() -> dict[str, Any]:
         return {}
     accounts = data.get("accounts") if isinstance(data, dict) else None
     return accounts if isinstance(accounts, dict) else {}
+
+
+@contextmanager
+def official_quota_cache_lock():
+    # Reuse the process-safe mutex implementation already used by the
+    # attribution ledger.  In particular, lock acquisition failures must
+    # propagate to the writer; writing without the lock would reintroduce the
+    # stale-process cache overwrite this guard is meant to prevent.
+    with attribution_ledger_write_lock(
+        COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
+        timeout_seconds=5.0,
+    ):
+        yield
+
+
+def official_quota_entry_success_epoch(entry: Any) -> float:
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        success = float(entry.get("last_success_at") or 0)
+    except (TypeError, ValueError):
+        success = 0.0
+    if success > 0:
+        return success
+    if entry.get("refresh_failed"):
+        return 0.0
+    try:
+        return float(entry.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def official_quota_entry_checked_epoch(entry: Any) -> float:
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        return float(entry.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def official_quota_row_is_live(quota: Any) -> bool:
+    if not isinstance(quota, dict):
+        return False
+    return any(
+        quota_window_is_live(quota.get(window_key))
+        for window_key in ("window_5h", "window_7d", "window_cycle")
+    )
+
+
+def official_quota_entry_source_rank(entry: Any) -> int:
+    quota = entry.get("quota") if isinstance(entry, dict) else None
+    if not isinstance(quota, dict):
+        return -1
+    return max(
+        quota_window_source_rank(quota.get(window_key))
+        for window_key in ("window_5h", "window_7d", "window_cycle")
+    )
+
+
+def prefer_official_cache_window(
+    disk_window: Any,
+    incoming_window: Any,
+    disk_success: float,
+    incoming_success: float,
+) -> dict[str, Any]:
+    return prefer_quota_window(
+        disk_window,
+        incoming_window,
+        disk_success,
+        incoming_success,
+    )
+
+
+def merge_official_quota_cache_entry(disk_entry: Any, incoming_entry: Any) -> dict[str, Any] | None:
+    if not isinstance(incoming_entry, dict):
+        return dict(disk_entry) if isinstance(disk_entry, dict) else None
+    if not isinstance(disk_entry, dict):
+        return dict(incoming_entry)
+    disk_success = official_quota_entry_success_epoch(disk_entry)
+    incoming_success = official_quota_entry_success_epoch(incoming_entry)
+    disk_quota = disk_entry.get("quota") if isinstance(disk_entry.get("quota"), dict) else {}
+    incoming_quota = incoming_entry.get("quota") if isinstance(incoming_entry.get("quota"), dict) else {}
+    merged_quota: dict[str, dict[str, Any]] = {}
+    for window_key in ("window_5h", "window_7d", "window_cycle"):
+        merged_quota[window_key] = prefer_official_cache_window(
+            disk_quota.get(window_key),
+            incoming_quota.get(window_key),
+            disk_success,
+            incoming_success,
+        )
+    merged = dict(disk_entry)
+    for key, value in incoming_entry.items():
+        if key in {"quota", "refresh_failed", "last_success_at", "checked_at"}:
+            continue
+        if value not in (None, ""):
+            merged[key] = value
+    merged["quota"] = merged_quota
+    disk_live = official_quota_row_is_live(disk_quota)
+    incoming_live = official_quota_row_is_live(incoming_quota)
+    disk_rank = official_quota_entry_source_rank(disk_entry)
+    incoming_rank = official_quota_entry_source_rank(incoming_entry)
+    same_generation_failure = bool(
+        incoming_entry.get("refresh_failed")
+        and not incoming_live
+        and incoming_success > 0
+        and incoming_success == disk_success
+        and incoming_rank >= disk_rank
+    )
+    if same_generation_failure:
+        merged_quota = {}
+        for window_key in ("window_5h", "window_7d", "window_cycle"):
+            incoming_window = incoming_quota.get(window_key)
+            merged_quota[window_key] = (
+                dict(incoming_window)
+                if isinstance(incoming_window, dict)
+                else prefer_official_cache_window(
+                    disk_quota.get(window_key),
+                    incoming_window,
+                    disk_success,
+                    incoming_success,
+                )
+            )
+        merged["quota"] = merged_quota
+        timestamp_source = incoming_entry
+    elif incoming_live and (
+        not disk_live
+        or incoming_rank > disk_rank
+        or (incoming_rank == disk_rank and incoming_success > disk_success)
+    ):
+        timestamp_source = incoming_entry
+    elif disk_live and (
+        not incoming_live
+        or disk_rank > incoming_rank
+        or disk_success > incoming_success
+    ):
+        timestamp_source = disk_entry
+    elif incoming_rank != disk_rank:
+        timestamp_source = incoming_entry if incoming_rank > disk_rank else disk_entry
+    elif incoming_success > disk_success:
+        timestamp_source = incoming_entry
+    elif disk_success > incoming_success:
+        timestamp_source = disk_entry
+    else:
+        timestamp_source = incoming_entry
+    source_success = official_quota_entry_success_epoch(timestamp_source)
+    if source_success > 0:
+        merged["last_success_at"] = source_success
+    else:
+        newest_success = max(disk_success, incoming_success)
+        if newest_success > 0:
+            merged["last_success_at"] = newest_success
+    checked_at = official_quota_entry_checked_epoch(timestamp_source)
+    if checked_at > 0:
+        merged["checked_at"] = checked_at
+    if timestamp_source.get("refresh_failed"):
+        merged["refresh_failed"] = True
+    elif official_quota_row_is_live(merged_quota) and not quota_row_needs_official_refresh(
+        merged_quota
+    ):
+        merged.pop("refresh_failed", None)
+    else:
+        merged.pop("refresh_failed", None)
+    return merged
+
+
+def merge_official_quota_cache_accounts(
+    disk_accounts: dict[str, Any],
+    incoming_accounts: dict[str, Any],
+) -> dict[str, Any]:
+    disk = disk_accounts if isinstance(disk_accounts, dict) else {}
+    incoming = incoming_accounts if isinstance(incoming_accounts, dict) else {}
+    merged: dict[str, Any] = {}
+    for account_id in set(disk) | set(incoming):
+        entry = merge_official_quota_cache_entry(disk.get(account_id), incoming.get(account_id))
+        if isinstance(entry, dict):
+            merged[str(account_id)] = entry
+    return merged
+
+
+def write_official_quota_cache(accounts: dict[str, Any]) -> None:
+    incoming = {
+        str(account_id): dict(entry)
+        for account_id, entry in accounts.items()
+        if isinstance(entry, dict)
+    }
+    try:
+        with official_quota_cache_lock():
+            merged = merge_official_quota_cache_accounts(load_official_quota_cache(), incoming)
+            write_json_atomic(
+                COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
+                {"schema": 2, "accounts": merged},
+            )
+    except OSError:
+        pass
 
 
 def cached_official_quota_by_label(
@@ -4001,7 +6461,7 @@ def persist_quota_snapshots_by_account(
     """Persist every real quota snapshot, including sidecar-derived values."""
     cache = load_official_quota_cache()
     snapshot_epoch = (now or datetime.now(LOCAL_TZ)).timestamp()
-    changed = False
+    dirty: dict[str, Any] = {}
     for account_id, account in accounts.items():
         label = labels_by_id.get(account_id, "")
         quota = quota_by_label.get(label)
@@ -4018,7 +6478,12 @@ def persist_quota_snapshots_by_account(
                 "quota": quota,
             }
         )
-        if not quota_row_needs_official_refresh(quota) and (
+        has_official_window = any(
+            str((quota.get(window_key) or {}).get("quota_source") or "")
+            == "official-wham"
+            for window_key in ("window_5h", "window_7d", "window_cycle")
+        )
+        if not has_official_window and not quota_row_needs_official_refresh(quota) and (
             quota_changed or not entry.get("last_success_at")
         ):
             entry["checked_at"] = snapshot_epoch
@@ -4026,23 +6491,65 @@ def persist_quota_snapshots_by_account(
             entry.pop("refresh_failed", None)
         if entry != previous:
             cache[account_id] = entry
-            changed = True
-    if not changed:
+            dirty[account_id] = entry
+    if not dirty:
         return
+    write_official_quota_cache(dirty)
+
+
+def official_quota_auth_from_payload(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict) or data.get("disabled"):
+        return None
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    access_token = str(data.get("access_token") or tokens.get("access_token") or "").strip()
+    claims = decode_jwt_payload(
+        tokens.get("id_token") or data.get("id_token") or access_token
+    )
+    auth_claims = claims.get("https://api.openai.com/auth")
+    auth_claims = auth_claims if isinstance(auth_claims, dict) else {}
+    account_id = str(
+        data.get("account_id")
+        or tokens.get("account_id")
+        or auth_claims.get("chatgpt_account_id")
+        or claims.get("chatgpt_account_id")
+        or ""
+    ).strip()
+    email = str(
+        data.get("email")
+        or tokens.get("email")
+        or claims.get("email")
+        or claims.get("preferred_username")
+        or ""
+    ).strip().lower()
+    expired = data.get("expired")
+    if isinstance(expired, bool):
+        if expired:
+            return None
+    elif expired not in (None, ""):
+        try:
+            expires_at = float(expired)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        if expires_at > 1 and expires_at <= datetime.now().timestamp():
+            return None
+    access_claims = decode_jwt_payload(access_token)
     try:
-        write_json_atomic(
-            COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
-            {
-                "schema": 2,
-                "accounts": {
-                    account_id: entry
-                    for account_id, entry in cache.items()
-                    if isinstance(entry, dict)
-                },
-            },
-        )
-    except OSError:
-        pass
+        token_exp = float(access_claims.get("exp") or 0)
+    except (TypeError, ValueError):
+        token_exp = 0.0
+    if token_exp > 1 and token_exp <= datetime.now().timestamp():
+        return None
+    if not access_token or not account_id:
+        return None
+    auth = {
+        "access_token": access_token,
+        "account_id": account_id,
+        "email": email,
+    }
+    proxy_url = str(data.get("proxy_url") or "").strip()
+    if proxy_url:
+        auth["proxy_url"] = proxy_url
+    return auth
 
 
 def read_cockpit_sidecar_auth(home: Path, account_id: str) -> dict[str, Any] | None:
@@ -4057,24 +6564,89 @@ def read_cockpit_sidecar_auth(home: Path, account_id: str) -> dict[str, Any] | N
         auth = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(auth, dict) or auth.get("disabled"):
-        return None
-    expired = auth.get("expired")
-    if isinstance(expired, bool):
-        if expired:
-            return None
-    elif expired not in (None, ""):
+    return official_quota_auth_from_payload(auth)
+
+
+def read_codex_home_official_auth(home: Path) -> dict[str, Any] | None:
+    codex_dir = home / ".codex"
+    # Prefer the live Codex login. Cockpit's sidecar metadata file can name the
+    # current account without carrying an access token.
+    for name in ("auth.json", ".cockpit_codex_auth.json"):
+        path = codex_dir / name
         try:
-            expires_at = float(expired)
-        except (TypeError, ValueError):
-            expires_at = 0.0
-        if expires_at > 1 and expires_at <= datetime.now().timestamp():
-            return None
-    if not str(auth.get("access_token") or "").strip():
+            auth = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        parsed = official_quota_auth_from_payload(auth)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def read_official_quota_auth(
+    home: Path,
+    account_id: str,
+    account: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    sidecar = read_cockpit_sidecar_auth(home, account_id)
+    if sidecar is not None:
+        return sidecar
+    current = read_codex_home_official_auth(home)
+    if current is None:
         return None
-    if not str(auth.get("account_id") or "").strip():
-        return None
-    return auth
+    account = account if isinstance(account, dict) else {}
+    email = str(account.get("email") or "").strip().lower()
+    if email and current.get("email") == email:
+        return current
+    return None
+
+
+def normalize_http_proxy_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    mapped: dict[str, str] = {}
+    for segment in raw.split(";"):
+        key, separator, candidate = segment.partition("=")
+        if separator and key.strip().lower() in {"http", "https"}:
+            mapped[key.strip().lower()] = candidate.strip()
+    candidate = mapped.get("https") or mapped.get("http") or raw
+    if ";" in candidate:
+        candidate = candidate.split(";", 1)[0].strip()
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+    parsed = parse.urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    return candidate
+
+
+def windows_user_proxy_url() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled = int(winreg.QueryValueEx(key, "ProxyEnable")[0] or 0)
+            proxy_server = winreg.QueryValueEx(key, "ProxyServer")[0]
+    except (ImportError, OSError, TypeError, ValueError):
+        return ""
+    return normalize_http_proxy_url(proxy_server) if enabled else ""
+
+
+def official_quota_proxy_url(auth: dict[str, Any]) -> str:
+    explicit = normalize_http_proxy_url(auth.get("proxy_url"))
+    if explicit:
+        return explicit
+    configured = request.getproxies()
+    if configured.get("https") or configured.get("http"):
+        # urlopen already honors process-level proxy configuration.
+        return ""
+    return windows_user_proxy_url()
 
 
 def fetch_cockpit_official_quota(
@@ -4096,7 +6668,7 @@ def fetch_cockpit_official_quota(
         },
     )
     try:
-        proxy_url = str(auth.get("proxy_url") or "").strip()
+        proxy_url = official_quota_proxy_url(auth)
         if proxy_url:
             opener = request.build_opener(
                 request.ProxyHandler({"http": proxy_url, "https": proxy_url})
@@ -4121,6 +6693,8 @@ def cockpit_official_quota_by_account(
     home: Path,
     accounts: dict[str, dict[str, Any]],
     now: datetime | None = None,
+    force_refresh_account_ids: set[str] | None = None,
+    active_account_ids: set[str] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     if not COCKPIT_OFFICIAL_QUOTA_ENABLED or not accounts:
         return {}
@@ -4129,7 +6703,9 @@ def cockpit_official_quota_by_account(
     cache = load_official_quota_cache()
     result: dict[str, dict[str, dict[str, Any]]] = {}
     pending: dict[str, tuple[dict[str, Any], str]] = {}
-    cache_changed = False
+    dirty: dict[str, Any] = {}
+    force_refresh_ids = force_refresh_account_ids or set()
+    active_refresh_ids = active_account_ids or set()
     for account_id, account in accounts.items():
         cached = cache.get(account_id)
         label = cockpit_account_label(
@@ -4147,23 +6723,24 @@ def cockpit_official_quota_by_account(
             for key, value in metadata.items():
                 if value and cached.get(key) != value:
                     cached[key] = value
-                    cache_changed = True
+                    dirty[account_id] = cached
         try:
             checked_epoch = float(cached.get("checked_at") or 0) if isinstance(cached, dict) else 0.0
         except (TypeError, ValueError):
             checked_epoch = 0.0
         cache_age = now_epoch - checked_epoch if checked_epoch > 0 else float("inf")
-        cache_seconds = (
-            COCKPIT_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS
-            if isinstance(cached, dict) and cached.get("refresh_failed")
-            else COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS
-        )
-        if 0 <= cache_age < cache_seconds:
+        if isinstance(cached, dict) and cached.get("refresh_failed"):
+            cache_seconds = COCKPIT_OFFICIAL_QUOTA_FAILURE_RETRY_SECONDS
+        elif account_id in active_refresh_ids:
+            cache_seconds = COCKPIT_OFFICIAL_QUOTA_ACTIVE_CACHE_SECONDS
+        else:
+            cache_seconds = COCKPIT_OFFICIAL_QUOTA_CACHE_SECONDS
+        if account_id not in force_refresh_ids and 0 <= cache_age < cache_seconds:
             quota = cached.get("quota") if isinstance(cached, dict) else None
             if isinstance(quota, dict):
                 result[account_id] = quota
             continue
-        auth = read_cockpit_sidecar_auth(home, account_id)
+        auth = read_official_quota_auth(home, account_id, account)
         if auth is not None:
             pending[account_id] = (auth, plan_type)
         else:
@@ -4203,21 +6780,28 @@ def cockpit_official_quota_by_account(
                     "plan_type": str(account.get("plan_type") or ""),
                 }
                 if isinstance(quota, dict):
-                    cache[account_id] = {
+                    cache_entry = {
                         **metadata,
                         "checked_at": now_epoch,
                         "last_success_at": now_epoch,
                         "quota": quota,
                     }
+                    cache[account_id] = cache_entry
+                    dirty[account_id] = cache_entry
                     result[account_id] = quota
                 else:
-                    stale_quota = stale_official_quota_snapshot(previous_quota)
-                    cache_entry: dict[str, Any] = {
-                        **metadata,
-                        "checked_at": now_epoch,
-                        "quota": stale_quota,
-                        "refresh_failed": True,
-                    }
+                    cache_entry: dict[str, Any] = (
+                        dict(previous_entry) if isinstance(previous_entry, dict) else {}
+                    )
+                    cache_entry.update(metadata)
+                    cache_entry["checked_at"] = now_epoch
+                    cache_entry["refresh_failed"] = True
+                    retained_quota = mark_quota_snapshot_stale(previous_quota)
+                    if retained_quota is not None:
+                        cache_entry["quota"] = retained_quota
+                        result[account_id] = retained_quota
+                    else:
+                        cache_entry.pop("quota", None)
                     if isinstance(previous_entry, dict):
                         last_success_at = (
                             previous_entry.get("last_success_at")
@@ -4226,27 +6810,45 @@ def cockpit_official_quota_by_account(
                         if last_success_at not in (None, ""):
                             cache_entry["last_success_at"] = last_success_at
                     cache[account_id] = cache_entry
-                    if stale_quota is not None:
-                        result[account_id] = stale_quota
-                cache_changed = True
+                    dirty[account_id] = cache_entry
 
-    if cache_changed:
-        compact_cache = {
-            account_id: entry
-            for account_id, entry in cache.items()
-            if isinstance(entry, dict)
-        }
-        try:
-            write_json_atomic(
-                COCKPIT_OFFICIAL_QUOTA_CACHE_PATH,
-                {"schema": 2, "accounts": compact_cache},
-            )
-        except OSError:
-            pass
+    if dirty:
+        write_official_quota_cache(dirty)
     return result
 
 
-def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, Any]]]:
+def cockpit_recent_usage_account_ids(
+    home: Path,
+    now: datetime | None = None,
+) -> set[str]:
+    db_path = home / ".antigravity_cockpit" / "codex_local_access_logs.sqlite"
+    if not db_path.exists():
+        return set()
+    now = now or datetime.now(LOCAL_TZ)
+    start = now - timedelta(seconds=COCKPIT_OFFICIAL_QUOTA_ACTIVE_LOOKBACK_SECONDS)
+    try:
+        con = connect_cockpit_sqlite_readonly(db_path)
+        rows = con.execute(
+            f"""
+            SELECT DISTINCT account_id
+            FROM request_logs
+            WHERE timestamp >= ? AND timestamp <= ?
+              AND account_id IS NOT NULL
+              AND TRIM(account_id) != ''
+              AND {COCKPIT_RECORDED_USAGE_SQL}
+            """,
+            (local_epoch_ms(start), local_epoch_ms(now)),
+        ).fetchall()
+        con.close()
+    except (OSError, sqlite3.Error):
+        return set()
+    return {str(row[0]).strip() for row in rows if row and str(row[0]).strip()}
+
+
+def cockpit_codex_quota_by_label(
+    home: Path,
+    force_active_official_refresh: bool = False,
+) -> dict[str, dict[str, dict[str, Any]]]:
     accounts_dir = home / ".antigravity_cockpit" / "codex_accounts"
     result: dict[str, dict[str, dict[str, Any]]] = {}
     source_accounts_by_id: dict[str, dict[str, Any]] = {}
@@ -4358,12 +6960,11 @@ def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, An
         )
         for account_id, account in all_accounts_by_id.items()
     }
+    official_cache = load_official_quota_cache()
     retained_quota = cached_official_quota_by_label(
-        load_official_quota_cache(),
+        official_cache,
         set(all_accounts_by_id),
     )
-    for label, quota in retained_quota.items():
-        result.setdefault(label, quota)
 
     def reserve_window(
         snapshot: dict[str, Any],
@@ -4489,24 +7090,115 @@ def cockpit_codex_quota_by_label(home: Path) -> dict[str, dict[str, dict[str, An
                     "quota_snapshot_at": snapshot_at,
                 },
             }
-            if label not in result or (
-                quota_row_needs_official_refresh(result[label])
-                and not quota_row_needs_official_refresh(local_quota)
-            ):
+            if label not in result:
                 result[label] = local_quota
+            else:
+                result[label] = merge_quota_rows(result[label], local_quota)
 
     # Resolve every Cockpit-owned local source before using account credentials
     # for a direct official request. A future sidecar version can therefore add
     # reset timestamps without causing duplicate network traffic.
+    # A fresh sidecar snapshot already is a refreshed inactive-account value.
+    # Use official credentials only when that local source is incomplete or
+    # stale; active accounts are added below on their shorter cadence.
     official_candidates = {
         account_id: account
-        for account_id, account in manifest_by_id.items()
+        for account_id, account in all_accounts_by_id.items()
         if quota_row_needs_official_refresh(result.get(labels_by_id.get(account_id, "")))
     }
-    official_by_id = cockpit_official_quota_by_account(home, official_candidates)
+    active_account_ids: set[str] = set()
+    if force_active_official_refresh:
+        active_account_ids.update(cockpit_recent_usage_account_ids(home))
+        current_auth = read_codex_home_official_auth(home)
+        current_email = str((current_auth or {}).get("email") or "").strip().lower()
+        if current_email:
+            matched_current_ids = {
+                account_id
+                for account_id, account in all_accounts_by_id.items()
+                if str(account.get("email") or "").strip().lower() == current_email
+            }
+            if not matched_current_ids:
+                matched_current_ids = {
+                    account_id
+                    for account_id, entry in official_cache.items()
+                    if isinstance(entry, dict)
+                    and str(entry.get("email") or "").strip().lower() == current_email
+                }
+                for account_id in matched_current_ids:
+                    entry = official_cache.get(account_id) or {}
+                    all_accounts_by_id.setdefault(
+                        account_id,
+                        {
+                            "id": account_id,
+                            "email": current_email,
+                            "plan_type": str(entry.get("plan_type") or ""),
+                        },
+                    )
+                    labels_by_id[account_id] = cockpit_account_label(
+                        account_id,
+                        current_email,
+                        "",
+                    )
+            if not matched_current_ids:
+                current_account_id = str((current_auth or {}).get("account_id") or "").strip()
+                if current_account_id:
+                    direct_id = "codex_direct_" + hashlib.sha256(
+                        current_account_id.encode("utf-8")
+                    ).hexdigest()[:32]
+                    all_accounts_by_id[direct_id] = {
+                        "id": direct_id,
+                        "email": current_email,
+                        "plan_type": "",
+                    }
+                    labels_by_id[direct_id] = cockpit_account_label(
+                        direct_id,
+                        current_email,
+                        "",
+                    )
+                    matched_current_ids.add(direct_id)
+            active_account_ids.update(matched_current_ids)
+        active_account_ids.intersection_update(all_accounts_by_id)
+        official_candidates.update(
+            {
+                account_id: all_accounts_by_id[account_id]
+                for account_id in active_account_ids
+            }
+        )
+
+    for account_id, entry in official_cache.items():
+        if account_id not in all_accounts_by_id or not isinstance(entry, dict):
+            continue
+        label = labels_by_id.get(account_id, "")
+        quota = entry.get("quota")
+        if not label or not isinstance(quota, dict):
+            continue
+        if not any(
+            quota_window_source_rank(quota.get(window_key)) >= 2
+            for window_key in ("window_5h", "window_7d", "window_cycle")
+        ):
+            continue
+        if label in result:
+            result[label] = merge_quota_rows(result[label], quota)
+        else:
+            result[label] = quota
+
+    for label, quota in retained_quota.items():
+        if label in result:
+            result[label] = merge_quota_rows(result[label], quota)
+        else:
+            result[label] = quota
+    official_by_id = cockpit_official_quota_by_account(
+        home,
+        official_candidates,
+        active_account_ids=active_account_ids,
+    )
     for account_id, quota in official_by_id.items():
         label = labels_by_id.get(account_id)
-        if label:
+        if not label:
+            continue
+        if label in result:
+            result[label] = merge_quota_rows(result[label], quota)
+        else:
             result[label] = quota
     persist_quota_snapshots_by_account(
         all_accounts_by_id,
@@ -4572,14 +7264,18 @@ def add_cockpit_usage_to_bucket(
     except (TypeError, ValueError):
         cost = 0.0
     multiplier = max(1.0, cost_multiplier)
-    calculated_cost = estimate_cost(
+    calculated_cost, _price_resolved = estimate_cost_with_resolution(
         model,
         max(0, input_tokens - cached_tokens),
         cached_tokens,
         output_tokens,
         pricing_tier="priority" if multiplier > 1 else "standard",
     )
-    bucket.cost += calculated_cost if calculated_cost > 0 else cost * multiplier
+    upstream_cost = max(0.0, cost * multiplier)
+    effective_cost = calculated_cost if calculated_cost > 0 else upstream_cost
+    bucket.cost += effective_cost
+    if effective_cost <= 0:
+        bucket.add_unpriced_model(model, event_total)
     bucket.add_model(model, event_total)
     bucket.mark_latest(ms_to_local_datetime(timestamp), model, app_speed, multiplier)
     return True
@@ -5558,6 +8254,8 @@ def quota_fingerprint_account_candidates(
     marker_index = account_markers_by_total_tokens(request_markers)
     used_marker_ids: set[int] = set()
     for event in sorted(events, key=lambda item: item.when):
+        if external_codex_provider_label(event.model):
+            continue
         if not event.quota_fingerprints:
             continue
         marker, exact = concrete_api_service_account_match(
@@ -5585,6 +8283,13 @@ def apply_quota_fingerprint_account_hints(
         if len(labels) == 1
     }
     for event in events:
+        if external_codex_provider_label(event.model):
+            continue
+        if event.account_hint_source in {
+            OPENCODEX_ACCOUNT_HINT_SOURCE,
+            OPENCODEX_UNRESOLVED_HINT_SOURCE,
+        }:
+            continue
         labels = {
             unique_labels[fingerprint]
             for fingerprint in event.quota_fingerprints
@@ -5610,12 +8315,22 @@ def attribute_codex_events_by_account(
     if not markers:
         for event in events:
             event_id = codex_event_id(event)
+            label = assign_external_codex_provider_label(event, attribution_ledger)
+            if label:
+                attributed.setdefault(label, []).append(event)
+                continue
             label = (
                 event.account_label_hint
-                if event.account_hint_source == "quota_fingerprint"
+                if event.account_hint_source in TRUSTED_CODEX_ACCOUNT_HINT_SOURCES
                 else ""
             )
-            if label and attribution_ledger is not None:
+            if event.account_hint_source == OPENCODEX_UNRESOLVED_HINT_SOURCE:
+                label = API_SERVICE_AGGREGATE_LABEL
+            if (
+                label
+                and attribution_ledger is not None
+                and event.account_hint_source != OPENCODEX_TURN_HINT_SOURCE
+            ):
                 ledger_assign(attribution_ledger, event_id, label)
             if not label:
                 label, event_id = ledger_label_for_event(event, attribution_ledger)
@@ -5640,12 +8355,22 @@ def attribute_codex_events_by_account(
     ledger = attribution_ledger
     for event in events:
         event_id = codex_event_id(event)
+        label = assign_external_codex_provider_label(event, ledger)
+        if label:
+            attributed.setdefault(label, []).append(event)
+            continue
         label = (
             event.account_label_hint
-            if event.account_hint_source == "quota_fingerprint"
+            if event.account_hint_source in TRUSTED_CODEX_ACCOUNT_HINT_SOURCES
             else ""
         )
-        if label and ledger is not None:
+        if event.account_hint_source == OPENCODEX_UNRESOLVED_HINT_SOURCE:
+            label = API_SERVICE_AGGREGATE_LABEL
+        if (
+            label
+            and ledger is not None
+            and event.account_hint_source != OPENCODEX_TURN_HINT_SOURCE
+        ):
             ledger_assign(ledger, event_id, label)
         if not label:
             label, event_id = ledger_label_for_event(event, ledger)
@@ -5825,14 +8550,18 @@ def add_claude_event_to_bucket(bucket: UsageBucket, event: ClaudeUsageEvent) -> 
     bucket.output_tokens += event.output_tokens
     bucket.cache_creation_input_tokens += event.cache_creation_tokens
     bucket.cache_read_input_tokens += event.cache_read_tokens
-    bucket.cost += estimate_cost(
+    cost, price_resolved = estimate_cost_with_resolution(
         event.model,
         event.input_tokens,
         event.cache_read_tokens,
         event.output_tokens,
         cache_creation_tokens=event.cache_creation_tokens,
         pricing_tier=event.pricing_tier,
+        when=event.when,
     )
+    bucket.cost += cost
+    if not price_resolved:
+        bucket.add_unpriced_model(event.model, event.total_tokens)
     bucket.add_model(event.model, event.total_tokens)
     bucket.mark_latest(event.when, event.model)
 
@@ -5864,6 +8593,7 @@ def claude_hourly_from_events(events: list[ClaudeUsageEvent]) -> list[dict[str, 
             event.output_tokens,
             cache_creation_tokens=event.cache_creation_tokens,
             pricing_tier=event.pricing_tier,
+            when=event.when,
         )
     for bucket in buckets:
         bucket["cost"] = round(float(bucket["cost"] or 0), 6)
@@ -5892,6 +8622,8 @@ def codex_hourly_from_events(events: list[UsageEvent]) -> list[dict[str, Any]]:
             event.cached_tokens,
             event.output_tokens,
             pricing_tier=pricing_tier,
+            pricing_model=event.pricing_model,
+            when=event.when,
         )
     for bucket in buckets:
         bucket["cost"] = round(float(bucket["cost"] or 0), 6)
@@ -5914,9 +8646,52 @@ def split_grok_token_count(total: int, parts: int, index: int) -> int:
     return quotient + (1 if 0 <= index < remainder else 0)
 
 
+def grok_canonical_model_name(value: Any) -> str:
+    name = str(value or "").strip().lower()
+    if name.startswith("xai/"):
+        name = name.split("/", 1)[1]
+    return name
+
+
+def grok_cli_default_model(home: Path | None = None) -> str:
+    path = (home or Path.home()) / ".grok" / "config.toml"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+    current_section = ""
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line.strip("[]").strip().lower()
+            continue
+        match = re.match(r'^default\s*=\s*["\']([^"\']+)["\']', line)
+        if match and current_section == "models":
+            return str(match.group(1) or "").strip()
+    return ""
+
+
+def grok_local_pricing_model(
+    model: str,
+    *,
+    default_model: str = "",
+) -> str:
+    usage_model = grok_canonical_model_name(model)
+    if usage_model != GROK_BUILD_USAGE_MODEL:
+        return ""
+    canonical_default = grok_canonical_model_name(default_model)
+    if canonical_default not in {grok_canonical_model_name(name) for name in GROK_CANONICAL_DEFAULT_MODELS}:
+        return ""
+    return GROK_CANONICAL_PRICING_MODEL
+
+
 def grok_usage_events_from_update_row(
     row: dict[str, Any],
     fallback_session_id: str = "",
+    *,
+    default_model: str | None = None,
 ) -> list[UsageEvent]:
     params = row.get("params")
     if not isinstance(params, dict):
@@ -5959,6 +8734,7 @@ def grok_usage_events_from_update_row(
 
     events: list[UsageEvent] = []
     event_offset = 0
+    grok_default_model = grok_cli_default_model() if default_model is None else str(default_model or "")
     for raw_model, raw_detail in sorted(model_usage.items(), key=lambda item: str(item[0])):
         if not isinstance(raw_detail, dict):
             continue
@@ -5980,6 +8756,10 @@ def grok_usage_events_from_update_row(
         cached_tokens = min(input_tokens, cache_read + cache_creation)
         uncached_input = max(0, input_tokens - cached_tokens)
         model_calls = max(1, usage_int(raw_detail, "modelCalls"))
+        pricing_model = grok_local_pricing_model(
+            model,
+            default_model=grok_default_model,
+        )
 
         for call_index in range(model_calls):
             call_when = when + timedelta(microseconds=event_offset)
@@ -6009,6 +8789,7 @@ def grok_usage_events_from_update_row(
                 route="grok-local",
                 request_at=call_when,
                 account_at=when,
+                pricing_model=pricing_model,
             )
             if event.total_tokens > 0:
                 events.append(event)
@@ -7730,6 +10511,7 @@ def resolve_api_service_event_accounts(
     affinity_events: list[CockpitAffinityEvent] | None = None,
     verdicts: dict[str, dict[str, str]] | None = None,
     record_verdicts: bool = True,
+    preserve_direct_official_usage: bool = False,
 ) -> tuple[dict[str, list[UsageEvent]], dict[str, str], int]:
     """Resolve api-service mirror labels into concrete Cockpit accounts.
 
@@ -7738,8 +10520,15 @@ def resolve_api_service_event_accounts(
     archive as the today pass so every view agrees, but their scans carry less
     evidence, so they are not allowed to write into the archive that the today
     pass just decided.
+
+    ``preserve_direct_official_usage`` is used only while reconstructing an
+    official quota window. That view may scan older than the Cockpit database
+    retention horizon, so a historical marker alone cannot erase a concrete,
+    unqualified local GPT event from the active quota period. General daily
+    attribution deliberately keeps the stricter aggregate fallback.
     """
     marker_index = account_markers_by_total_tokens(account_markers)
+    cockpit_mode = bool(account_markers or affinity_events)
     session_accounts = dict(known_session_accounts or {})
     resolved: dict[str, list[UsageEvent]] = {}
     unresolved = 0
@@ -7751,8 +10540,80 @@ def resolve_api_service_event_accounts(
         ),
         key=lambda item: usage_event_attribution_time(item[1]),
     )
+    remaining: list[tuple[str, UsageEvent]] = []
+    latest_by_session: dict[str, tuple[str, bool, datetime]] = {}
+    for label, event in ordered:
+        opencodex_confirmed = (
+            event.account_hint_source == OPENCODEX_ACCOUNT_HINT_SOURCE
+            and bool(usable_cockpit_account_label(event.account_label_hint))
+            and not is_api_service_mirror_label(event.account_label_hint)
+        )
+        opencodex_unresolved = (
+            event.account_hint_source == OPENCODEX_UNRESOLVED_HINT_SOURCE
+        )
+        if opencodex_confirmed:
+            resolved_label = event.account_label_hint
+        elif opencodex_unresolved:
+            resolved_label = API_SERVICE_AGGREGATE_LABEL
+        else:
+            resolved_label = (
+                label
+                if is_external_codex_provider_label(label)
+                else assign_external_codex_provider_label(event, None)
+            )
+        if not resolved_label:
+            remaining.append((label, event))
+            continue
+        session_id = event.session_id or event.request_key or codex_event_id(event)
+        resolved.setdefault(resolved_label, []).append(event)
+        event_time = usage_event_attribution_time(event)
+        confirmed = not opencodex_unresolved
+        if opencodex_unresolved:
+            unresolved += 1
+        elif opencodex_confirmed and verdicts is not None and record_verdicts:
+            record_attribution_verdict(
+                verdicts,
+                codex_event_id(event),
+                resolved_label,
+                "opencodex_usage_row",
+                event_time,
+            )
+        previous = latest_by_session.get(session_id)
+        if previous is None or event_time >= previous[2]:
+            latest_by_session[session_id] = (resolved_label, confirmed, event_time)
+    ordered = remaining
     records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]] = []
-    cockpit_mode = bool(account_markers or affinity_events)
+    # Only the quota-window reconstruction asks for the limited direct-label
+    # escape hatch. Its scan can include old rows from a prior quota cycle;
+    # retain the normal strict fallback everywhere else.
+    cockpit_context_times = (
+        sorted(
+            [
+                account_marker_epoch(marker.when)
+                for marker in account_markers
+                if account_marker_has_recorded_usage(marker)
+            ]
+            + [
+                account_marker_epoch(item.when)
+                for item in affinity_events or []
+                if cockpit_affinity_event_concrete_account_id(item)
+            ]
+        )
+        if preserve_direct_official_usage
+        else []
+    )
+
+    def has_nearby_cockpit_context(event: UsageEvent) -> bool:
+        if not cockpit_context_times:
+            return False
+        event_epoch = account_marker_epoch(event.when)
+        position = bisect_left(cockpit_context_times, event_epoch)
+        for index in (position - 1, position):
+            if index < 0 or index >= len(cockpit_context_times):
+                continue
+            if abs(cockpit_context_times[index] - event_epoch) <= API_SERVICE_ACTIVITY_MATCH_SECONDS:
+                return True
+        return False
     anchors_by_turn: dict[str, list[tuple[datetime, AccountMarker]]] = {}
     # The verdict key must be taken from the freshly scanned event, because a
     # matched marker rewrites event.model further down and codex_event_id()
@@ -7867,7 +10728,6 @@ def resolve_api_service_event_accounts(
             )
         )
 
-    latest_by_session: dict[str, tuple[str, bool]] = {}
     for record_index, (label, event, session_id, turn_key, matched_marker) in enumerate(records):
         resolved_label = label
         confirmed = False
@@ -7898,6 +10758,12 @@ def resolve_api_service_event_accounts(
             and not is_api_service_mirror_label(event.account_label_hint)
             else ""
         )
+        opencodex_turn_label = (
+            event.account_label_hint
+            if event.account_hint_source == OPENCODEX_TURN_HINT_SOURCE
+            and event.account_label_hint
+            else ""
+        )
         # Exact Cockpit usage is strongest. A successful auth_result tied to
         # this event is next and can correct a stale quota fingerprint. A quota
         # hint still beats fuzzy token/time matches and inherited turn state.
@@ -7921,6 +10787,14 @@ def resolve_api_service_event_accounts(
         elif quota_hint_label:
             resolved_label = quota_hint_label
             confirmed = True
+        elif opencodex_turn_label:
+            resolved_label = opencodex_turn_label
+            if is_api_service_mirror_label(resolved_label):
+                resolved_label = API_SERVICE_AGGREGATE_LABEL
+                unresolved += 1
+                counted_unresolved = True
+            else:
+                confirmed = True
         elif matched_marker is not None:
             resolved_label = matched_marker.label
             confirmed = True
@@ -7946,9 +10820,19 @@ def resolve_api_service_event_accounts(
                 # run's label but stays out of the archive.
                 verdict_tier = ""
         elif cockpit_mode or is_api_service_mirror_label(label):
-            resolved_label = API_SERVICE_AGGREGATE_LABEL
-            unresolved += 1
-            counted_unresolved = True
+            preserve_direct_label = (
+                preserve_direct_official_usage
+                and not is_api_service_mirror_label(label)
+                and bool(usable_cockpit_account_label(label))
+                and is_official_codex_quota_model(event.model)
+                and not has_nearby_cockpit_context(event)
+            )
+            if preserve_direct_label:
+                confirmed = True
+            else:
+                resolved_label = API_SERVICE_AGGREGATE_LABEL
+                unresolved += 1
+                counted_unresolved = True
         else:
             confirmed = True
         if verdicts is not None:
@@ -7975,9 +10859,12 @@ def resolve_api_service_event_accounts(
                     if counted_unresolved:
                         unresolved -= 1
         resolved.setdefault(resolved_label, []).append(event)
-        latest_by_session[session_id] = (resolved_label, confirmed)
+        event_time = usage_event_attribution_time(event)
+        previous = latest_by_session.get(session_id)
+        if previous is None or event_time >= previous[2]:
+            latest_by_session[session_id] = (resolved_label, confirmed, event_time)
 
-    for session_id, (label, confirmed) in latest_by_session.items():
+    for session_id, (label, confirmed, _event_time) in latest_by_session.items():
         if confirmed and label and not is_api_service_mirror_label(label):
             session_accounts[session_id] = label
         else:
@@ -8125,6 +11012,8 @@ def merge_missing_cockpit_account_events(
     )
     records: list[tuple[str, UsageEvent, str, str, AccountMarker | None]] = []
     for label, event in ordered:
+        if is_external_codex_provider_label(label) or external_codex_provider_label(event.model):
+            continue
         session_id = event.session_id or event.request_key or codex_event_id(event)
         records.append(
             (
@@ -8354,6 +11243,8 @@ def collapse_api_service_mirror_providers(output: dict[str, Any]) -> dict[str, A
         "cache_creation_input_tokens": sum(int(row.get("cache_creation_input_tokens") or 0) for row in mirrors),
         "output_tokens": sum(int(row.get("output_tokens") or 0) for row in mirrors),
         "cost": round(sum(float(row.get("cost") or 0) for row in mirrors), 6),
+        "unpriced_tokens": sum(int(row.get("unpriced_tokens") or 0) for row in mirrors),
+        "unpriced_models": {},
         "models": {},
         "latest_at": str(latest.get("latest_at") or ""),
         "latest_model": str(latest.get("latest_model") or ""),
@@ -8364,10 +11255,17 @@ def collapse_api_service_mirror_providers(output: dict[str, Any]) -> dict[str, A
     }
     for row in mirrors:
         models = row.get("models")
-        if not isinstance(models, dict):
-            continue
-        for model, tokens in models.items():
-            aggregate["models"][str(model)] = aggregate["models"].get(str(model), 0) + int(tokens or 0)
+        if isinstance(models, dict):
+            for model, tokens in models.items():
+                aggregate["models"][str(model)] = (
+                    aggregate["models"].get(str(model), 0) + int(tokens or 0)
+                )
+        unpriced_models = row.get("unpriced_models")
+        if isinstance(unpriced_models, dict):
+            for model, tokens in unpriced_models.items():
+                aggregate["unpriced_models"][str(model)] = (
+                    aggregate["unpriced_models"].get(str(model), 0) + int(tokens or 0)
+                )
     providers[:] = [
         provider
         for provider in providers
@@ -8423,10 +11321,40 @@ def latest_history_observation(history: dict[str, Any]) -> datetime | None:
     return max(candidates) if candidates else None
 
 
+def opencodex_accounting_migration_dates(
+    home: Path,
+    now: datetime,
+    max_days: int = OFFLINE_HISTORY_BACKFILL_MAX_DAYS,
+) -> set[date]:
+    """Return closed local dates backed by positive OpenCodex usage evidence."""
+    max_days = max(0, int(max_days or 0))
+    if max_days <= 0:
+        return set()
+    today = now.date()
+    floor = today - timedelta(days=max_days)
+    start = datetime.combine(floor, datetime.min.time())
+    end = datetime.combine(today, datetime.min.time())
+    padding = timedelta(seconds=OPENCODEX_RECONCILIATION_MATCH_WINDOW_SECONDS)
+    markers = scan_opencodex_usage_markers(
+        home,
+        start - padding,
+        end + padding,
+    )
+    return {
+        marker.request_at.date()
+        for marker in markers
+        if marker.total_tokens > 0
+        and not opencodex_proxy_rejection_reason(marker)
+        and floor <= marker.request_at.date() < today
+    }
+
+
 def offline_history_dates_to_reconcile(
     history: dict[str, Any],
     now: datetime,
     max_days: int = OFFLINE_HISTORY_BACKFILL_MAX_DAYS,
+    *,
+    accounting_evidence_dates: set[date] | None = None,
 ) -> list[date]:
     max_days = max(0, int(max_days or 0))
     if max_days <= 0:
@@ -8434,6 +11362,11 @@ def offline_history_dates_to_reconcile(
     today = now.date()
     last_complete_day = today - timedelta(days=1)
     floor = today - timedelta(days=max_days)
+    accounting_evidence = {
+        item
+        for item in (accounting_evidence_dates or set())
+        if floor <= item < today
+    }
     raw_days = history.get("days")
     days = raw_days if isinstance(raw_days, dict) else {}
     known_dates: list[date] = []
@@ -8464,6 +11397,33 @@ def offline_history_dates_to_reconcile(
             if cursor.isoformat() not in days:
                 targets.add(cursor)
             cursor += timedelta(days=1)
+
+    for key, row in days.items():
+        try:
+            parsed = date.fromisoformat(str(key))
+        except ValueError:
+            continue
+        if parsed < floor or parsed >= today:
+            continue
+        if not isinstance(row, dict):
+            targets.add(parsed)
+            continue
+        try:
+            accounting_schema = int(row.get("usage_accounting_schema") or 0)
+        except (TypeError, ValueError):
+            accounting_schema = 0
+        try:
+            cockpit_schema = int(row.get("cockpit_usage_schema") or 0)
+        except (TypeError, ValueError):
+            cockpit_schema = 0
+        if (
+            (
+                accounting_schema < USAGE_ACCOUNTING_SCHEMA
+                and parsed in accounting_evidence
+            )
+            or cockpit_schema < COCKPIT_USAGE_DEDUPE_SCHEMA
+        ):
+            targets.add(parsed)
     return sorted(day for day in targets if floor <= day < today)
 
 
@@ -8479,6 +11439,16 @@ def scan_claude_daily_buckets(
     return buckets
 
 
+def group_contiguous_dates(target_days: list[date]) -> list[list[date]]:
+    groups: list[list[date]] = []
+    for target_day in sorted(set(target_days)):
+        if not groups or target_day != groups[-1][-1] + timedelta(days=1):
+            groups.append([target_day])
+        else:
+            groups[-1].append(target_day)
+    return groups
+
+
 def build_historical_usage_rows(
     home: Path,
     sessions_root: Path,
@@ -8486,8 +11456,23 @@ def build_historical_usage_rows(
     attribution_ledger: dict[str, str],
     now: datetime,
 ) -> dict[str, dict[str, Any]]:
+    target_days = sorted(set(target_days))
     if not target_days:
         return {}
+    groups = group_contiguous_dates(target_days)
+    if len(groups) > 1:
+        rows: dict[str, dict[str, Any]] = {}
+        for group in groups:
+            rows.update(
+                build_historical_usage_rows(
+                    home,
+                    sessions_root,
+                    group,
+                    attribution_ledger,
+                    now,
+                )
+            )
+        return rows
     wanted = {item.isoformat() for item in target_days}
     start = datetime.combine(min(target_days), datetime.min.time())
     end = datetime.combine(max(target_days) + timedelta(days=1), datetime.min.time())
@@ -8604,9 +11589,11 @@ def build_historical_usage_rows(
         rows[key] = {
             "date": key,
             "source": "local-backfill",
+            "usage_accounting_schema": USAGE_ACCOUNTING_SCHEMA,
             "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
             "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
             "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
+            "opencodex_attribution_schema": OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA,
             "requests": int(total_row.get("requests") or 0),
             "tokens": int(total_row.get("tokens") or 0),
             "input_tokens": int(total_row.get("input_tokens") or 0),
@@ -8627,6 +11614,7 @@ def build_historical_usage_rows(
 
 def history_row_signature(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
+        int(row.get("usage_accounting_schema") or 0),
         int(row.get("requests") or 0),
         int(row.get("tokens") or 0),
         int(row.get("input_tokens") or 0),
@@ -8636,7 +11624,47 @@ def history_row_signature(row: dict[str, Any]) -> tuple[Any, ...]:
         round(float(row.get("cost") or 0), 6),
         json.dumps(row.get("models") or {}, ensure_ascii=False, sort_keys=True),
         json.dumps(row.get("providers") or [], ensure_ascii=False, sort_keys=True),
+        json.dumps(row.get("source_gap") or {}, ensure_ascii=False, sort_keys=True),
     )
+
+
+def append_history_high_water_residual(
+    row: dict[str, Any],
+    residual_tokens: int,
+    residual_requests: int = 0,
+    residual_cost: float = 0.0,
+) -> None:
+    """Append an explicit residual while preserving canonical account details."""
+    residual_tokens = max(0, int(residual_tokens or 0))
+    residual_requests = max(0, int(residual_requests or 0))
+    residual_cost = max(0.0, float(residual_cost or 0))
+    if residual_tokens <= 0:
+        return
+    label = "Historical high-water"
+    row["input_tokens"] = max(0, int(row.get("input_tokens") or 0)) + residual_tokens
+    models = dict(row.get("models") or {}) if isinstance(row.get("models"), dict) else {}
+    models[label] = max(0, int(models.get(label) or 0)) + residual_tokens
+    row["models"] = models
+    providers = [
+        dict(provider)
+        for provider in (row.get("providers") or [])
+        if isinstance(provider, dict)
+    ]
+    providers.append(
+        {
+            "name": label,
+            "requests": residual_requests,
+            "tokens": residual_tokens,
+            "input_tokens": residual_tokens,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "cost": round(residual_cost, 6),
+            "models": {label: residual_tokens},
+        }
+    )
+    row["providers"] = providers
+    row["detail_tokens"] = int(row.get("detail_tokens") or 0) + residual_tokens
 
 
 def merge_rebuilt_history_day(
@@ -8657,7 +11685,32 @@ def merge_rebuilt_history_day(
         if isinstance(provider, dict)
     )
     rebuilt_detail = int(rebuilt.get("detail_tokens") or 0)
-    use_rebuilt = rebuilt_tokens > existing_tokens or (
+    try:
+        existing_accounting_schema = int(
+            existing.get("usage_accounting_schema") or 0
+        )
+    except (TypeError, ValueError):
+        existing_accounting_schema = 0
+    try:
+        rebuilt_accounting_schema = int(
+            rebuilt.get("usage_accounting_schema") or 0
+        )
+    except (TypeError, ValueError):
+        rebuilt_accounting_schema = 0
+    accounting_schema_upgrade = (
+        rebuilt_accounting_schema > existing_accounting_schema
+    )
+    try:
+        existing_schema = int(existing.get("cockpit_usage_schema") or 0)
+    except (TypeError, ValueError):
+        existing_schema = 0
+    try:
+        rebuilt_schema = int(rebuilt.get("cockpit_usage_schema") or 0)
+    except (TypeError, ValueError):
+        rebuilt_schema = 0
+    cockpit_schema_upgrade = rebuilt_schema > existing_schema
+    schema_upgrade = accounting_schema_upgrade or cockpit_schema_upgrade
+    use_rebuilt = schema_upgrade or rebuilt_tokens > existing_tokens or (
         rebuilt_tokens == existing_tokens and rebuilt_detail > existing_detail
     )
     merged = dict(rebuilt if use_rebuilt else existing)
@@ -8666,26 +11719,114 @@ def merge_rebuilt_history_day(
     merged["source_date"] = str(
         existing.get("source_date") or rebuilt.get("source_date") or merged["date"]
     )
-    merged["requests"] = max(
-        int(existing.get("requests") or 0),
-        int(rebuilt.get("requests") or 0),
-    )
-    merged["tokens"] = max(existing_tokens, rebuilt_tokens)
-    merged["cost"] = round(
-        max(float(existing.get("cost") or 0), float(rebuilt.get("cost") or 0)),
-        6,
-    )
-    if rebuilt_detail > existing_detail and isinstance(rebuilt.get("providers"), list):
-        merged["providers"] = rebuilt["providers"]
+    if accounting_schema_upgrade and rebuilt_tokens >= existing_tokens:
+        merged["usage_accounting_schema"] = rebuilt_accounting_schema
+        merged["requests"] = int(rebuilt.get("requests") or 0)
+        merged["tokens"] = rebuilt_tokens
+        merged["input_tokens"] = int(rebuilt.get("input_tokens") or 0)
+        merged["cached_input_tokens"] = int(rebuilt.get("cached_input_tokens") or 0)
+        merged["cache_creation_input_tokens"] = int(
+            rebuilt.get("cache_creation_input_tokens") or 0
+        )
+        merged["output_tokens"] = int(rebuilt.get("output_tokens") or 0)
+        merged["cost"] = round(float(rebuilt.get("cost") or 0), 6)
         merged["models"] = rebuilt.get("models") or {}
+        merged["providers"] = (
+            rebuilt["providers"]
+            if isinstance(rebuilt.get("providers"), list)
+            else []
+        )
         merged["detail_tokens"] = rebuilt_detail
+        merged.pop("source_gap", None)
+    elif accounting_schema_upgrade:
+        residual_tokens = existing_tokens - rebuilt_tokens
+        merged = dict(rebuilt)
+        merged["date"] = str(existing.get("date") or rebuilt.get("date") or "")
+        merged["source"] = str(
+            existing.get("source") or rebuilt.get("source") or "local-backfill"
+        )
+        merged["source_date"] = str(
+            existing.get("source_date") or rebuilt.get("source_date") or merged["date"]
+        )
+        merged["usage_accounting_schema"] = rebuilt_accounting_schema
+        merged["requests"] = max(
+            int(existing.get("requests") or 0),
+            int(rebuilt.get("requests") or 0),
+        )
+        merged["tokens"] = existing_tokens
+        merged["cost"] = round(
+            max(float(existing.get("cost") or 0), float(rebuilt.get("cost") or 0)),
+            6,
+        )
+        canonical_provider_requests = sum(
+            int(provider.get("requests") or 0)
+            for provider in (merged.get("providers") or [])
+            if isinstance(provider, dict)
+        )
+        canonical_provider_cost = sum(
+            float(provider.get("cost") or 0)
+            for provider in (merged.get("providers") or [])
+            if isinstance(provider, dict)
+        )
+        residual_requests = max(
+            0,
+            int(merged["requests"]) - canonical_provider_requests,
+        )
+        residual_cost = max(0.0, float(merged["cost"]) - canonical_provider_cost)
+        merged.pop("source_gap", None)
+        merged["accounting_migration_high_water_guard"] = {
+            "retained_tokens": existing_tokens,
+            "canonical_tokens": rebuilt_tokens,
+            "residual_tokens": residual_tokens,
+            "residual_requests": residual_requests,
+            "residual_cost": round(residual_cost, 6),
+            "reason": "canonical_below_existing_high_water",
+        }
+        append_history_high_water_residual(
+            merged,
+            residual_tokens,
+            residual_requests,
+            residual_cost,
+        )
     else:
-        if not isinstance(merged.get("providers"), list) and isinstance(rebuilt.get("providers"), list):
+        merged["requests"] = max(
+            int(existing.get("requests") or 0),
+            int(rebuilt.get("requests") or 0),
+        )
+        merged["tokens"] = max(existing_tokens, rebuilt_tokens)
+        merged["cost"] = round(
+            max(float(existing.get("cost") or 0), float(rebuilt.get("cost") or 0)),
+            6,
+        )
+        if cockpit_schema_upgrade:
+            merged["cockpit_usage_schema"] = rebuilt_schema
+            if rebuilt_tokens >= existing_tokens:
+                merged["input_tokens"] = int(rebuilt.get("input_tokens") or 0)
+                merged["cached_input_tokens"] = int(
+                    rebuilt.get("cached_input_tokens") or 0
+                )
+                merged["cache_creation_input_tokens"] = int(
+                    rebuilt.get("cache_creation_input_tokens") or 0
+                )
+                merged["output_tokens"] = int(rebuilt.get("output_tokens") or 0)
+        if (
+            (cockpit_schema_upgrade or rebuilt_detail > existing_detail)
+            and isinstance(rebuilt.get("providers"), list)
+        ):
             merged["providers"] = rebuilt["providers"]
-        if not isinstance(merged.get("models"), dict) and isinstance(rebuilt.get("models"), dict):
-            merged["models"] = rebuilt["models"]
-        if "detail_tokens" not in merged:
+            merged["models"] = rebuilt.get("models") or {}
             merged["detail_tokens"] = rebuilt_detail
+        else:
+            if not isinstance(merged.get("providers"), list) and isinstance(
+                rebuilt.get("providers"), list
+            ):
+                merged["providers"] = rebuilt["providers"]
+            if not isinstance(merged.get("models"), dict) and isinstance(
+                rebuilt.get("models"), dict
+            ):
+                merged["models"] = rebuilt["models"]
+            if "detail_tokens" not in merged:
+                merged["detail_tokens"] = rebuilt_detail
     before = history_row_signature(existing)
     after = history_row_signature(merged)
     if before != after:
@@ -8734,64 +11875,333 @@ def backfill_offline_usage_history(
             attribution_ledger,
             now,
         )
-        changed = 0
-        for target_day in targets:
-            key = target_day.isoformat()
-            rebuilt = rebuilt_rows.get(key)
-            if not isinstance(rebuilt, dict):
-                continue
-            merged, row_changed = merge_rebuilt_history_day(
-                days.get(key) if isinstance(days.get(key), dict) else None,
-                rebuilt,
-                started_at,
-            )
-            days[key] = merged
-            changed += int(row_changed)
         completed_at = datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
-        result.update(
-            {
+        with attribution_ledger_write_lock(USAGE_HISTORY_PATH):
+            latest_history = read_usage_history_json()
+            if not isinstance(latest_history, dict):
+                latest_history = dict(history)
+            latest_days = latest_history.setdefault("days", {})
+            if not isinstance(latest_days, dict):
+                latest_days = {}
+                latest_history["days"] = latest_days
+            changed = 0
+            for target_day in targets:
+                key = target_day.isoformat()
+                rebuilt = rebuilt_rows.get(key)
+                if not isinstance(rebuilt, dict):
+                    continue
+                merged, row_changed = merge_rebuilt_history_day(
+                    latest_days.get(key)
+                    if isinstance(latest_days.get(key), dict)
+                    else None,
+                    rebuilt,
+                    started_at,
+                )
+                latest_days[key] = merged
+                changed += int(row_changed)
+            result.update(
+                {
+                    "state": "complete",
+                    "updated_days": changed,
+                    "completed_at": completed_at,
+                }
+            )
+            latest_history["schema"] = max(
+                2,
+                int(latest_history.get("schema") or 1),
+            )
+            latest_history["offline_sync"] = {
                 "state": "complete",
+                "last_successful_at": completed_at,
+                "from": result["from"],
+                "through": result["through"],
+                "scanned_days": result["scanned_days"],
                 "updated_days": changed,
-                "completed_at": completed_at,
             }
-        )
-        history["schema"] = max(2, int(history.get("schema") or 1))
-        history["offline_sync"] = {
-            "state": "complete",
-            "last_successful_at": completed_at,
-            "from": result["from"],
-            "through": result["through"],
-            "scanned_days": result["scanned_days"],
-            "updated_days": changed,
-        }
-        write_json_atomic(USAGE_HISTORY_PATH, history)
-        refresh_json_backup(USAGE_HISTORY_PATH)
+            write_json_atomic(USAGE_HISTORY_PATH, latest_history)
+            refresh_json_backup(USAGE_HISTORY_PATH, max_age_seconds=0)
         return result
     except Exception as exc:
         completed_at = datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
-        previous_sync = history.get("offline_sync")
-        sync = dict(previous_sync) if isinstance(previous_sync, dict) else {}
-        sync.update(
-            {
-                "state": "error",
-                "last_attempt_at": completed_at,
-                "error": f"{type(exc).__name__}: {exc}"[:240],
-            }
-        )
-        history["offline_sync"] = sync
+        message = f"{type(exc).__name__}: {exc}"[:240]
         try:
-            write_json_atomic(USAGE_HISTORY_PATH, history)
-            refresh_json_backup(USAGE_HISTORY_PATH)
-        except OSError:
+            with attribution_ledger_write_lock(USAGE_HISTORY_PATH):
+                latest_history = read_usage_history_json()
+                if not isinstance(latest_history, dict):
+                    latest_history = dict(history)
+                previous_sync = latest_history.get("offline_sync")
+                sync = dict(previous_sync) if isinstance(previous_sync, dict) else {}
+                sync.update(
+                    {
+                        "state": "error",
+                        "last_attempt_at": completed_at,
+                        "error": message,
+                    }
+                )
+                latest_history["offline_sync"] = sync
+                write_json_atomic(USAGE_HISTORY_PATH, latest_history)
+                refresh_json_backup(USAGE_HISTORY_PATH)
+        except (OSError, TimeoutError):
             pass
         result.update(
             {
                 "state": "error",
                 "completed_at": completed_at,
-                "message": sync["error"],
+                "message": message,
             }
         )
         return result
+
+
+@contextmanager
+def offline_backfill_singleton_lock(
+    path: Path | None = None,
+):
+    path = path or OFFLINE_BACKFILL_LOCK_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                handle.seek(0)
+                if handle.read(1) == b"":
+                    handle.seek(0)
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                yield False
+                return
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        acquired = True
+        yield True
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def read_offline_backfill_status() -> dict[str, Any]:
+    try:
+        value = json.loads(OFFLINE_BACKFILL_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def offline_backfill_status_is_fresh(status: dict[str, Any], now: datetime) -> bool:
+    if str(status.get("state") or "") not in {"queued", "running"}:
+        return False
+    heartbeat = parse_dt(status.get("heartbeat_at") or status.get("queued_at"))
+    if heartbeat is None:
+        return False
+    age = (now - heartbeat).total_seconds()
+    return -OFFLINE_BACKFILL_LEASE_SECONDS <= age < OFFLINE_BACKFILL_LEASE_SECONDS
+
+
+def offline_backfill_check_is_due(status: dict[str, Any], now: datetime) -> bool:
+    if offline_backfill_status_is_fresh(status, now):
+        return False
+    next_check = parse_dt(status.get("next_check_at") or status.get("retry_after"))
+    return next_check is None or now >= next_check
+
+
+def offline_backfill_next_check_at(now: datetime | None = None) -> str:
+    current = now or datetime.now()
+    return (current + timedelta(seconds=OFFLINE_BACKFILL_CHECK_INTERVAL_SECONDS)).replace(
+        tzinfo=LOCAL_TZ
+    ).isoformat(timespec="seconds")
+
+
+def write_offline_backfill_status(status: dict[str, Any]) -> None:
+    write_json_atomic(OFFLINE_BACKFILL_STATUS_PATH, status)
+
+
+def run_offline_backfill_worker(
+    home: Path,
+    sessions_root: Path,
+    now: datetime,
+    run_id: str = "",
+) -> dict[str, Any]:
+    with offline_backfill_singleton_lock() as acquired:
+        if not acquired:
+            return {"state": "already_running", "scanned_days": 0}
+        status = read_offline_backfill_status()
+        expected_run_id = str(status.get("run_id") or "")
+        if run_id and expected_run_id and run_id != expected_run_id:
+            return {"state": "superseded", "scanned_days": 0}
+        run_id = run_id or expected_run_id or f"{os.getpid()}-{time.time_ns()}"
+        heartbeat = datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        write_offline_backfill_status(
+            {
+                "state": "running",
+                "run_id": run_id,
+                "started_at": heartbeat,
+                "heartbeat_at": heartbeat,
+            }
+        )
+        history = load_usage_history_for_backfill()
+        evidence_dates = opencodex_accounting_migration_dates(home, now)
+        targets = offline_history_dates_to_reconcile(
+            history,
+            now,
+            accounting_evidence_dates=evidence_dates,
+        )
+        if not targets:
+            result = {
+                "state": "idle",
+                "run_id": run_id,
+                "scanned_days": 0,
+                "next_check_at": offline_backfill_next_check_at(),
+            }
+            write_offline_backfill_status(result)
+            return result
+        ledger = load_attribution_ledger()
+        total_updated = 0
+        completed = 0
+        last_result: dict[str, Any] = {}
+        for target_group in group_contiguous_dates(targets):
+            history = load_usage_history_for_backfill()
+            last_result = backfill_offline_usage_history(
+                home,
+                sessions_root,
+                now,
+                ledger,
+                history=history,
+                target_days=target_group,
+            )
+            if last_result.get("state") == "error":
+                last_result["run_id"] = run_id
+                last_result["retry_after"] = offline_backfill_next_check_at()
+                write_offline_backfill_status(last_result)
+                return last_result
+            completed += len(target_group)
+            total_updated += int(last_result.get("updated_days") or 0)
+            write_offline_backfill_status(
+                {
+                    "state": "running",
+                    "run_id": run_id,
+                    "started_at": heartbeat,
+                    "heartbeat_at": datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+                    "scanned_days": completed,
+                    "total_days": len(targets),
+                }
+            )
+        result = {
+            "state": "complete",
+            "run_id": run_id,
+            "scanned_days": completed,
+            "updated_days": total_updated,
+            "completed_at": datetime.now().replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
+            "next_check_at": offline_backfill_next_check_at(),
+        }
+        write_offline_backfill_status(result)
+        return result
+
+
+def offline_backfill_command(output_path: Path, run_id: str) -> list[str]:
+    if IS_FROZEN:
+        return [
+            sys.executable,
+            "--offline-backfill",
+            "--offline-backfill-run-id",
+            run_id,
+            "--output",
+            str(output_path),
+        ]
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--offline-backfill",
+        "--offline-backfill-run-id",
+        run_id,
+        "--output",
+        str(output_path),
+    ]
+
+
+def spawn_offline_backfill_worker(output_path: Path, run_id: str) -> bool:
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    try:
+        subprocess.Popen(
+            offline_backfill_command(output_path, run_id),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creationflags,
+            cwd=str(APP_DIR),
+            shell=False,
+        )
+        return True
+    except OSError as exc:
+        logger.warning("offline history worker launch failed: %s", exc)
+        return False
+
+
+def queue_offline_backfill_worker(output_path: Path, now: datetime) -> dict[str, Any]:
+    status = read_offline_backfill_status()
+    if not offline_backfill_check_is_due(status, now):
+        return status
+    should_spawn = False
+    run_id = ""
+    with offline_backfill_singleton_lock() as acquired:
+        if not acquired:
+            status = read_offline_backfill_status()
+            return status or {"state": "running"}
+        status = read_offline_backfill_status()
+        if not offline_backfill_check_is_due(status, now):
+            return status
+        run_id = f"{os.getpid()}-{time.time_ns()}"
+        queued_at = now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        status = {
+            "state": "queued",
+            "run_id": run_id,
+            "queued_at": queued_at,
+            "heartbeat_at": queued_at,
+        }
+        write_offline_backfill_status(status)
+        should_spawn = True
+    if should_spawn and not spawn_offline_backfill_worker(output_path, run_id):
+        with offline_backfill_singleton_lock() as acquired:
+            current = read_offline_backfill_status()
+            if (
+                acquired
+                and str(current.get("run_id") or "") == run_id
+                and str(current.get("state") or "") == "queued"
+            ):
+                status = dict(current)
+                status["state"] = "launch_failed"
+                status["retry_after"] = offline_backfill_next_check_at(now)
+                write_offline_backfill_status(status)
+    return status
 
 
 def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day: date) -> None:
@@ -8811,6 +12221,17 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         return
     collapse_api_service_mirror_providers(existing)
     try:
+        current_accounting_schema = int(output.get("usage_accounting_schema") or 0)
+        existing_accounting_schema = int(
+            existing.get("usage_accounting_schema") or 0
+        )
+    except (TypeError, ValueError):
+        current_accounting_schema = 0
+        existing_accounting_schema = 0
+    accounting_schema_upgrade = (
+        current_accounting_schema > existing_accounting_schema
+    )
+    try:
         current_claude_schema = int(output.get("claude_usage_schema") or 0)
         existing_claude_schema = int(existing.get("claude_usage_schema") or 0)
     except (TypeError, ValueError):
@@ -8824,7 +12245,25 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         current_cockpit_schema = 0
         existing_cockpit_schema = 0
     cockpit_schema_upgrade = current_cockpit_schema > existing_cockpit_schema
-    usage_schema_upgrade = claude_schema_upgrade or cockpit_schema_upgrade
+    try:
+        current_opencodex_schema = int(
+            output.get("opencodex_attribution_schema") or 0
+        )
+        existing_opencodex_schema = int(
+            existing.get("opencodex_attribution_schema") or 0
+        )
+    except (TypeError, ValueError):
+        current_opencodex_schema = 0
+        existing_opencodex_schema = 0
+    opencodex_schema_upgrade = (
+        current_opencodex_schema > existing_opencodex_schema
+    )
+    usage_schema_upgrade = (
+        accounting_schema_upgrade
+        or claude_schema_upgrade
+        or cockpit_schema_upgrade
+        or opencodex_schema_upgrade
+    )
     current_api_aggregate = bool(output.get("api_service_aggregate"))
     current_api_account_routing = current_api_aggregate or bool(output.get("api_service_routed"))
 
@@ -8852,6 +12291,8 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
             "output_tokens",
             "cost",
             "models",
+            "unpriced_tokens",
+            "unpriced_models",
             "latest_at",
             "latest_model",
             "show_zero",
@@ -8951,10 +12392,23 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         name = str(previous.get("name") or "")
         if not name:
             continue
+        if accounting_schema_upgrade:
+            current = current_by_name.get(name)
+            if (
+                current is not None
+                and "window_30d" not in current
+                and isinstance(previous.get("window_30d"), dict)
+            ):
+                current["window_30d"] = dict(previous["window_30d"])
+            continue
         if claude_schema_upgrade and name == "Claude local":
             continue
+        if opencodex_schema_upgrade and is_codex_account_provider_name(name):
+            continue
         current = current_by_name.get(name)
-        if current_api_account_routing:
+        if current_api_account_routing or (
+            cockpit_schema_upgrade and is_codex_account_provider_name(name)
+        ):
             if current is not None and "window_30d" not in current and isinstance(previous.get("window_30d"), dict):
                 current["window_30d"] = dict(previous["window_30d"])
             continue
@@ -8983,6 +12437,18 @@ def same_day_output_high_water(output: dict[str, Any], existing_path: Path, day:
         current_today["cache_creation_input_tokens"] = sum(int(provider.get("cache_creation_input_tokens") or 0) for provider in provider_totals)
         current_today["output_tokens"] = sum(int(provider.get("output_tokens") or 0) for provider in provider_totals)
         current_today["cost"] = round(sum(float(provider.get("cost") or 0) for provider in provider_totals), 6)
+        current_today["unpriced_tokens"] = sum(
+            int(provider.get("unpriced_tokens") or 0) for provider in provider_totals
+        )
+        unpriced_models: dict[str, int] = {}
+        for provider in provider_totals:
+            provider_unpriced = provider.get("unpriced_models")
+            if not isinstance(provider_unpriced, dict):
+                continue
+            for model, tokens in provider_unpriced.items():
+                name = str(model or "unknown")
+                unpriced_models[name] = unpriced_models.get(name, 0) + int(tokens or 0)
+        current_today["unpriced_models"] = unpriced_models
 
 
 def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
@@ -8998,6 +12464,14 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         return
     row = dict(row)
     try:
+        current_accounting_schema = int(output.get("usage_accounting_schema") or 0)
+        history_accounting_schema = int(row.get("usage_accounting_schema") or 0)
+    except (TypeError, ValueError):
+        current_accounting_schema = 0
+        history_accounting_schema = 0
+    if current_accounting_schema > history_accounting_schema:
+        return
+    try:
         current_claude_schema = int(output.get("claude_usage_schema") or 0)
         history_claude_schema = int(row.get("claude_usage_schema") or 0)
     except (TypeError, ValueError):
@@ -9012,6 +12486,18 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         current_cockpit_schema = 0
         history_cockpit_schema = 0
     if current_cockpit_schema > history_cockpit_schema:
+        return
+    try:
+        current_opencodex_schema = int(
+            output.get("opencodex_attribution_schema") or 0
+        )
+        history_opencodex_schema = int(
+            row.get("opencodex_attribution_schema") or 0
+        )
+    except (TypeError, ValueError):
+        current_opencodex_schema = 0
+        history_opencodex_schema = 0
+    if current_opencodex_schema > history_opencodex_schema:
         return
     try:
         history_tokens = int(row.get("tokens") or 0)
@@ -9033,6 +12519,11 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
         ):
             gap[key] = max(0, int(row.get(key) or 0) - int(today.get(key) or 0))
         gap["cost"] = round(max(0.0, float(row.get("cost") or 0) - float(today.get("cost") or 0)), 6)
+        gap["unpriced_tokens"] = max(
+            0,
+            int(row.get("unpriced_tokens") or 0)
+            - int(today.get("unpriced_tokens") or 0),
+        )
         history_row = days.get(day.isoformat()) if isinstance(days, dict) else None
         if isinstance(history_row, dict):
             history_row["source_gap"] = gap
@@ -9067,6 +12558,10 @@ def restore_today_from_usage_history(output: dict[str, Any], day: date) -> None:
     ):
         today[key] = int(today.get(key) or 0) + int(gap.get(key) or 0)
     today["cost"] = round(float(today.get("cost") or 0) + float(gap.get("cost") or 0), 6)
+    today["unpriced_tokens"] = (
+        int(today.get("unpriced_tokens") or 0)
+        + int(gap.get("unpriced_tokens") or 0)
+    )
     if not isinstance(providers, list):
         return
     add_unattributed_provider_gap(output)
@@ -9107,6 +12602,12 @@ def add_unattributed_provider_gap(output: dict[str, Any]) -> None:
         "cache_creation_input_tokens": max(0, int(today.get("cache_creation_input_tokens") or 0) - int(provider_sum("cache_creation_input_tokens"))),
         "output_tokens": max(0, int(today.get("output_tokens") or 0) - int(provider_sum("output_tokens"))),
         "cost": round(max(0.0, float(today.get("cost") or 0) - provider_sum("cost")), 6),
+        "unpriced_tokens": max(
+            0,
+            int(today.get("unpriced_tokens") or 0)
+            - int(provider_sum("unpriced_tokens")),
+        ),
+        "unpriced_models": {},
         "models": {},
         "latest_at": str(today.get("latest_at") or ""),
         "latest_model": str(today.get("latest_model") or ""),
@@ -9126,6 +12627,10 @@ def bucket_to_dict(name: str, bucket: UsageBucket, show_zero: bool = False) -> d
         "output_tokens": bucket.output_tokens,
         "cost": round(bucket.cost, 6),
         "models": dict(sorted(bucket.models.items(), key=lambda item: item[1], reverse=True)[:8]),
+        "unpriced_tokens": bucket.unpriced_tokens,
+        "unpriced_models": dict(
+            sorted(bucket.unpriced_models.items(), key=lambda item: item[1], reverse=True)[:8]
+        ),
         "latest_at": latest_at_text(bucket),
         "latest_model": bucket.latest_model,
         "show_zero": show_zero,
@@ -9151,6 +12656,10 @@ def bucket_to_window_dict(bucket: UsageBucket, start: datetime, end: datetime) -
         "output_tokens": bucket.output_tokens,
         "cost": round(bucket.cost, 6),
         "models": dict(sorted(bucket.models.items(), key=lambda item: item[1], reverse=True)[:8]),
+        "unpriced_tokens": bucket.unpriced_tokens,
+        "unpriced_models": dict(
+            sorted(bucket.unpriced_models.items(), key=lambda item: item[1], reverse=True)[:8]
+        ),
         "start_at": start.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "end_at": end.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
     }
@@ -9256,6 +12765,22 @@ def prefer_more_complete_usage_buckets(
         ):
             result[label] = bucket
     return result
+
+
+def prefer_local_usage_buckets(
+    cockpit_fallback: dict[str, UsageBucket],
+    local_buckets: dict[str, UsageBucket],
+    *,
+    local_window_covered: bool,
+) -> dict[str, UsageBucket]:
+    """Choose one complete token source for a window, never a per-label mix.
+
+    Cockpit can establish a reset boundary and an account identity, but local
+    ``UsageEvent`` rows are the authoritative token ledger once their source
+    covered the window. If the source was unavailable, retain Cockpit as the
+    explicit fallback rather than treating an empty local map as a real zero.
+    """
+    return dict(local_buckets) if local_window_covered else dict(cockpit_fallback)
 
 
 def build_codex_window_stats(
@@ -9468,12 +12993,19 @@ def build_codex_window_stats(
         + list(aligned_starts_cycle.values())
     )
     rolling_7d_buckets = dict(direct_7d)
+    local_window_covered = False
     scan_starts = aligned_starts + [window_7d_start]
     if scan_starts:
         aligned_scan_start = min(scan_starts) - timedelta(
             seconds=max(0, QUOTA_WINDOW_START_TOLERANCE_SECONDS)
         )
         aligned_events = scan_all_codex_events(home, sessions_root, aligned_scan_start, window_end)
+        local_window_covered = bool(aligned_events) or local_codex_window_source_available(
+            home,
+            sessions_root,
+            aligned_scan_start,
+            window_end,
+        )
         speed_markers = codex_speed_history(home, aligned_scan_start, window_end)
         apply_codex_speed_fallback(aligned_events, speed_markers)
         aligned_markers = scan_cockpit_codex_switch_markers(home, aligned_scan_start, window_end)
@@ -9504,16 +13036,25 @@ def build_codex_window_stats(
             None,
             attribution_verdicts,
             record_verdicts=False,
+            preserve_direct_official_usage=True,
         )
         raw_5h = {label: UsageBucket() for label in aligned_starts_5h}
         raw_7d = {label: UsageBucket() for label in aligned_starts_7d}
         raw_cycle = {label: UsageBucket() for label in aligned_starts_cycle}
+        raw_rolling_5h: dict[str, UsageBucket] = {}
         raw_rolling_7d: dict[str, UsageBucket] = {}
         for label, account_events in attributed_events.items():
             for event in account_events:
                 resolved_label = label
                 event_time = usage_event_attribution_time(event)
                 multiplier = cost_multiplier_by_label.get(resolved_label, 1.0)
+                if event_time >= window_5h_start:
+                    add_codex_event_to_bucket(
+                        raw_rolling_5h.setdefault(resolved_label, UsageBucket()),
+                        event,
+                        multiplier,
+                        bucket_time=event_time,
+                    )
                 if event_time >= window_7d_start:
                     add_codex_event_to_bucket(
                         raw_rolling_7d.setdefault(resolved_label, UsageBucket()),
@@ -9522,15 +13063,53 @@ def build_codex_window_stats(
                         bucket_time=event_time,
                     )
                 if resolved_label in aligned_starts_5h and event_time >= aligned_starts_5h[resolved_label]:
-                    add_codex_event_to_bucket(raw_5h[resolved_label], event, multiplier, bucket_time=event_time)
+                    quota_5h = (quota_by_account.get(resolved_label) or {}).get("window_5h")
+                    if event_counts_toward_official_quota_window(event, quota_5h):
+                        add_codex_event_to_bucket(raw_5h[resolved_label], event, multiplier, bucket_time=event_time)
                 if resolved_label in aligned_starts_7d and event_time >= aligned_starts_7d[resolved_label]:
-                    add_codex_event_to_bucket(raw_7d[resolved_label], event, multiplier, bucket_time=event_time)
+                    quota_7d = (quota_by_account.get(resolved_label) or {}).get("window_7d")
+                    if event_counts_toward_official_quota_window(event, quota_7d):
+                        add_codex_event_to_bucket(raw_7d[resolved_label], event, multiplier, bucket_time=event_time)
                 if resolved_label in aligned_starts_cycle and event_time >= aligned_starts_cycle[resolved_label]:
-                    add_codex_event_to_bucket(raw_cycle[resolved_label], event, multiplier, bucket_time=event_time)
-        aligned_5h = prefer_more_complete_usage_buckets(aligned_5h, raw_5h)
-        aligned_7d = prefer_more_complete_usage_buckets(aligned_7d, raw_7d)
-        aligned_cycle = prefer_more_complete_usage_buckets(aligned_cycle, raw_cycle)
-        rolling_7d_buckets = prefer_more_complete_usage_buckets(rolling_7d_buckets, raw_rolling_7d)
+                    quota_cycle = (quota_by_account.get(resolved_label) or {}).get("window_cycle")
+                    if event_counts_toward_official_quota_window(event, quota_cycle):
+                        add_codex_event_to_bucket(raw_cycle[resolved_label], event, multiplier, bucket_time=event_time)
+        local_5h_buckets = dict(raw_rolling_5h)
+        # A quota-limited 5h window must use its filtered local bucket, not the
+        # wider analysis bucket that can contain external-model activity.
+        local_5h_buckets.update(raw_5h)
+        local_7d_buckets = dict(raw_rolling_7d)
+        local_7d_buckets.update(raw_7d)
+        aligned_5h = prefer_local_usage_buckets(
+            aligned_5h,
+            raw_5h,
+            local_window_covered=local_window_covered,
+        )
+        aligned_7d = prefer_local_usage_buckets(
+            aligned_7d,
+            raw_7d,
+            local_window_covered=local_window_covered,
+        )
+        aligned_cycle = prefer_local_usage_buckets(
+            aligned_cycle,
+            raw_cycle,
+            local_window_covered=local_window_covered,
+        )
+        buckets_5h = prefer_local_usage_buckets(
+            buckets_5h,
+            local_5h_buckets,
+            local_window_covered=local_window_covered,
+        )
+        buckets_7d = prefer_local_usage_buckets(
+            buckets_7d,
+            local_7d_buckets,
+            local_window_covered=local_window_covered,
+        )
+        rolling_7d_buckets = prefer_local_usage_buckets(
+            rolling_7d_buckets,
+            raw_rolling_7d,
+            local_window_covered=local_window_covered,
+        )
     buckets_5h.update(aligned_5h)
     buckets_7d.update(aligned_7d)
     buckets_cycle = aligned_cycle
@@ -9626,9 +13205,11 @@ def build_live_catchup_payload(
     if through <= since:
         return {
             "schema": 1,
+            "usage_accounting_schema": USAGE_ACCOUNTING_SCHEMA,
             "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
             "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
             "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
+            "opencodex_attribution_schema": OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA,
             "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
             "events": [],
@@ -9636,6 +13217,7 @@ def build_live_catchup_payload(
         }
 
     day_start = datetime.combine(since.date(), datetime.min.time())
+    record_current_opencodex_account_snapshot(home, through)
     session_lifecycle: dict[str, SessionLifecycle] = {}
     codex_events = scan_all_codex_events(
         home,
@@ -9773,6 +13355,8 @@ def build_live_catchup_payload(
             rows.append(
                 {
                     "event_id": live_usage_event_id(event),
+                    "canonical_id": str(event.canonical_id or ""),
+                    "supersedes_event_ids": list(event.supersedes_event_ids),
                     "when": aware_when.isoformat(timespec="microseconds"),
                     "provider": provider,
                     "model": event.model,
@@ -9784,6 +13368,8 @@ def build_live_catchup_payload(
                     "cached_tokens": event.cached_tokens,
                     "output_tokens": event.output_tokens,
                     "cost": round(event_bucket.cost, 12),
+                    "price_resolved": event_bucket.unpriced_tokens == 0,
+                    "unpriced_tokens": event_bucket.unpriced_tokens,
                 }
             )
     for event in grok_events:
@@ -9799,6 +13385,8 @@ def build_live_catchup_payload(
         rows.append(
             {
                 "event_id": live_usage_event_id(event),
+                "canonical_id": str(event.canonical_id or ""),
+                "supersedes_event_ids": list(event.supersedes_event_ids),
                 "when": aware_when.isoformat(timespec="microseconds"),
                 "provider": GROK_LOCAL_LABEL,
                 "model": event.model,
@@ -9810,14 +13398,18 @@ def build_live_catchup_payload(
                 "cached_tokens": event.cached_tokens,
                 "output_tokens": event.output_tokens,
                 "cost": round(event_bucket.cost, 12),
+                "price_resolved": event_bucket.unpriced_tokens == 0,
+                "unpriced_tokens": event_bucket.unpriced_tokens,
             }
         )
     rows.sort(key=lambda row: (str(row.get("when") or ""), str(row.get("event_id") or "")))
     return {
         "schema": 1,
+        "usage_accounting_schema": USAGE_ACCOUNTING_SCHEMA,
         "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
         "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
         "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
+        "opencodex_attribution_schema": OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA,
         "since": since.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "through": through.replace(tzinfo=LOCAL_TZ).isoformat(timespec="microseconds"),
         "events": rows,
@@ -9835,6 +13427,8 @@ def main() -> int:
     parser.add_argument("--date", default="")
     parser.add_argument("--include-30d", action="store_true")
     parser.add_argument("--backfill-history-details", action="store_true")
+    parser.add_argument("--offline-backfill", action="store_true")
+    parser.add_argument("--offline-backfill-run-id", default="")
     parser.add_argument("--quota-only", action="store_true")
     parser.add_argument("--live-since", default="")
     parser.add_argument("--live-through", default="")
@@ -9843,6 +13437,15 @@ def main() -> int:
     now = datetime.now()
     out = Path(args.output)
     home = Path(os.path.expanduser("~"))
+    if args.offline_backfill:
+        result = run_offline_backfill_worker(
+            home,
+            home / ".codex" / "sessions",
+            now,
+            args.offline_backfill_run_id,
+        )
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return 0 if result.get("state") != "error" else 1
     if args.live_since:
         since = parse_dt(args.live_since)
         through = parse_dt(args.live_through) if args.live_through else now
@@ -9862,7 +13465,10 @@ def main() -> int:
             json.dumps(
                 {
                     "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-                    "accounts": cockpit_codex_quota_by_label(home),
+                    "accounts": cockpit_codex_quota_by_label(
+                        home,
+                        force_active_official_refresh=True,
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -9888,6 +13494,7 @@ def main() -> int:
 
     codex_sessions_root = home / ".codex" / "sessions"
     record_current_account_snapshot(home, now)
+    record_current_opencodex_account_snapshot(home, now)
     attribution_ledger = load_attribution_ledger()
     attribution_verdicts = load_attribution_verdicts()
     current_label = current_codex_account_label(home)
@@ -9906,10 +13513,12 @@ def main() -> int:
         session_lifecycle=session_lifecycle,
         failure_events=codex_failures,
     )
+    today_reconciliation = last_opencodex_reconciliation_diagnostics()
     # A manual auth switch can happen during a long session scan. Re-read the
     # identity here and retain the auth file's mtime as the actual switch edge.
     snapshot_now = datetime.now()
     record_current_account_snapshot(home, snapshot_now)
+    record_current_opencodex_account_snapshot(home, snapshot_now)
     current_label = current_codex_account_label(home)
     desktop_log_roots = default_codex_desktop_log_roots()
     if desktop_log_roots:
@@ -10087,6 +13696,9 @@ def main() -> int:
         total.cache_read_input_tokens += bucket.cache_read_input_tokens
         total.output_tokens += bucket.output_tokens
         total.cost += bucket.cost
+        total.unpriced_tokens += bucket.unpriced_tokens
+        for model, tokens in bucket.unpriced_models.items():
+            total.unpriced_models[model] = total.unpriced_models.get(model, 0) + tokens
         total.mark_latest(bucket.latest_at, bucket.latest_model)
 
     latest_provider = ""
@@ -10159,9 +13771,11 @@ def main() -> int:
 
     output = {
         "schema": 1,
+        "usage_accounting_schema": USAGE_ACCOUNTING_SCHEMA,
         "claude_usage_schema": CLAUDE_USAGE_DEDUPE_SCHEMA,
         "cockpit_usage_schema": COCKPIT_USAGE_DEDUPE_SCHEMA,
         "grok_usage_schema": GROK_USAGE_DEDUPE_SCHEMA,
+        "opencodex_attribution_schema": OPENCODEX_ACCOUNT_ATTRIBUTION_SCHEMA,
         "source": "client-jsonl",
         "updated_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
         "date": day.isoformat(),
@@ -10186,19 +13800,32 @@ def main() -> int:
         "cockpit_fallback_events": cockpit_fallback_events,
         "dashboard": {
             "hourly_today": hourly_today,
+            "reconciliation": today_reconciliation,
         },
     }
-    offline_history: dict[str, Any] | None = None
-    offline_days: list[date] = []
-    if not args.date and day == now.date() and OFFLINE_HISTORY_BACKFILL_MAX_DAYS > 0:
-        offline_history = load_usage_history_for_backfill()
-        offline_days = offline_history_dates_to_reconcile(offline_history, now)
+    offline_queue_enabled = (
+        not args.date
+        and day == now.date()
+        and OFFLINE_HISTORY_BACKFILL_MAX_DAYS > 0
+    )
+    if offline_queue_enabled:
+        queued = read_offline_backfill_status()
         output["offline_catchup"] = {
-            "state": "running" if offline_days else "idle",
-            "started_at": now.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds"),
-            "from": min(offline_days).isoformat() if offline_days else "",
-            "through": max(offline_days).isoformat() if offline_days else "",
-            "scanned_days": len(offline_days),
+            key: value
+            for key, value in queued.items()
+            if key
+            in {
+                "state",
+                "run_id",
+                "queued_at",
+                "started_at",
+                "heartbeat_at",
+                "completed_at",
+                "next_check_at",
+                "retry_after",
+                "scanned_days",
+                "updated_days",
+            }
         }
     if args.include_30d:
         output["account_30d_updated_at"] = (
@@ -10212,19 +13839,27 @@ def main() -> int:
     restore_today_from_usage_history(output, day)
     add_unattributed_provider_gap(output)
     write_json_atomic(out, output)
-    if offline_history is not None:
-        catchup = backfill_offline_usage_history(
-            home,
-            codex_sessions_root,
-            now,
-            attribution_ledger,
-            history=offline_history,
-            target_days=offline_days,
-        )
-        output["offline_catchup"] = catchup
-        if offline_days or catchup.get("state") == "error":
+    if offline_queue_enabled:
+        queued = queue_offline_backfill_worker(out, datetime.now())
+        if isinstance(output.get("offline_catchup"), dict):
+            output["offline_catchup"] = {
+                key: value
+                for key, value in queued.items()
+                if key
+                in {
+                    "state",
+                    "run_id",
+                    "queued_at",
+                    "started_at",
+                    "heartbeat_at",
+                    "completed_at",
+                    "next_check_at",
+                    "retry_after",
+                    "scanned_days",
+                    "updated_days",
+                }
+            }
             write_json_atomic(out, output)
-        save_attribution_ledger(attribution_ledger, datetime.now(), attribution_verdicts)
     if args.backfill_history_details:
         backfill_usage_history_details(home, codex_sessions_root)
     logger.info(

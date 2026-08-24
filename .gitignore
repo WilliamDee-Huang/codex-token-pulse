@@ -25,6 +25,7 @@ client_usage_*.json
 client_usage_*.jsonl
 client_usage_*.jsonl.*
 .usage_history.json.*.tmp
+.offline-history-backfill.lock
 .client_usage_*.tmp
 *.corrupt-*
 *.bak
