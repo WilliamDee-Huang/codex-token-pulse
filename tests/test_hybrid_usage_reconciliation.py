@@ -509,7 +509,11 @@ class OfflineAccountingMigrationTests(unittest.TestCase):
             days[target.isoformat()] = row
         history = {
             "days": days,
-            "offline_sync": {"last_successful_at": now.isoformat()},
+            "offline_sync": {
+                "state": "complete",
+                "last_successful_at": now.isoformat(),
+                "through": (now.date() - timedelta(days=1)).isoformat(),
+            },
         }
         evidence = {now.date() - timedelta(days=offset) for offset in range(1, 9)}
 

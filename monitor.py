@@ -148,7 +148,17 @@ LIVE_USAGE_WATCH_FULL_SCAN_SECONDS = max(
     5.0,
     float(os.environ.get("TOKEN_PULSE_LIVE_USAGE_FULL_SCAN_SECONDS", "30")),
 )
-LIVE_USAGE_WATCH_HOT_FILE_LIMIT = 16
+LIVE_USAGE_WATCH_HOT_FILE_LIMIT = max(
+    16,
+    int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_HOT_FILE_LIMIT", "64")),
+)
+LIVE_USAGE_WATCH_HOT_POLL_LIMIT = max(
+    8,
+    min(
+        LIVE_USAGE_WATCH_HOT_FILE_LIMIT,
+        int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_HOT_POLL_LIMIT", "32")),
+    ),
+)
 AUTH_SWITCH_WATCH_INTERVAL_MS = max(
     500,
     int(os.environ.get("TOKEN_PULSE_AUTH_SWITCH_WATCH_INTERVAL_MS", "1000")),
@@ -177,6 +187,10 @@ LIVE_USAGE_VERIFY_DELAY_MS = max(
 LIVE_USAGE_EXPORT_IDLE_SECONDS = max(
     5,
     int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_EXPORT_IDLE_SECONDS", "30")),
+)
+LIVE_USAGE_SYNC_FRESH_SECONDS = max(
+    60,
+    int(os.environ.get("TOKEN_PULSE_LIVE_USAGE_SYNC_FRESH_SECONDS", "300")),
 )
 QUOTA_REFRESH_SECONDS = max(
     10,
@@ -1998,7 +2012,9 @@ def _refresh_usage_history_backup(history: dict[str, Any]) -> None:
         LOGGER.warning("usage history backup write failed: %s", backup_path)
 
 
-def _update_usage_history_unlocked(state: "MonitorState") -> dict[str, Any]:
+def _update_usage_history_unlocked(
+    state: "MonitorState", *, day_key: str | None = None
+) -> dict[str, Any]:
     # Copy the shared cached layers before mutating: readers on other threads
     # may still hold the object returned by load_usage_history().
     history = dict(load_usage_history())
@@ -2006,7 +2022,7 @@ def _update_usage_history_unlocked(state: "MonitorState") -> dict[str, Any]:
     days = dict(days) if isinstance(days, dict) else {}
     history["days"] = days
 
-    key = today_key()
+    key = day_key or today_key()
     existing = days.get(key) if isinstance(days.get(key), dict) else {}
     new_cost = float(state.today_account_cost or 0)
     new_tokens = int(state.today_tokens or 0)
@@ -2159,14 +2175,16 @@ def _update_usage_history_unlocked(state: "MonitorState") -> dict[str, Any]:
     return summarize_usage_history(history)
 
 
-def update_usage_history(state: "MonitorState") -> dict[str, Any]:
+def update_usage_history(
+    state: "MonitorState", *, day_key: str | None = None
+) -> dict[str, Any]:
     global _USAGE_HISTORY_CACHE
     try:
         with usage_history_write_lock():
             # The worker may have committed while the monitor held a cached
             # snapshot. Reload inside the shared transaction before mutating.
             _USAGE_HISTORY_CACHE = None
-            return _update_usage_history_unlocked(state)
+            return _update_usage_history_unlocked(state, day_key=day_key)
     except (OSError, TimeoutError):
         LOGGER.warning("usage history transaction failed: %s", USAGE_HISTORY_JSON)
         _USAGE_HISTORY_CACHE = None
@@ -2195,10 +2213,37 @@ def relative_time(value: str | None) -> str:
     return f"{hours // 24}天前"
 
 
+def usage_sync_has_live_coverage(
+    sync: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if not isinstance(sync, dict) or not bool(
+        sync.get("live_overlay_covers_cache")
+    ):
+        return False
+    value = str(sync.get("live_overlay_latest_at") or "").strip()
+    if not value:
+        return False
+    try:
+        latest = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=CN_TZ)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=CN_TZ)
+        age = (current.astimezone(timezone.utc) - latest.astimezone(timezone.utc)).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return -5.0 <= age <= LIVE_USAGE_SYNC_FRESH_SECONDS
+
+
 def usage_sync_label(sync: dict[str, Any] | None) -> str:
     if not isinstance(sync, dict):
         return ""
     state = str(sync.get("state") or "").lower()
+    if state == "timeout" and usage_sync_has_live_coverage(sync):
+        return "\u5b9e\u65f6\u7edf\u8ba1\u4e2d / \u5168\u91cf\u6838\u5bf9\u6392\u961f"
     labels = {
         "partial": "\u4eca\u65e5\u5df2\u66f4\u65b0 / \u5386\u53f2\u8865\u5f55\u672a\u5b8c\u6210",
         "timeout": "\u8865\u5f55\u8d85\u65f6 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
@@ -2233,7 +2278,7 @@ def account_usage_sort_key(row: dict[str, Any], account_range: str) -> tuple[Any
         requests = int(row.get("requests") or 0)
     except (TypeError, ValueError):
         requests = 0
-    if account_range == "today":
+    if account_range in {"today", "30d"}:
         return (-tokens, -requests, name)
     latest_at = str(
         row.get("latest_at")
@@ -2290,6 +2335,15 @@ def account_has_weekly_quota(row: dict[str, Any] | None) -> bool:
     if "quota_available" in window:
         return bool(window.get("quota_available"))
     return window.get("utilization") is not None or window.get("remaining_percent") is not None
+
+
+def account_has_5h_quota(row: dict[str, Any] | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    window = row.get("window_5h")
+    if not isinstance(window, dict) or not window or window.get("quota_stale"):
+        return False
+    return bool(window.get("quota_available"))
 
 
 def account_should_remain_visible(
@@ -2537,17 +2591,30 @@ class WindowsDirectoryChangeSignal:
 class CodexUsageFileWatcher:
     """Detect appended token_count records with hot-file and fallback scans."""
 
-    def __init__(self, sessions_root: Path, max_read_bytes: int = LIVE_USAGE_WATCH_READ_BYTES) -> None:
+    def __init__(
+        self,
+        sessions_root: Path,
+        max_read_bytes: int = LIVE_USAGE_WATCH_READ_BYTES,
+        *,
+        initial_since: datetime | None = None,
+    ) -> None:
         self.sessions_root = sessions_root
         self.max_read_bytes = max(4096, int(max_read_bytes))
+        self.initial_since = (
+            initial_since.astimezone(timezone.utc)
+            if isinstance(initial_since, datetime)
+            else None
+        )
         self._files: dict[Path, tuple[int, int]] = {}
         self._hot_files: dict[Path, int] = {}
+        self._hot_poll_cursor = 0
         self._recent_dir_mtimes: dict[Path, int] = {}
         self._seen_events: dict[tuple[Any, ...], None] = {}
         self._last_cumulative_by_path: dict[Path, tuple[int, int, int, int]] = {}
         self._fork_replay_cutoffs: dict[Path, datetime | None] = {}
         self._last_full_scan_at = float("-inf")
         self._last_activity_at = time.monotonic()
+        self._activity_observed = False
         self._primed = False
         self.token_count_changed = False
         self.reconciliation_needed = False
@@ -2598,6 +2665,22 @@ class CodexUsageFileWatcher:
         while len(self._hot_files) > LIVE_USAGE_WATCH_HOT_FILE_LIMIT:
             coldest = min(self._hot_files, key=self._hot_files.get)
             self._hot_files.pop(coldest, None)
+
+    def _hot_poll_paths(self) -> set[Path]:
+        paths = list(self._hot_files)
+        count = len(paths)
+        if count <= LIVE_USAGE_WATCH_HOT_POLL_LIMIT:
+            self._hot_poll_cursor = 0
+            return set(paths)
+        start = self._hot_poll_cursor % count
+        selected = [
+            paths[(start + offset) % count]
+            for offset in range(LIVE_USAGE_WATCH_HOT_POLL_LIMIT)
+        ]
+        self._hot_poll_cursor = (
+            start + LIVE_USAGE_WATCH_HOT_POLL_LIMIT
+        ) % count
+        return set(selected)
 
     def _fork_replay_cutoff(self, path: Path) -> datetime | None:
         if path in self._fork_replay_cutoffs:
@@ -2683,7 +2766,10 @@ class CodexUsageFileWatcher:
         return LIVE_USAGE_WATCH_COLD_INTERVAL_MS
 
     def has_recent_activity(self, window_seconds: float) -> bool:
-        return time.monotonic() - self._last_activity_at <= max(0.0, float(window_seconds))
+        return self._activity_observed and (
+            time.monotonic() - self._last_activity_at
+            <= max(0.0, float(window_seconds))
+        )
 
     def reconciliation_ready(self, quiet_seconds: float) -> bool:
         if not self.reconciliation_needed:
@@ -2763,7 +2849,10 @@ class CodexUsageFileWatcher:
             if now >= expires_at:
                 self._reconciliation_paths.pop(watched_path, None)
         activity_detected = False
-        paths = set(self._hot_files)
+        # Native notifications are still consumed below immediately. Rotate a
+        # bounded fallback shard so 64 tracked sessions do not require 640+
+        # stat calls per second when only a handful are currently writing.
+        paths = self._hot_poll_paths()
         native_overflow = False
         if self._directory_changes is not None:
             notified_paths, native_overflow = self._directory_changes.drain()
@@ -2800,7 +2889,16 @@ class CodexUsageFileWatcher:
             current = (size, modified_ns)
             previous = self._files.get(path)
             self._files[path] = current
-            self._remember_hot_file(path, modified_ns)
+            if previous != current:
+                # Windows can defer LastWriteTime updates while Codex keeps a
+                # rollout handle open. Promote observed size changes with the
+                # current clock so a busy file is not evicted by older mtimes.
+                hot_score = (
+                    modified_ns
+                    if not was_primed
+                    else max(modified_ns, time.time_ns())
+                )
+                self._remember_hot_file(path, hot_score)
             if previous == current:
                 continue
             if was_primed and path in self._reconciliation_paths:
@@ -2810,7 +2908,18 @@ class CodexUsageFileWatcher:
                 activity_detected = True
             if not was_primed:
                 data = self._read_region(path, max(0, size - self.max_read_bytes), size)
-                self._extract_live_events(path, data)
+                extracted = self._extract_live_events(path, data)
+                if self.initial_since is not None:
+                    recovered = [
+                        event
+                        for event in extracted
+                        if isinstance(event.get("when"), datetime)
+                        and event["when"] > self.initial_since
+                    ]
+                    if recovered:
+                        live_events.extend(recovered)
+                        token_count_changed = True
+                        activity_detected = True
                 continue
             if previous is None:
                 scan_start = max(0, size - self.max_read_bytes)
@@ -2823,10 +2932,13 @@ class CodexUsageFileWatcher:
                 continue
             token_count_changed = True
             extracted = self._extract_live_events(path, data)
-            # A brand-new rollout may contain a copied fork prefix. Keep all of
-            # its events provisional during the observation window so delayed
-            # fork metadata cannot make the visible total jump and then fall.
-            if previous is None:
+            # Unknown new rollouts stay provisional because delayed fork
+            # metadata may reveal a copied prefix. When session_meta already
+            # identifies a normal rollout (cached None) or a fork cutoff
+            # (cached datetime), _extract_live_events has enough information to
+            # emit the safe rows immediately.
+            metadata_known = path in self._fork_replay_cutoffs
+            if previous is None and not metadata_known:
                 self.reconciliation_needed = True
                 self._reconciliation_paths[path] = now + LIVE_USAGE_NEW_ROLLOUT_WATCH_SECONDS
                 self._last_reconciliation_change_at = now
@@ -2835,7 +2947,9 @@ class CodexUsageFileWatcher:
 
         if activity_detected:
             self._last_activity_at = now
+            self._activity_observed = True
         self._primed = True
+        self.initial_since = None
         self.token_count_changed = token_count_changed
         return live_events
 
@@ -3996,6 +4110,20 @@ def _concrete_live_provider(value: Any) -> str:
     return label
 
 
+def _concrete_live_model(value: Any) -> str:
+    model = str(value or "").strip()
+    if model.casefold() in {
+        "",
+        "-",
+        "unknown",
+        "untracked",
+        "none",
+        "null",
+    }:
+        return ""
+    return model
+
+
 def scan_live_codex_active_sessions(
     sessions_root: Path,
     cached_sessions: list[dict[str, Any]] | None = None,
@@ -4223,7 +4351,11 @@ def scan_live_codex_active_sessions(
                 cached_provider if same_turn_cached_provider else ""
             )
         else:
-            provider = cached_provider or current_label or matched_label
+            # Official direct mode has one process-wide auth identity. A
+            # cached session provider describes the previous refresh and can
+            # survive an account switch indefinitely, so the current auth
+            # timeline must win for every newly observed usage snapshot.
+            provider = current_label or cached_provider or matched_label
         if not provider:
             if api_service_route:
                 provider = (
@@ -4683,6 +4815,20 @@ def load_client_usage(
             "dashboard": data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {},
             "updated_at": data.get("updated_at") or "",
             "date": data_date,
+            # Totals from a prior day are intentionally discarded, but schema
+            # identity still describes the cache format. Keeping it lets a
+            # valid same-day live checkpoint survive a restart before the
+            # heavyweight exporter has produced today's authoritative file.
+            "schema": int(data.get("schema") or 0),
+            "usage_accounting_schema": int(
+                data.get("usage_accounting_schema") or 0
+            ),
+            "claude_usage_schema": int(data.get("claude_usage_schema") or 0),
+            "cockpit_usage_schema": int(data.get("cockpit_usage_schema") or 0),
+            "grok_usage_schema": int(data.get("grok_usage_schema") or 0),
+            "opencodex_attribution_schema": int(
+                data.get("opencodex_attribution_schema") or 0
+            ),
             "stale": True,
             "sync": sync_status,
         }
@@ -6148,11 +6294,67 @@ class FloatingMonitorApp:
         self._live_usage_verification_pending = False
         self._live_usage_verification_latest_when: datetime | None = None
         self._live_usage_verification_pending_tokens = 0
+        self._live_quota_reconcile_since: datetime | None = None
         self._last_live_checkpoint_write_at = float("-inf")
+        self._last_live_history_write_at = float("-inf")
         self._live_reconcile_scheduled = False
         self._live_initial_recheck_scheduled = False
         self._last_live_reconcile_at = float("-inf")
         self._restore_live_usage_checkpoint()
+        checkpoint_since = (
+            self._live_usage_overlay.get("latest_when")
+            if isinstance(self._live_usage_overlay, dict)
+            else None
+        )
+        if not isinstance(checkpoint_since, datetime) and self.state is not None:
+            client_usage = (
+                self.state.client_usage
+                if isinstance(self.state.client_usage, dict)
+                else {}
+            )
+            scan_status = (
+                client_usage.get("scan_status")
+                if isinstance(client_usage.get("scan_status"), dict)
+                else {}
+            )
+            checkpoint_since = _parse_time(
+                str(
+                    scan_status.get("through")
+                    or client_usage.get("updated_at")
+                    or ""
+                )
+            )
+            day_start = datetime.combine(
+                datetime.now(CN_TZ).date(),
+                datetime.min.time(),
+                tzinfo=CN_TZ,
+            ).astimezone(timezone.utc)
+            if (
+                not isinstance(checkpoint_since, datetime)
+                or checkpoint_since < day_start
+                or checkpoint_since > datetime.now(timezone.utc) + timedelta(seconds=5)
+            ):
+                checkpoint_since = None
+        if isinstance(checkpoint_since, datetime):
+            # The normal prime deliberately discards existing rows. Re-prime
+            # from either the persisted live cutoff or the last complete scan
+            # so a restart during continuous traffic does not leave a gap even
+            # when the heavyweight current-day catch-up must wait for idle.
+            self._live_usage_watcher.close()
+            self._live_usage_watcher = CodexUsageFileWatcher(
+                Path.home() / ".codex" / "sessions",
+                initial_since=checkpoint_since,
+            )
+            try:
+                startup_events = self._live_usage_watcher.poll_events()
+            except Exception:
+                startup_events = []
+            if startup_events:
+                self._record_live_usage_events(
+                    startup_events,
+                    allow_historical=True,
+                    animate=False,
+                )
         self._pulse_phase = 0.0
         self._pulse_tick_scheduled = False
         self._token_flow_samples: list[tuple[float, int]] = []
@@ -6289,7 +6491,10 @@ class FloatingMonitorApp:
         self._schedule_live_active_refresh()
         self._schedule_auth_switch_refresh()
         self._schedule_live_usage_refresh()
-        self._refresh_live_usage_catchup_async()
+        # Give the watcher a moment to observe active writers. A startup
+        # catch-up scans the whole current day, which is useful after downtime
+        # but needlessly competes with continuously running Codex sessions.
+        self.root.after(2_000, self._start_initial_live_catchup)
         self._schedule_midnight_refresh()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -7840,6 +8045,11 @@ class FloatingMonitorApp:
                     continue
                 quota_available = bool(window.get("quota_available", window.get("utilization") is not None))
                 quota_unlimited = bool(window.get("quota_unlimited"))
+                if key == "window_5h" and not quota_available and not quota_unlimited:
+                    # A 7d-only Pro account can still have rolling 5h analysis
+                    # counters. They are not an official quota window and must
+                    # not be presented as one on the Token Budget page.
+                    continue
                 try:
                     utilization = float(window.get("utilization") or 0)
                 except (TypeError, ValueError):
@@ -8768,6 +8978,9 @@ class FloatingMonitorApp:
         #  HEADER  (row y=10..48)
         # ════════════════════════════════════════════════════════
         sync_state = str((self.state.usage_sync or {}).get("state") or "") if self.state else ""
+        live_sync_coverage = usage_sync_has_live_coverage(
+            self.state.usage_sync if self.state else None
+        )
         verifying_live_usage = bool(
             getattr(self, "_live_usage_verification_pending", False)
         )
@@ -8783,7 +8996,9 @@ class FloatingMonitorApp:
         elif verifying_live_usage:
             pulse_color = Theme.warn
         elif self.state:
-            if sync_state in {"timeout", "error", "unavailable", "stale"}:
+            if sync_state == "timeout" and live_sync_coverage:
+                pulse_color = Theme.warn
+            elif sync_state in {"timeout", "error", "unavailable", "stale"}:
                 pulse_color = Theme.coral
             elif sync_state == "partial":
                 pulse_color = Theme.warn
@@ -9314,6 +9529,11 @@ class FloatingMonitorApp:
                 window_cost = float(window.get("cost") or 0)
                 has_quota = bool(window.get("quota_available", window.get("utilization") is not None))
                 quota_unlimited = bool(window.get("quota_unlimited"))
+                if self._account_range == "5h" and not account_has_5h_quota(account):
+                    # The 5h tab is an official quota-window view. Rolling
+                    # analysis usage for an unlimited account belongs in
+                    # Usage Stats and must not create a synthetic quota row.
+                    continue
                 if (
                     window_tokens <= 0
                     and window_requests <= 0
@@ -10109,14 +10329,76 @@ class FloatingMonitorApp:
                 if marker_changed:
                     self._draw()
                 return
+            live_models_by_provider: dict[str, tuple[datetime, str]] = {}
+            for session in sessions:
+                if not isinstance(session, dict):
+                    continue
+                provider_key = account_display_key(session.get("provider"))
+                model = _concrete_live_model(session.get("model"))
+                latest_at = _parse_time(str(session.get("latest_at") or ""))
+                if not provider_key or not model or latest_at is None:
+                    continue
+                previous = live_models_by_provider.get(provider_key)
+                if previous is None or latest_at > previous[0]:
+                    live_models_by_provider[provider_key] = (latest_at, model)
+            for session in sessions:
+                if not isinstance(session, dict) or _concrete_live_model(
+                    session.get("model")
+                ):
+                    continue
+                known = live_models_by_provider.get(
+                    account_display_key(session.get("provider"))
+                )
+                if known is not None:
+                    session["model"] = known[1]
             self.state.client_usage["active_sessions"] = sessions
             self.state.active_accounts = local_active_accounts_from_client_usage(
                 self.state.client_usage
             )
             self._promote_pending_latest_account_from_sessions(sessions)
+            self._synchronize_account_activity_flags(self.state)
             self._draw()
         finally:
             self._live_active_lock.release()
+
+    def _synchronize_account_activity_flags(
+        self,
+        state: MonitorState | None = None,
+    ) -> None:
+        current_state = state or self.state
+        if current_state is None:
+            return
+        active_keys: set[str] = set()
+        for account in current_state.active_accounts or []:
+            if not isinstance(account, dict):
+                continue
+            key = account_display_key(
+                account.get("provider") or account.get("name")
+            )
+            if key:
+                active_keys.add(key)
+
+        latest_provider = ""
+        if isinstance(current_state.latest_request, dict):
+            latest_provider = str(
+                current_state.latest_request.get("provider") or ""
+            )
+        if not latest_provider:
+            latest_provider = str(current_state.latest_account_name or "")
+        current_label = _current_codex_account_label()
+        if current_label and not is_local_api_service_provider_name(current_label):
+            # The direct auth identity is the strongest signal for which
+            # account should lead 5h/7d while it is being used. The latest
+            # request remains the fallback for API-service multi-account mode.
+            latest_provider = current_label
+        latest_key = account_display_key(latest_provider)
+
+        for row in current_state.top_accounts or []:
+            if not isinstance(row, dict):
+                continue
+            row_key = account_display_key(row.get("name"))
+            row["active_now"] = bool(row_key and row_key in active_keys)
+            row["is_latest"] = bool(row_key and row_key == latest_key)
 
     def _promote_pending_latest_account_from_sessions(
         self,
@@ -10768,6 +11050,25 @@ class FloatingMonitorApp:
             if "reconciled_event_ids" in overlay:
                 overlay.pop("reconciled_event_ids", None)
                 changed = True
+        quota_reconcile_since = getattr(
+            self,
+            "_live_quota_reconcile_since",
+            None,
+        )
+        quota_reconcile_text = (
+            quota_reconcile_since.astimezone(timezone.utc).isoformat(
+                timespec="microseconds"
+            )
+            if isinstance(quota_reconcile_since, datetime)
+            else ""
+        )
+        if quota_reconcile_text:
+            if overlay.get("quota_reconcile_since") != quota_reconcile_text:
+                overlay["quota_reconcile_since"] = quota_reconcile_text
+                changed = True
+        elif "quota_reconcile_since" in overlay:
+            overlay.pop("quota_reconcile_since", None)
+            changed = True
         return changed
 
     def _restore_live_reconciliation_metadata(self, overlay: dict[str, Any]) -> None:
@@ -10805,6 +11106,19 @@ class FloatingMonitorApp:
         if isinstance(seen_ids, dict):
             for event_id in (*aliases.keys(), *aliases.values(), *reconciled.keys()):
                 seen_ids[event_id] = None
+        quota_reconcile_since = _parse_time(
+            str(overlay.get("quota_reconcile_since") or "")
+        )
+        if quota_reconcile_since is not None:
+            self._live_quota_reconcile_since = quota_reconcile_since
+            self._live_usage_verification_pending = True
+            pending_latest = getattr(
+                self,
+                "_live_usage_verification_latest_when",
+                None,
+            )
+            if not isinstance(pending_latest, datetime):
+                self._live_usage_verification_latest_when = quota_reconcile_since
 
     def _clear_live_usage_checkpoint(self) -> None:
         try:
@@ -10839,6 +11153,212 @@ class FloatingMonitorApp:
         self._last_live_checkpoint_write_at = now_clock
         return True
 
+    def _update_live_usage_history_if_due(self) -> bool:
+        # Tests and lightweight object fixtures created via __new__ deliberately
+        # do not own the application's history writer.
+        if not hasattr(self, "_last_live_history_write_at") or self.state is None:
+            return False
+        now_clock = time.monotonic()
+        if now_clock - self._last_live_history_write_at < 60.0:
+            return False
+        try:
+            self.state.cost_history = update_usage_history(self.state)
+        except Exception:
+            LOGGER.warning("live usage history update failed")
+            return False
+        self._last_live_history_write_at = now_clock
+        return True
+
+    def _rebase_restored_live_quota_windows(
+        self,
+        overlay: dict[str, Any],
+        base_state: MonitorState | None = None,
+    ) -> None:
+        quota_targets = overlay.get("quota_windows")
+        provider_targets = overlay.get("providers")
+        if not isinstance(quota_targets, dict) or not isinstance(provider_targets, dict):
+            return
+        numeric_fields = (
+            "requests",
+            "tokens",
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+            "unpriced_tokens",
+        )
+        # A canonical catch-up always returns absolute provider totals for the
+        # whole day, but its event rows begin at the requested cutoff. During
+        # concurrent sessions the live watcher can advance that cutoff after
+        # observing one hot file while another file still has unseen events.
+        # Seed stable quota windows from the authoritative base so the absolute
+        # provider delta below can repair those missing rows as well.
+        for provider, account_target in provider_targets.items():
+            if (
+                not isinstance(account_target, dict)
+                or not bool(account_target.get("replace_existing"))
+            ):
+                continue
+            rows = self._live_quota_provider_rows(
+                str(provider),
+                base_state or self.state,
+            )
+            if not rows:
+                continue
+            provider_windows = quota_targets.setdefault(str(provider), {})
+            if not isinstance(provider_windows, dict):
+                continue
+            target_latest = account_target.get("latest_when")
+            if not isinstance(target_latest, datetime):
+                target_latest = _parse_time(str(target_latest or ""))
+            for window_key in ("window_5h", "window_7d", "window_cycle"):
+                if isinstance(provider_windows.get(window_key), dict):
+                    continue
+                candidates = [
+                    window
+                    for row in rows
+                    if isinstance((window := row.get(window_key)), dict)
+                    and self._live_quota_window_signature(window) is not None
+                ]
+                if not candidates:
+                    continue
+                current = max(
+                    candidates,
+                    key=lambda window: (
+                        str(window.get("end_at") or ""),
+                        int(window.get("tokens") or 0),
+                    ),
+                )
+                signature = self._live_quota_window_signature(current)
+                current_through = _parse_time(
+                    str(current.get("end_at") or current.get("latest_at") or "")
+                )
+                if signature is None or current_through is None:
+                    continue
+                window_minutes, reset_text = signature
+                reset_at = _parse_time(reset_text)
+                if reset_at is None:
+                    continue
+                start_at = reset_at - timedelta(minutes=window_minutes)
+                if not start_at <= current_through < reset_at:
+                    continue
+                if isinstance(target_latest, datetime) and target_latest >= reset_at:
+                    # The absolute provider delta crosses a reset. Only exact
+                    # event replay may decide which side of that boundary owns it.
+                    continue
+                provider_windows[window_key] = {
+                    "signature": list(signature),
+                    "start_at": start_at,
+                    "resets_at": reset_at,
+                    "base_through": current_through,
+                    "replace_existing": False,
+                    **{
+                        f"base_{field}": max(0, int(current.get(field) or 0))
+                        for field in numeric_fields
+                    },
+                    "base_cost": max(0.0, float(current.get("cost") or 0.0)),
+                    "base_models": dict(current.get("models") or {}),
+                    "base_unpriced_models": dict(
+                        current.get("unpriced_models") or {}
+                    ),
+                    **{field: 0 for field in numeric_fields},
+                    "cost": 0.0,
+                    "models": {},
+                    "unpriced_models": {},
+                    "event_ids": {},
+                    "latest_when": current_through,
+                    "latest_model": str(current.get("latest_model") or ""),
+                }
+        for provider, windows in quota_targets.items():
+            account_target = provider_targets.get(provider)
+            rows = self._live_quota_provider_rows(
+                str(provider),
+                base_state or self.state,
+            )
+            if not isinstance(windows, dict) or not isinstance(account_target, dict) or not rows:
+                continue
+            account_row = max(rows, key=lambda row: int(row.get("tokens") or 0))
+            account_total = int(account_target.get("base_tokens") or 0) + int(
+                account_target.get("tokens") or 0
+            )
+            pending_tokens = max(0, account_total - int(account_row.get("tokens") or 0))
+            target_models = dict(account_target.get("base_models") or {})
+            for model, tokens in dict(account_target.get("models") or {}).items():
+                target_models[str(model)] = int(target_models.get(str(model)) or 0) + int(
+                    tokens or 0
+                )
+            current_models = dict(account_row.get("models") or {})
+            pending_models = {
+                str(model): max(0, int(tokens or 0) - int(current_models.get(str(model)) or 0))
+                for model, tokens in target_models.items()
+                if self._live_event_counts_toward_official_quota({"model": model})
+                and int(tokens or 0) > int(current_models.get(str(model)) or 0)
+            }
+            if sum(pending_models.values()) != pending_tokens:
+                continue
+            for window_key, target in windows.items():
+                if not isinstance(target, dict):
+                    continue
+                signature = tuple(target.get("signature") or ())
+                candidates = [
+                    window
+                    for row in rows
+                    if isinstance((window := row.get(window_key)), dict)
+                    and self._live_quota_window_signature(window) == signature
+                ]
+                if not candidates:
+                    continue
+                current = max(
+                    candidates,
+                    key=lambda window: (
+                        str(window.get("end_at") or ""),
+                        int(window.get("tokens") or 0),
+                    ),
+                )
+                current_through = _parse_time(str(current.get("end_at") or ""))
+                previous_through = _parse_time(str(target.get("base_through") or ""))
+                replace_account = bool(account_target.get("replace_existing"))
+                if current_through is None or (
+                    previous_through is not None
+                    and previous_through > current_through
+                    and not replace_account
+                ):
+                    continue
+                if (
+                    previous_through is not None
+                    and previous_through >= current_through
+                ):
+                    expected_tokens = int(current.get("tokens") or 0) + pending_tokens
+                    recorded_tokens = int(target.get("base_tokens") or 0) + int(
+                        target.get("tokens") or 0
+                    )
+                    if recorded_tokens == expected_tokens or (
+                        recorded_tokens > expected_tokens
+                        and not replace_account
+                    ):
+                        continue
+                for field in numeric_fields:
+                    target[f"base_{field}"] = max(0, int(current.get(field) or 0))
+                    account_total_field = int(account_target.get(f"base_{field}") or 0) + int(
+                        account_target.get(field) or 0
+                    )
+                    target[field] = max(0, account_total_field - int(account_row.get(field) or 0))
+                target["tokens"] = pending_tokens
+                target["base_cost"] = max(0.0, float(current.get("cost") or 0.0))
+                account_total_cost = float(account_target.get("base_cost") or 0.0) + float(
+                    account_target.get("cost") or 0.0
+                )
+                target["cost"] = max(0.0, account_total_cost - float(account_row.get("cost") or 0.0))
+                target["base_models"] = dict(current.get("models") or {})
+                target["models"] = pending_models
+                target["base_unpriced_models"] = dict(current.get("unpriced_models") or {})
+                target["base_through"] = current_through
+                target["replace_existing"] = False
+                latest_when = account_target.get("latest_when")
+                if isinstance(latest_when, datetime):
+                    target["latest_when"] = latest_when
+                target["latest_model"] = str(account_target.get("latest_model") or "")
+
     def _restore_live_usage_checkpoint(self) -> bool:
         if self.state is None:
             return False
@@ -10865,12 +11385,20 @@ class FloatingMonitorApp:
         overlay_accounting_schema = self._usage_accounting_schema(
             raw_overlay.get("usage_accounting_schema")
         )
-        if (
-            checkpoint_accounting_schema != current_accounting_schema
-            or overlay_accounting_schema != current_accounting_schema
+        if checkpoint_accounting_schema != overlay_accounting_schema or (
+            current_accounting_schema > 0
+            and checkpoint_accounting_schema != current_accounting_schema
         ):
             self._clear_live_usage_checkpoint()
             return False
+        if current_accounting_schema == 0 and checkpoint_accounting_schema > 0:
+            # A missing or previous-day authoritative cache has no current
+            # schema of its own. The same-day checkpoint remains valid and is
+            # the only durable source for usage accumulated before restart.
+            if isinstance(self.state.client_usage, dict):
+                self.state.client_usage["usage_accounting_schema"] = (
+                    checkpoint_accounting_schema
+                )
         try:
             base_tokens = max(0, int(raw_overlay.get("base_today_tokens") or 0))
             delta_tokens = max(0, int(raw_overlay.get("tokens") or 0))
@@ -10895,6 +11423,9 @@ class FloatingMonitorApp:
         latest_when = _parse_time(str(overlay.get("latest_when") or ""))
         if latest_when is not None:
             overlay["latest_when"] = latest_when
+        catchup_through = _parse_time(str(overlay.get("catchup_through") or ""))
+        if catchup_through is not None:
+            overlay["catchup_through"] = catchup_through
         providers = overlay.get("providers")
         if isinstance(providers, dict):
             for target in providers.values():
@@ -10908,6 +11439,11 @@ class FloatingMonitorApp:
         if not exact_base:
             remaining_tokens = max(0, target_tokens - current_tokens)
             ratio = remaining_tokens / delta_tokens if delta_tokens > 0 else 0.0
+            preserved_provider_targets = {
+                str(provider): dict(target)
+                for provider, target in dict(overlay.get("providers") or {}).items()
+                if isinstance(target, dict) and bool(target.get("replace_existing"))
+            }
             current_client_usage = (
                 self.state.client_usage
                 if isinstance(self.state.client_usage, dict)
@@ -10942,9 +11478,15 @@ class FloatingMonitorApp:
                     "input_tokens": int(max(0, int(overlay.get("input_tokens") or 0)) * ratio),
                     "cached_input_tokens": int(max(0, int(overlay.get("cached_input_tokens") or 0)) * ratio),
                     "output_tokens": int(max(0, int(overlay.get("output_tokens") or 0)) * ratio),
-                    "providers": {},
+                    # Catch-up provider rows are absolute, fixed-cutoff totals.
+                    # They remain valid when a newer base snapshot partially
+                    # covers the global delta; ordinary optimistic provider
+                    # deltas are still dropped because they cannot be scaled
+                    # safely without event-level attribution.
+                    "providers": preserved_provider_targets,
                 }
             )
+        self._rebase_restored_live_quota_windows(overlay)
         self._live_usage_overlay = overlay
         self._apply_live_usage_overlay(self.state)
         self._last_live_checkpoint_write_at = time.monotonic()
@@ -10956,13 +11498,15 @@ class FloatingMonitorApp:
         candidates: list[tuple[datetime, bool]] = []
         overlay = self._live_usage_overlay
         if isinstance(overlay, dict):
-            parsed = overlay.get("latest_when")
+            # Reconcile from the last canonical catch-up, not the newest
+            # optimistic watcher event. Otherwise an overcount before that
+            # event can never be revisited and corrected.
+            parsed = overlay.get("catchup_through")
             if isinstance(parsed, datetime):
                 candidates.append((parsed, False))
         client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
         scan_status = client_usage.get("scan_status") if isinstance(client_usage.get("scan_status"), dict) else {}
         for value in (
-            (self.state.latest_request or {}).get("created_at") if isinstance(self.state.latest_request, dict) else "",
             (client_usage.get("latest_request") or {}).get("created_at")
             if isinstance(client_usage.get("latest_request"), dict)
             else "",
@@ -10991,7 +11535,15 @@ class FloatingMonitorApp:
                 since -= timedelta(microseconds=1)
         else:
             since = day_start
-        if since < day_start:
+        quota_reconcile_since = getattr(self, "_live_quota_reconcile_since", None)
+        if isinstance(quota_reconcile_since, datetime):
+            if quota_reconcile_since.tzinfo is None:
+                quota_reconcile_since = quota_reconcile_since.replace(tzinfo=CN_TZ)
+            # An official quota reset can predate the normal canonical cutoff.
+            # Revisit the full new cycle once so its window is rebuilt from
+            # local event detail instead of the watcher's short in-memory tail.
+            since = min(since, quota_reconcile_since.astimezone(timezone.utc))
+        if since < day_start and not isinstance(quota_reconcile_since, datetime):
             return day_start
         return min(since, now)
 
@@ -11021,6 +11573,24 @@ class FloatingMonitorApp:
             through = _parse_time(str(payload.get("through") or ""))
             if through is None:
                 return
+            payload_since = _parse_time(str(payload.get("since") or ""))
+            quota_reconcile_since = getattr(
+                self,
+                "_live_quota_reconcile_since",
+                None,
+            )
+            if isinstance(quota_reconcile_since, datetime):
+                if quota_reconcile_since.tzinfo is None:
+                    quota_reconcile_since = quota_reconcile_since.replace(tzinfo=CN_TZ)
+                quota_reconcile_since = quota_reconcile_since.astimezone(timezone.utc)
+            else:
+                quota_reconcile_since = None
+            quota_reconcile_covered = bool(
+                quota_reconcile_since is not None
+                and payload_since is not None
+                and payload_since <= quota_reconcile_since + timedelta(seconds=2)
+                and through >= quota_reconcile_since
+            )
 
             payload_accounting_schema = self._usage_accounting_schema(
                 payload.get("usage_accounting_schema")
@@ -11288,6 +11858,18 @@ class FloatingMonitorApp:
                         latest_model = row_model or latest_model
 
             client_usage = self.state.client_usage if isinstance(self.state.client_usage, dict) else {}
+            current_usage_date = through.astimezone(CN_TZ).date().isoformat()
+            client_usage["date"] = current_usage_date
+            client_usage["updated_at"] = through.astimezone(CN_TZ).isoformat(
+                timespec="microseconds"
+            )
+            scan_status = (
+                dict(client_usage.get("scan_status"))
+                if isinstance(client_usage.get("scan_status"), dict)
+                else {}
+            )
+            scan_status["through"] = client_usage["updated_at"]
+            client_usage["scan_status"] = scan_status
             if accounting_schema_upgrade:
                 client_usage["usage_accounting_schema"] = payload_accounting_schema
                 for key in (
@@ -11417,6 +11999,85 @@ class FloatingMonitorApp:
             self.state.today_tokens = authoritative_tokens
             self.state.today_requests = authoritative_requests
             self.state.today_account_cost = authoritative_cost
+            # Restore the last authoritative quota usage counters before
+            # replaying canonical rows. The previous optimistic quota overlay
+            # may contain events that the catch-up has since deduplicated or
+            # reassigned to another account.
+            authoritative_usage = load_client_usage(run_export=False) or {}
+            authoritative_quota_state = MonitorState(
+                client_usage=authoritative_usage,
+                top_accounts=[],
+            )
+            authoritative_rows = {
+                account_display_key(row.get("name")): row
+                for row in (
+                    authoritative_usage.get("providers")
+                    if isinstance(authoritative_usage.get("providers"), list)
+                    else []
+                )
+                if isinstance(row, dict) and account_display_key(row.get("name"))
+            }
+            quota_metadata_fields = (
+                "quota_available",
+                "quota_stale",
+                "quota_unlimited",
+                "quota_source",
+                "quota_snapshot_at",
+                "quota_reset_unavailable",
+                "quota_snapshot_expired",
+                "quota_absent_confirmed",
+                "quota_idle",
+                "countdown_active",
+                "remaining_percent",
+                "utilization",
+                "resets_at",
+                "window_minutes",
+                "window_days",
+            )
+            for row in (
+                *(client_usage.get("providers") or []),
+                *(self.state.top_accounts or []),
+            ):
+                if not isinstance(row, dict):
+                    continue
+                base_row = authoritative_rows.get(account_display_key(row.get("name")))
+                if not isinstance(base_row, dict):
+                    continue
+                for window_key in ("window_5h", "window_7d", "window_cycle"):
+                    base_window = base_row.get(window_key)
+                    if not isinstance(base_window, dict):
+                        continue
+                    current_window = row.get(window_key)
+                    restored_window = dict(base_window)
+                    restored_signature = self._live_quota_window_signature(
+                        restored_window
+                    )
+                    if isinstance(current_window, dict):
+                        for field in quota_metadata_fields:
+                            if field in current_window:
+                                restored_window[field] = current_window[field]
+                        current_signature = self._live_quota_window_signature(
+                            current_window
+                        )
+                        if (
+                            quota_reconcile_covered
+                            and current_signature is not None
+                            and restored_signature != current_signature
+                        ):
+                            current_start = _parse_time(current_signature[1])
+                            if current_start is not None:
+                                current_start -= timedelta(
+                                    minutes=current_signature[0]
+                                )
+                            if (
+                                current_start is not None
+                                and current_start >= quota_reconcile_since - timedelta(seconds=2)
+                            ):
+                                self._reset_usage_for_new_quota_boundary(
+                                    restored_window,
+                                    current_signature,
+                                )
+                    row[window_key] = restored_window
             overlay: dict[str, Any] = {
                 "base_today_tokens": authoritative_tokens,
                 "base_today_requests": authoritative_requests,
@@ -11452,18 +12113,46 @@ class FloatingMonitorApp:
                 "output_tokens": 0,
                 "latest_when": latest_when or through,
                 "providers": {},
+                "quota_windows": {},
                 "base_hourly": self._live_hourly_snapshot(),
                 "hourly": {},
                 "catchup_summary_tokens": int(summary.get("tokens") or 0),
                 "catchup_tail_tokens": tail_tokens,
                 "catchup_through": through,
             }
+            hourly_day = through.astimezone(CN_TZ).date()
             for event in rows:
-                self._add_live_hourly_delta(overlay, event)
+                event_when = _parse_time(str(event.get("when") or ""))
+                if (
+                    event_when is not None
+                    and event_when.astimezone(CN_TZ).date() == hourly_day
+                ):
+                    self._add_live_hourly_delta(overlay, event)
             for event in tail_events:
-                self._add_live_hourly_delta(overlay, event)
+                event_when = event.get("when")
+                if (
+                    isinstance(event_when, datetime)
+                    and event_when.astimezone(CN_TZ).date() == hourly_day
+                ):
+                    self._add_live_hourly_delta(overlay, event)
+            for event in (*rows, *tail_events):
+                event_when = event.get("when")
+                if not isinstance(event_when, datetime):
+                    event_when = _parse_time(str(event_when or ""))
+                provider_name = str(event.get("provider") or "").strip()
+                if event_when is not None and provider_name:
+                    self._record_live_quota_window_overlay(
+                        overlay,
+                        provider_name,
+                        event,
+                        event_when,
+                    )
             raw_providers = client_usage.get("providers") if isinstance(client_usage.get("providers"), list) else []
             top_accounts = self.state.top_accounts if isinstance(self.state.top_accounts, list) else []
+            if not isinstance(client_usage.get("providers"), list):
+                client_usage["providers"] = raw_providers
+            if not isinstance(self.state.top_accounts, list):
+                self.state.top_accounts = top_accounts
             for provider_name, desired in provider_targets.items():
                 provider_key = account_display_key(provider_name)
                 raw_row = next(
@@ -11471,15 +12160,27 @@ class FloatingMonitorApp:
                         row for row in raw_providers
                         if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key
                     ),
-                    {},
+                    None,
                 )
                 top_row = next(
                     (
                         row for row in top_accounts
                         if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key
                     ),
-                    {},
+                    None,
                 )
+                if not isinstance(raw_row, dict):
+                    raw_row = {
+                        "name": provider_name,
+                        "show_zero": False,
+                    }
+                    raw_providers.append(raw_row)
+                if not isinstance(top_row, dict):
+                    top_row = {
+                        "name": local_provider_display_name(provider_name),
+                        "show_zero": False,
+                    }
+                    top_accounts.append(top_row)
                 desired_tokens = max(0, int(desired.get("tokens") or 0))
                 desired_requests = max(0, int(desired.get("requests") or 0))
                 desired_cost = max(0.0, float(desired.get("cost") or 0.0))
@@ -11495,23 +12196,71 @@ class FloatingMonitorApp:
                     "unpriced_models": dict(desired.get("unpriced_models") or {}),
                     "input_tokens": max(0, int(desired.get("input_tokens") or 0)),
                     "cached_input_tokens": max(0, int(desired.get("cached_input_tokens") or 0)),
+                    "cache_creation_input_tokens": max(
+                        0,
+                        int(desired.get("cache_creation_input_tokens") or 0),
+                    ),
                     "output_tokens": max(0, int(desired.get("output_tokens") or 0)),
                 }
-                if isinstance(raw_row, dict):
-                    raw_row.update(desired_values)
-                    raw_row["latest_at"] = str(desired.get("latest_at") or raw_row.get("latest_at") or "")
-                if isinstance(top_row, dict):
-                    top_row["tokens"] = desired_tokens
-                    top_row["requests"] = desired_requests
-                    top_row["cost"] = desired_cost
-                    top_row["models"] = desired_values["models"]
-                    top_row["unpriced_tokens"] = desired_values["unpriced_tokens"]
-                    top_row["unpriced_models"] = desired_values["unpriced_models"]
-                    top_row["latest_at"] = str(desired.get("latest_at") or top_row.get("latest_at") or "")
+                desired_latest_at = str(
+                    desired.get("latest_at") or raw_row.get("latest_at") or ""
+                )
+                desired_latest_when = _parse_time(desired_latest_at) or through
+                desired_latest_model = str(desired.get("latest_model") or "")
+                raw_row.update(desired_values)
+                raw_row["latest_at"] = desired_latest_at
+                raw_row["latest_model"] = desired_latest_model
+                top_row.update(desired_values)
+                top_row["latest_at"] = str(
+                    desired.get("latest_at") or top_row.get("latest_at") or ""
+                )
+                top_row["latest_model"] = desired_latest_model
+                overlay["providers"][provider_name] = {
+                    "replace_existing": True,
+                    "base_tokens": desired_tokens,
+                    "base_requests": desired_requests,
+                    "base_cost": desired_cost,
+                    "base_models": dict(desired_values["models"]),
+                    "base_unpriced_tokens": desired_values["unpriced_tokens"],
+                    "base_unpriced_models": dict(
+                        desired_values["unpriced_models"]
+                    ),
+                    "base_input_tokens": desired_values["input_tokens"],
+                    "base_cached_input_tokens": desired_values[
+                        "cached_input_tokens"
+                    ],
+                    "base_cache_creation_input_tokens": desired_values[
+                        "cache_creation_input_tokens"
+                    ],
+                    "base_output_tokens": desired_values["output_tokens"],
+                    "tokens": 0,
+                    "requests": 0,
+                    "cost": 0.0,
+                    "models": {},
+                    "unpriced_tokens": 0,
+                    "unpriced_models": {},
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 0,
+                    "latest_when": desired_latest_when,
+                    "latest_model": desired_latest_model,
+                }
 
+            # The catch-up provider buckets are absolute and may correct an
+            # optimistic event's earlier account attribution. Rebase the
+            # matching quota window as well so those old events cannot remain
+            # charged to the previous account after the provider total moves.
+            self._rebase_restored_live_quota_windows(
+                overlay,
+                authoritative_quota_state,
+            )
             self._live_usage_overlay = overlay
             self._apply_live_usage_overlay(self.state)
-            self._complete_live_usage_verification(through)
+            if quota_reconcile_since is None or quota_reconcile_covered:
+                self._complete_live_usage_verification(through)
+            if quota_reconcile_covered:
+                self._live_quota_reconcile_since = None
             if latest_when is not None:
                 request_provider = latest_provider or (
                     "Codex local - api-service-local"
@@ -11528,11 +12277,9 @@ class FloatingMonitorApp:
                 if request_provider:
                     self.state.latest_account_name = request_provider
             self._persist_live_usage_checkpoint(force=True)
+            self._update_live_usage_history_if_due()
             self._last_live_reconcile_at = time.monotonic()
             self._draw()
-            if not bool(getattr(self, "_live_initial_recheck_scheduled", False)):
-                self._live_initial_recheck_scheduled = True
-                self._schedule_live_usage_reconcile(LIVE_USAGE_INITIAL_RECHECK_MS)
         finally:
             try:
                 self._live_catchup_lock.release()
@@ -11549,7 +12296,15 @@ class FloatingMonitorApp:
         since = self._live_usage_catchup_since()
         if since is None or not CLIENT_USAGE_EXPORT.exists():
             return False
+        refresh_lock = getattr(self, "_refresh_lock", None)
+        if refresh_lock is not None and refresh_lock.locked():
+            return False
         if not self._live_catchup_lock.acquire(blocking=False):
+            return False
+        # Close the race with refresh_async(): only one exporter may scan the
+        # multi-gigabyte rollout set at a time.
+        if refresh_lock is not None and refresh_lock.locked():
+            self._live_catchup_lock.release()
             return False
         through = datetime.now(CN_TZ)
         if through <= since + timedelta(milliseconds=50):
@@ -11679,7 +12434,7 @@ class FloatingMonitorApp:
         session_id = str(event.get("session_id") or "")
         event_id = str(event.get("event_id") or "")
         provider = ""
-        model = str(event.get("model") or "")
+        model = _concrete_live_model(event.get("model"))
         client_usage = (
             self.state.client_usage
             if self.state and isinstance(self.state.client_usage, dict)
@@ -11691,12 +12446,23 @@ class FloatingMonitorApp:
             if current_label
             else bool(client_usage.get("api_service_routed"))
         )
+        current_direct_provider = (
+            _concrete_live_provider(current_label)
+            if current_label and not api_service_current
+            else ""
+        )
         sessions = client_usage.get("active_sessions")
         for session in sessions if isinstance(sessions, list) else []:
             if not isinstance(session, dict) or str(session.get("session_id") or "") != session_id:
                 continue
             if not api_service_current:
-                provider = _concrete_live_provider(session.get("provider"))
+                # The active-session list can come from an older full snapshot.
+                # For official direct mode, the current auth switch timeline is
+                # the same authority used by the full local exporter, so it must
+                # override a stale account cached on that session row.
+                provider = current_direct_provider or _concrete_live_provider(
+                    session.get("provider")
+                )
             elif (
                 event_id
                 and session.get("provider_confirmed") is True
@@ -11709,8 +12475,10 @@ class FloatingMonitorApp:
                 # account for the whole current turn, so keep that account
                 # for later snapshots without carrying it into a new turn.
                 provider = _same_turn_confirmed_provider(event, session)
-            model = model or str(session.get("model") or "")
+            model = model or _concrete_live_model(session.get("model"))
             break
+        if not provider and current_direct_provider:
+            provider = current_direct_provider
         if not provider and self.state and not api_service_current:
             for account in self.state.active_accounts or []:
                 if not isinstance(account, dict):
@@ -11720,17 +12488,13 @@ class FloatingMonitorApp:
                 )
                 if candidate:
                     provider = candidate
-                    model = model or str(account.get("model") or "")
+                    model = model or _concrete_live_model(account.get("model"))
                     break
-        if not provider and not api_service_current:
-            current_provider = _concrete_live_provider(current_label)
-            if current_provider:
-                provider = current_provider
         existing = self.state.latest_request if self.state and isinstance(self.state.latest_request, dict) else {}
         if not provider and self.state and not api_service_current:
             provider = str(self.state.latest_account_name or "")
-        model = model or str(existing.get("model") or "-")
-        return provider, model
+        model = model or _concrete_live_model(existing.get("model"))
+        return provider, model or "-"
 
     def _record_live_provider_overlay(
         self,
@@ -11768,10 +12532,22 @@ class FloatingMonitorApp:
                 ),
                 {},
             )
+            base_models: dict[str, int] = {}
+            for model_map in (
+                raw_row.get("models") if isinstance(raw_row, dict) else {},
+                top_row.get("models") if isinstance(top_row, dict) else {},
+            ):
+                for model, tokens in dict(model_map or {}).items():
+                    model_name = str(model)
+                    base_models[model_name] = max(
+                        int(base_models.get(model_name) or 0),
+                        max(0, int(tokens or 0)),
+                    )
             target = {
                 "base_tokens": max(int(raw_row.get("tokens") or 0), int(top_row.get("tokens") or 0)),
                 "base_requests": max(int(raw_row.get("requests") or 0), int(top_row.get("requests") or 0)),
                 "base_cost": max(float(raw_row.get("cost") or 0.0), float(top_row.get("cost") or 0.0)),
+                "base_models": base_models,
                 "base_unpriced_tokens": max(
                     int(raw_row.get("unpriced_tokens") or 0),
                     int(top_row.get("unpriced_tokens") or 0),
@@ -11779,36 +12555,486 @@ class FloatingMonitorApp:
                 "base_unpriced_models": dict(raw_row.get("unpriced_models") or {}),
                 "base_input_tokens": int(raw_row.get("input_tokens") or 0),
                 "base_cached_input_tokens": int(raw_row.get("cached_input_tokens") or 0),
+                "base_cache_creation_input_tokens": int(
+                    raw_row.get("cache_creation_input_tokens") or 0
+                ),
                 "base_output_tokens": int(raw_row.get("output_tokens") or 0),
                 "tokens": 0,
                 "requests": 0,
                 "cost": 0.0,
+                "models": {},
                 "unpriced_tokens": 0,
                 "unpriced_models": {},
                 "input_tokens": 0,
                 "cached_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
                 "output_tokens": 0,
                 "latest_when": when,
+                "latest_model": "",
             }
             targets[provider] = target
+        target.setdefault("base_models", {})
+        target.setdefault("models", {})
+        target.setdefault("base_cache_creation_input_tokens", 0)
+        target.setdefault("cache_creation_input_tokens", 0)
         total_tokens = max(0, int(usage.get("total_tokens") or 0))
         raw_input = max(0, int(usage.get("input_tokens") or 0))
         cached_input = min(raw_input, max(0, int(usage.get("cached_tokens") or 0)))
+        cache_creation_input = max(
+            0,
+            int(usage.get("cache_creation_input_tokens") or 0),
+        )
         output_tokens = max(0, int(usage.get("output_tokens") or 0))
+        model = str(usage.get("model") or "unknown").strip() or "unknown"
         target["tokens"] += total_tokens
         target["requests"] += 1
         target["cost"] += max(0.0, float(usage.get("cost") or 0.0))
+        target["models"][model] = (
+            int(target["models"].get(model) or 0) + total_tokens
+        )
         unpriced_tokens = max(0, int(usage.get("unpriced_tokens") or 0))
         target["unpriced_tokens"] += unpriced_tokens
         if unpriced_tokens:
-            model = str(usage.get("model") or "unknown").strip() or "unknown"
             target["unpriced_models"][model] = (
                 int(target["unpriced_models"].get(model) or 0) + unpriced_tokens
             )
         target["input_tokens"] += max(0, raw_input - cached_input)
         target["cached_input_tokens"] += cached_input
+        target["cache_creation_input_tokens"] += cache_creation_input
         target["output_tokens"] += output_tokens
-        target["latest_when"] = max(target["latest_when"], when)
+        previous_latest = target.get("latest_when")
+        if not isinstance(previous_latest, datetime) or when >= previous_latest:
+            target["latest_when"] = when
+            target["latest_model"] = model
+        self._record_live_quota_window_overlay(
+            overlay,
+            provider,
+            usage,
+            when,
+        )
+
+    @staticmethod
+    def _live_quota_window_signature(
+        window: Any,
+    ) -> tuple[int, str] | None:
+        if not isinstance(window, dict):
+            return None
+        quota_available = bool(
+            window.get("quota_available", window.get("utilization") is not None)
+        )
+        if not quota_available or bool(window.get("quota_unlimited")):
+            return None
+        try:
+            window_minutes = int(window.get("window_minutes") or 0)
+        except (TypeError, ValueError):
+            window_minutes = 0
+        reset_at = _parse_time(str(window.get("resets_at") or ""))
+        if window_minutes <= 0 or reset_at is None:
+            return None
+        return window_minutes, reset_at.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _live_event_counts_toward_official_quota(usage: dict[str, Any]) -> bool:
+        model = str(usage.get("model") or "").strip().lower()
+        if not model or "/" in model:
+            return False
+        return model.startswith(
+            ("gpt-", "o1", "o3", "o4", "o5", "codex-", "chatgpt-")
+        )
+
+    @staticmethod
+    def _reset_usage_for_new_quota_boundary(
+        window: dict[str, Any],
+        signature: tuple[int, str],
+    ) -> None:
+        window_minutes, reset_text = signature
+        reset_at = _parse_time(reset_text)
+        if reset_at is None:
+            return
+        start_at = reset_at - timedelta(minutes=window_minutes)
+        for field in (
+            "requests",
+            "tokens",
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+            "unpriced_tokens",
+        ):
+            window[field] = 0
+        window["cost"] = 0.0
+        window["models"] = {}
+        window["unpriced_models"] = {}
+        window["start_at"] = start_at.astimezone(CN_TZ).isoformat(
+            timespec="seconds"
+        )
+        # The quota snapshot proves the cycle boundary, not that usage between
+        # that boundary and the snapshot has already been scanned.
+        window["end_at"] = start_at.astimezone(CN_TZ).isoformat(timespec="seconds")
+        window.pop("latest_at", None)
+        window.pop("latest_model", None)
+        window.pop("window_usage_live", None)
+
+    def _live_quota_provider_rows(
+        self,
+        provider: str,
+        state: MonitorState | None = None,
+    ) -> list[dict[str, Any]]:
+        current_state = state or self.state
+        if current_state is None:
+            return []
+        provider_key = account_display_key(provider)
+        client_usage = (
+            current_state.client_usage
+            if isinstance(current_state.client_usage, dict)
+            else {}
+        )
+        raw_rows = (
+            client_usage.get("providers")
+            if isinstance(client_usage.get("providers"), list)
+            else []
+        )
+        top_rows = (
+            current_state.top_accounts
+            if isinstance(current_state.top_accounts, list)
+            else []
+        )
+        result: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in (*raw_rows, *top_rows):
+            if (
+                not isinstance(row, dict)
+                or account_display_key(row.get("name")) != provider_key
+                or id(row) in seen
+            ):
+                continue
+            seen.add(id(row))
+            result.append(row)
+        return result
+
+    @staticmethod
+    def _live_quota_base_map(
+        windows: list[dict[str, Any]],
+        key: str,
+    ) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for window in windows:
+            values = window.get(key)
+            if not isinstance(values, dict):
+                continue
+            for name, value in values.items():
+                try:
+                    amount = max(0, int(value or 0))
+                except (TypeError, ValueError):
+                    continue
+                result[str(name)] = max(result.get(str(name), 0), amount)
+        return result
+
+    def _record_live_quota_window_overlay(
+        self,
+        overlay: dict[str, Any],
+        provider: str,
+        usage: dict[str, Any],
+        when: datetime,
+    ) -> None:
+        if (
+            not isinstance(when, datetime)
+            or not self._live_event_counts_toward_official_quota(usage)
+        ):
+            return
+        provider = str(provider or "").strip()
+        if not provider or is_local_api_service_provider_name(provider):
+            return
+        rows = self._live_quota_provider_rows(provider)
+        if not rows:
+            return
+        quota_targets = overlay.get("quota_windows")
+        if not isinstance(quota_targets, dict):
+            quota_targets = {}
+            overlay["quota_windows"] = quota_targets
+        provider_targets = quota_targets.setdefault(provider, {})
+        event_id = str(
+            usage.get("_live_record_id")
+            or usage.get("canonical_id")
+            or usage.get("canonical_event_id")
+            or usage.get("event_id")
+            or _live_usage_event_id(
+                when,
+                str(usage.get("session_id") or ""),
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("cached_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+            )
+        ).strip()
+        total_tokens = max(0, int(usage.get("total_tokens") or 0))
+        raw_input = max(0, int(usage.get("input_tokens") or 0))
+        cached_input = min(
+            raw_input,
+            max(0, int(usage.get("cached_tokens") or 0)),
+        )
+        output_tokens = max(0, int(usage.get("output_tokens") or 0))
+        unpriced_tokens = max(0, int(usage.get("unpriced_tokens") or 0))
+        model = str(usage.get("model") or "unknown").strip() or "unknown"
+
+        for window_key in ("window_5h", "window_7d", "window_cycle"):
+            source_windows = [
+                window
+                for row in rows
+                if isinstance((window := row.get(window_key)), dict)
+                and self._live_quota_window_signature(window) is not None
+            ]
+            if not source_windows:
+                provider_targets.pop(window_key, None)
+                continue
+            source_window = max(
+                source_windows,
+                key=lambda window: str(window.get("quota_snapshot_at") or ""),
+            )
+            signature = self._live_quota_window_signature(source_window)
+            if signature is None:
+                continue
+            window_minutes, reset_text = signature
+            reset_at = _parse_time(reset_text)
+            if reset_at is None:
+                continue
+            start_at = reset_at - timedelta(minutes=window_minutes)
+            event_when = when.astimezone(timezone.utc)
+            if event_when < start_at or event_when >= reset_at:
+                continue
+
+            target = provider_targets.get(window_key)
+            if not isinstance(target, dict) or tuple(target.get("signature") or ()) != signature:
+                matching_base_windows = []
+                for window in source_windows:
+                    row_start = _parse_time(str(window.get("start_at") or ""))
+                    if (
+                        row_start is not None
+                        and abs((row_start - start_at).total_seconds()) <= 2.0
+                    ):
+                        matching_base_windows.append(window)
+                base_through = max(
+                    (
+                        parsed
+                        for window in matching_base_windows
+                        if (
+                            parsed := _parse_time(
+                                str(
+                                    window.get("end_at")
+                                    or window.get("latest_at")
+                                    or ""
+                                )
+                            )
+                        )
+                        is not None
+                    ),
+                    default=start_at,
+                )
+                target = {
+                    "signature": list(signature),
+                    "start_at": start_at,
+                    "resets_at": reset_at,
+                    "base_through": base_through,
+                    "replace_existing": not bool(matching_base_windows),
+                    "base_requests": max(
+                        (int(window.get("requests") or 0) for window in matching_base_windows),
+                        default=0,
+                    ),
+                    "base_tokens": max(
+                        (int(window.get("tokens") or 0) for window in matching_base_windows),
+                        default=0,
+                    ),
+                    "base_input_tokens": max(
+                        (int(window.get("input_tokens") or 0) for window in matching_base_windows),
+                        default=0,
+                    ),
+                    "base_cached_input_tokens": max(
+                        (
+                            int(window.get("cached_input_tokens") or 0)
+                            for window in matching_base_windows
+                        ),
+                        default=0,
+                    ),
+                    "base_cache_creation_input_tokens": max(
+                        (
+                            int(window.get("cache_creation_input_tokens") or 0)
+                            for window in matching_base_windows
+                        ),
+                        default=0,
+                    ),
+                    "base_output_tokens": max(
+                        (int(window.get("output_tokens") or 0) for window in matching_base_windows),
+                        default=0,
+                    ),
+                    "base_cost": max(
+                        (float(window.get("cost") or 0.0) for window in matching_base_windows),
+                        default=0.0,
+                    ),
+                    "base_unpriced_tokens": max(
+                        (
+                            int(window.get("unpriced_tokens") or 0)
+                            for window in matching_base_windows
+                        ),
+                        default=0,
+                    ),
+                    "base_models": self._live_quota_base_map(
+                        matching_base_windows,
+                        "models",
+                    ),
+                    "base_unpriced_models": self._live_quota_base_map(
+                        matching_base_windows,
+                        "unpriced_models",
+                    ),
+                    "requests": 0,
+                    "tokens": 0,
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost": 0.0,
+                    "unpriced_tokens": 0,
+                    "models": {},
+                    "unpriced_models": {},
+                    "event_ids": {},
+                    "latest_when": base_through,
+                    "latest_model": "",
+                }
+                provider_targets[window_key] = target
+            base_through = target.get("base_through")
+            if not isinstance(base_through, datetime):
+                base_through = _parse_time(str(base_through or "")) or start_at
+                target["base_through"] = base_through
+            event_ids = target.setdefault("event_ids", {})
+            if event_id in event_ids:
+                continue
+            event_ids[event_id] = True
+            while len(event_ids) > 16_384:
+                event_ids.pop(next(iter(event_ids)))
+            # The base window already includes events through its exporter
+            # cutoff. Remember their IDs, but do not add them a second time
+            # when a catch-up payload overlaps that cutoff.
+            if event_when <= base_through:
+                continue
+            target["requests"] += 1
+            target["tokens"] += total_tokens
+            target["input_tokens"] += max(0, raw_input - cached_input)
+            target["cached_input_tokens"] += cached_input
+            target["output_tokens"] += output_tokens
+            target["cost"] += max(0.0, float(usage.get("cost") or 0.0))
+            target["unpriced_tokens"] += unpriced_tokens
+            target["models"][model] = int(target["models"].get(model) or 0) + total_tokens
+            if unpriced_tokens:
+                target["unpriced_models"][model] = (
+                    int(target["unpriced_models"].get(model) or 0)
+                    + unpriced_tokens
+                )
+            latest_when = target.get("latest_when")
+            if not isinstance(latest_when, datetime):
+                latest_when = _parse_time(str(latest_when or "")) or base_through
+            if event_when >= latest_when:
+                target["latest_when"] = event_when
+                target["latest_model"] = model
+        if not provider_targets:
+            quota_targets.pop(provider, None)
+            if not quota_targets:
+                overlay.pop("quota_windows", None)
+
+    def _apply_live_quota_window_overlay(self, state: MonitorState) -> None:
+        overlay = self._live_usage_overlay
+        if not isinstance(overlay, dict):
+            return
+        quota_targets = overlay.get("quota_windows")
+        if not isinstance(quota_targets, dict):
+            return
+        numeric_fields = (
+            "requests",
+            "tokens",
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+            "unpriced_tokens",
+        )
+        for provider, windows in quota_targets.items():
+            if not isinstance(windows, dict):
+                continue
+            rows = self._live_quota_provider_rows(str(provider), state)
+            for window_key, target in windows.items():
+                if not isinstance(target, dict):
+                    continue
+                signature = tuple(target.get("signature") or ())
+                latest_when = target.get("latest_when")
+                if not isinstance(latest_when, datetime):
+                    latest_when = _parse_time(str(latest_when or ""))
+                desired = {
+                    field: int(target.get(f"base_{field}") or 0)
+                    + int(target.get(field) or 0)
+                    for field in numeric_fields
+                }
+                desired_cost = float(target.get("base_cost") or 0.0) + float(
+                    target.get("cost") or 0.0
+                )
+                desired_models = dict(target.get("base_models") or {})
+                for model, tokens in dict(target.get("models") or {}).items():
+                    desired_models[str(model)] = (
+                        int(desired_models.get(str(model)) or 0) + int(tokens or 0)
+                    )
+                desired_unpriced_models = dict(
+                    target.get("base_unpriced_models") or {}
+                )
+                for model, tokens in dict(target.get("unpriced_models") or {}).items():
+                    desired_unpriced_models[str(model)] = (
+                        int(desired_unpriced_models.get(str(model)) or 0)
+                        + int(tokens or 0)
+                    )
+                replace_existing = bool(target.get("replace_existing"))
+                for row in rows:
+                    current = row.get(window_key)
+                    if (
+                        not isinstance(current, dict)
+                        or self._live_quota_window_signature(current) != signature
+                    ):
+                        continue
+                    for field, value in desired.items():
+                        current[field] = (
+                            value
+                            if replace_existing
+                            else max(int(current.get(field) or 0), value)
+                        )
+                    current["cost"] = (
+                        desired_cost
+                        if replace_existing
+                        else max(float(current.get("cost") or 0.0), desired_cost)
+                    )
+                    for field, values in (
+                        ("models", desired_models),
+                        ("unpriced_models", desired_unpriced_models),
+                    ):
+                        existing = {} if replace_existing else dict(current.get(field) or {})
+                        for model, tokens in values.items():
+                            existing[str(model)] = max(
+                                int(existing.get(str(model)) or 0),
+                                int(tokens or 0),
+                            )
+                        current[field] = existing
+                    start_at = target.get("start_at")
+                    if not isinstance(start_at, datetime):
+                        start_at = _parse_time(str(start_at or ""))
+                    if start_at is not None:
+                        current["start_at"] = start_at.astimezone(CN_TZ).isoformat(
+                            timespec="seconds"
+                        )
+                    if latest_when is not None:
+                        latest_at = latest_when.astimezone(CN_TZ).isoformat(
+                            timespec="seconds"
+                        )
+                        current["end_at"] = latest_at
+                        if desired["requests"] > 0:
+                            current["latest_at"] = latest_at
+                            if target.get("latest_model"):
+                                current["latest_model"] = str(
+                                    target.get("latest_model")
+                                )
+                    current["window_usage_live"] = True
 
     def _live_usage_batch_requires_verification(
         self,
@@ -11827,18 +13053,40 @@ class FloatingMonitorApp:
         ]
         batch_tokens = sum(max(0, int(event.get("total_tokens") or 0)) for event in events)
         projected_tokens = sum(tokens for _timestamp, tokens in samples) + batch_tokens
+        overlay = getattr(self, "_live_usage_overlay", None)
+        provider_targets = (
+            overlay.get("providers") if isinstance(overlay, dict) else None
+        )
+        unverified_tokens = sum(
+            max(0, int(target.get("tokens") or 0))
+            for target in (
+                provider_targets.values()
+                if isinstance(provider_targets, dict)
+                else []
+            )
+            if isinstance(target, dict)
+        )
+        projected_unverified_tokens = unverified_tokens + batch_tokens
         verification_pending = bool(
             getattr(self, "_live_usage_verification_pending", False)
         )
-        if not verification_pending and projected_tokens < LIVE_USAGE_VERIFY_THRESHOLD_TOKENS:
+        if (
+            not verification_pending
+            and projected_tokens < LIVE_USAGE_VERIFY_THRESHOLD_TOKENS
+            and projected_unverified_tokens < LIVE_USAGE_VERIFY_THRESHOLD_TOKENS
+        ):
             samples.append((now_clock, batch_tokens))
             return False
 
         self._live_usage_verification_pending = True
         self._live_usage_verification_pending_tokens = max(
-            0,
-            int(getattr(self, "_live_usage_verification_pending_tokens", 0) or 0),
-        ) + batch_tokens
+            projected_unverified_tokens,
+            max(
+                0,
+                int(getattr(self, "_live_usage_verification_pending_tokens", 0) or 0),
+            )
+            + batch_tokens,
+        )
         latest_when = max(
             (
                 event.get("when")
@@ -12051,12 +13299,12 @@ class FloatingMonitorApp:
         for event_index, event in enumerate(recent):
             event_cost = max(0.0, float(event.get("cost") or 0.0))
             provider = _concrete_live_provider(event.get("provider"))
-            model = str(event.get("model") or "")
+            model = _concrete_live_model(event.get("model"))
             matched_marker = live_cockpit_matches.get(event_index)
             record_provider = bool(provider)
             if matched_marker is not None:
                 provider = str(matched_marker.get("label") or "")
-                model = str(matched_marker.get("model") or "")
+                model = _concrete_live_model(matched_marker.get("model"))
                 record_provider = bool(provider)
                 marker_request_id = str(matched_marker.get("request_id") or "").strip()
                 if marker_request_id:
@@ -12066,7 +13314,7 @@ class FloatingMonitorApp:
             if not provider or not model:
                 context_provider, context_model = self._live_event_request_context(event)
             if not model:
-                model = context_model
+                model = _concrete_live_model(context_model)
             if not provider:
                 provider = context_provider
                 record_provider = bool(provider)
@@ -12223,6 +13471,7 @@ class FloatingMonitorApp:
             self._ensure_pulse_animation()
         self._apply_live_usage_overlay(self.state)
         self._persist_live_usage_checkpoint(force=allow_historical)
+        self._update_live_usage_history_if_due()
         return True
 
     def _apply_live_usage_overlay(self, state: MonitorState) -> None:
@@ -12246,6 +13495,45 @@ class FloatingMonitorApp:
         client_usage = (
             state.client_usage if isinstance(state.client_usage, dict) else {}
         )
+        sync = state.usage_sync if isinstance(state.usage_sync, dict) else {}
+        if str(sync.get("state") or "").lower() == "timeout":
+            scan_status = (
+                client_usage.get("scan_status")
+                if isinstance(client_usage.get("scan_status"), dict)
+                else {}
+            )
+            scan_through = _parse_time(
+                str(
+                    scan_status.get("through")
+                    or client_usage.get("updated_at")
+                    or ""
+                )
+            )
+            overlay_latest = overlay.get("latest_when")
+            cached_tokens = max(0, int(client_usage.get("tokens") or 0))
+            overlay_target_tokens = max(
+                0,
+                int(overlay.get("base_today_tokens") or 0)
+                + int(overlay.get("tokens") or 0),
+            )
+            live_covers_cache = bool(
+                isinstance(scan_through, datetime)
+                and isinstance(overlay_latest, datetime)
+                and overlay_latest >= scan_through - timedelta(seconds=1)
+                and overlay_target_tokens >= cached_tokens
+                and (
+                    int(overlay.get("tokens") or 0) > 0
+                    or int(overlay.get("requests") or 0) > 0
+                )
+            )
+            if live_covers_cache:
+                sync["live_overlay_covers_cache"] = True
+                sync["live_overlay_latest_at"] = overlay_latest.astimezone(
+                    CN_TZ
+                ).isoformat(timespec="seconds")
+            else:
+                sync.pop("live_overlay_covers_cache", None)
+                sync.pop("live_overlay_latest_at", None)
         provider_targets = overlay.get("providers")
         if isinstance(provider_targets, dict):
             raw_providers = (
@@ -12258,15 +13546,33 @@ class FloatingMonitorApp:
                 if not isinstance(target, dict):
                     continue
                 provider_key = account_display_key(provider)
+                replace_existing = bool(target.get("replace_existing"))
                 desired = {
-                    "tokens": int(target["base_tokens"]) + int(target["tokens"]),
-                    "requests": int(target["base_requests"]) + int(target["requests"]),
-                    "input_tokens": int(target["base_input_tokens"]) + int(target["input_tokens"]),
-                    "cached_input_tokens": int(target["base_cached_input_tokens"]) + int(target["cached_input_tokens"]),
-                    "output_tokens": int(target["base_output_tokens"]) + int(target["output_tokens"]),
+                    "tokens": int(target.get("base_tokens") or 0)
+                    + int(target.get("tokens") or 0),
+                    "requests": int(target.get("base_requests") or 0)
+                    + int(target.get("requests") or 0),
+                    "input_tokens": int(target.get("base_input_tokens") or 0)
+                    + int(target.get("input_tokens") or 0),
+                    "cached_input_tokens": int(
+                        target.get("base_cached_input_tokens") or 0
+                    )
+                    + int(target.get("cached_input_tokens") or 0),
+                    "cache_creation_input_tokens": int(
+                        target.get("base_cache_creation_input_tokens") or 0
+                    )
+                    + int(target.get("cache_creation_input_tokens") or 0),
+                    "output_tokens": int(target.get("base_output_tokens") or 0)
+                    + int(target.get("output_tokens") or 0),
                     "unpriced_tokens": int(target.get("base_unpriced_tokens") or 0)
                     + int(target.get("unpriced_tokens") or 0),
                 }
+                desired_provider_models = dict(target.get("base_models") or {})
+                for model, tokens in dict(target.get("models") or {}).items():
+                    desired_provider_models[str(model)] = (
+                        int(desired_provider_models.get(str(model)) or 0)
+                        + int(tokens or 0)
+                    )
                 desired_provider_unpriced_models = dict(
                     target.get("base_unpriced_models") or {}
                 )
@@ -12282,6 +13588,7 @@ class FloatingMonitorApp:
                     if isinstance(latest_when, datetime)
                     else ""
                 )
+                latest_model = str(target.get("latest_model") or "")
                 raw_row = next(
                     (
                         row
@@ -12291,19 +13598,6 @@ class FloatingMonitorApp:
                     ),
                     None,
                 )
-                if isinstance(raw_row, dict):
-                    for key, value in desired.items():
-                        raw_row[key] = max(int(raw_row.get(key) or 0), value)
-                    raw_row["cost"] = max(float(raw_row.get("cost") or 0.0), desired_cost)
-                    raw_unpriced_models = dict(raw_row.get("unpriced_models") or {})
-                    for model, tokens in desired_provider_unpriced_models.items():
-                        raw_unpriced_models[model] = max(
-                            int(raw_unpriced_models.get(model) or 0),
-                            int(tokens or 0),
-                        )
-                    raw_row["unpriced_models"] = raw_unpriced_models
-                    if latest_at:
-                        raw_row["latest_at"] = latest_at
                 top_row = next(
                     (
                         row
@@ -12313,23 +13607,63 @@ class FloatingMonitorApp:
                     ),
                     None,
                 )
-                if isinstance(top_row, dict):
-                    top_row["tokens"] = max(int(top_row.get("tokens") or 0), desired["tokens"])
-                    top_row["requests"] = max(int(top_row.get("requests") or 0), desired["requests"])
-                    top_row["cost"] = max(float(top_row.get("cost") or 0.0), desired_cost)
-                    top_row["unpriced_tokens"] = max(
-                        int(top_row.get("unpriced_tokens") or 0),
-                        desired["unpriced_tokens"],
-                    )
-                    top_unpriced_models = dict(top_row.get("unpriced_models") or {})
-                    for model, tokens in desired_provider_unpriced_models.items():
-                        top_unpriced_models[model] = max(
-                            int(top_unpriced_models.get(model) or 0),
-                            int(tokens or 0),
+                if not isinstance(raw_row, dict) and replace_existing:
+                    raw_row = {
+                        "name": provider,
+                        "show_zero": False,
+                    }
+                    if not isinstance(client_usage.get("providers"), list):
+                        client_usage["providers"] = raw_providers
+                    raw_providers.append(raw_row)
+                if not isinstance(top_row, dict) and replace_existing:
+                    top_row = {
+                        "name": local_provider_display_name(provider),
+                        "show_zero": False,
+                    }
+                    if not isinstance(state.top_accounts, list):
+                        state.top_accounts = top_accounts
+                    top_accounts.append(top_row)
+
+                for row in (
+                    candidate
+                    for candidate in (raw_row, top_row)
+                    if isinstance(candidate, dict)
+                ):
+                    if replace_existing:
+                        row.update(desired)
+                        row["cost"] = desired_cost
+                        row["models"] = dict(desired_provider_models)
+                        row["unpriced_models"] = dict(
+                            desired_provider_unpriced_models
                         )
-                    top_row["unpriced_models"] = top_unpriced_models
+                    else:
+                        for key, value in desired.items():
+                            row[key] = max(int(row.get(key) or 0), value)
+                        row["cost"] = max(
+                            float(row.get("cost") or 0.0),
+                            desired_cost,
+                        )
+                        row_models = dict(row.get("models") or {})
+                        for model, tokens in desired_provider_models.items():
+                            row_models[str(model)] = max(
+                                int(row_models.get(str(model)) or 0),
+                                int(tokens or 0),
+                            )
+                        row["models"] = row_models
+                        row_unpriced_models = dict(
+                            row.get("unpriced_models") or {}
+                        )
+                        for model, tokens in desired_provider_unpriced_models.items():
+                            row_unpriced_models[str(model)] = max(
+                                int(row_unpriced_models.get(str(model)) or 0),
+                                int(tokens or 0),
+                            )
+                        row["unpriced_models"] = row_unpriced_models
                     if latest_at:
-                        top_row["latest_at"] = latest_at
+                        row["latest_at"] = latest_at
+                    if latest_model:
+                        row["latest_model"] = latest_model
+        self._apply_live_quota_window_overlay(state)
         state.cost_history = trend_with_current_totals(
             state.cost_history,
             state.today_tokens,
@@ -12471,6 +13805,16 @@ class FloatingMonitorApp:
         self.root.after(max(1_000, int(delay_ms)), self._run_live_usage_reconcile)
         return True
 
+    def _start_initial_live_catchup(self) -> None:
+        if self.closed:
+            return
+        if self._codex_logs_busy():
+            # The live watcher/checkpoint owns the busy period. Request one
+            # authoritative refresh after the writers have gone quiet.
+            self._full_refresh_requested = True
+            return
+        self._refresh_live_usage_catchup_async()
+
     def _run_live_usage_reconcile(self) -> None:
         self._live_reconcile_scheduled = False
         if self.closed:
@@ -12482,6 +13826,9 @@ class FloatingMonitorApp:
         urgent_verification = bool(
             getattr(self, "_live_usage_verification_pending", False)
         )
+        if not urgent_verification and self._codex_logs_busy():
+            self._schedule_live_usage_reconcile()
+            return
         if elapsed < LIVE_USAGE_RECONCILE_MIN_INTERVAL_SECONDS and not urgent_verification:
             remaining_ms = int(
                 (LIVE_USAGE_RECONCILE_MIN_INTERVAL_SECONDS - elapsed) * 1000
@@ -12490,7 +13837,10 @@ class FloatingMonitorApp:
             return
         if isinstance(watcher, CodexUsageFileWatcher):
             quiet_seconds = LIVE_USAGE_RECONCILE_DELAY_MS / 1000.0
-            if not watcher.reconciliation_ready(quiet_seconds):
+            if (
+                not urgent_verification
+                and not watcher.reconciliation_ready(quiet_seconds)
+            ):
                 self._schedule_live_usage_reconcile()
                 return
             watcher.mark_reconciled()
@@ -12521,6 +13871,13 @@ class FloatingMonitorApp:
 
     def refresh_async(self, force: bool = False) -> bool:
         if not self._refresh_lock.acquire(blocking=False):
+            if force:
+                self._refresh_pending = True
+                self._draw()
+            return False
+        catchup_lock = getattr(self, "_live_catchup_lock", None)
+        if catchup_lock is not None and catchup_lock.locked():
+            self._refresh_lock.release()
             if force:
                 self._refresh_pending = True
                 self._draw()
@@ -12792,6 +14149,7 @@ class FloatingMonitorApp:
             self._apply_live_latest_request_overlay(result)
             self._synchronize_latest_request_identity(result)
             self.state = result
+            self._synchronize_account_activity_flags(result)
             if result.usage_source == "local":
                 self._last_forced_full_refresh_at = time.monotonic()
                 if fresh_result:
@@ -12818,6 +14176,22 @@ class FloatingMonitorApp:
         current_day = today_key()
         if not force and current_day == self._current_day_key:
             return False
+        previous_day = str(self._current_day_key or "")
+        state = getattr(self, "state", None)
+        client_usage = (
+            state.client_usage
+            if isinstance(state, MonitorState) and isinstance(state.client_usage, dict)
+            else {}
+        )
+        if (
+            previous_day
+            and previous_day != current_day
+            and str(client_usage.get("date") or "") == previous_day
+        ):
+            try:
+                state.cost_history = update_usage_history(state, day_key=previous_day)
+            except Exception:
+                LOGGER.warning("previous-day usage archive failed: %s", previous_day)
         self._current_day_key = current_day
         self.client.clear_runtime_caches()
         self._live_usage_overlay = None
@@ -12825,6 +14199,7 @@ class FloatingMonitorApp:
         self._live_usage_verification_pending = False
         self._live_usage_verification_latest_when = None
         self._live_usage_verification_pending_tokens = 0
+        self._live_quota_reconcile_since = None
         samples = getattr(self, "_live_usage_rate_samples", None)
         if isinstance(samples, list):
             samples.clear()
@@ -12852,6 +14227,7 @@ class FloatingMonitorApp:
                 "quota_snapshot_at",
                 "quota_reset_unavailable",
                 "quota_snapshot_expired",
+                "quota_absent_confirmed",
                 "quota_idle",
                 "countdown_active",
                 "remaining_percent",
@@ -12870,41 +14246,151 @@ class FloatingMonitorApp:
                 "window_minutes",
             )
             quota_boundary_changed = False
+            quota_reconcile_since: datetime | None = None
+            refreshed_providers: set[str] = set()
 
             def quota_boundary_signature(window: dict[str, Any]) -> tuple[Any, ...]:
                 return tuple(window.get(field) for field in quota_boundary_signature_fields)
 
-            def merge_account_windows(row: dict[str, Any], quota: dict[str, Any]) -> None:
-                nonlocal quota_boundary_changed
+            def merge_account_windows(
+                row: dict[str, Any],
+                quota: dict[str, Any],
+                provider: str,
+            ) -> None:
+                nonlocal quota_boundary_changed, quota_reconcile_since
                 for window_key in ("window_5h", "window_7d", "window_cycle"):
                     quota_window = quota.get(window_key)
                     if not isinstance(quota_window, dict):
                         continue
                     current = dict(row.get(window_key) or {})
                     previous_signature = quota_boundary_signature(current)
+                    previous_live_signature = self._live_quota_window_signature(
+                        current
+                    )
                     for field in quota_fields:
                         current.pop(field, None)
                     current.update(quota_window)
                     if quota_boundary_signature(current) != previous_signature:
                         quota_boundary_changed = True
+                    current_live_signature = self._live_quota_window_signature(
+                        current
+                    )
+                    if (
+                        previous_live_signature is not None
+                        and current_live_signature is not None
+                        and previous_live_signature != current_live_signature
+                    ):
+                        new_start = _parse_time(current_live_signature[1])
+                        if new_start is not None:
+                            new_start -= timedelta(
+                                minutes=current_live_signature[0]
+                            )
+                        previous_start = _parse_time(
+                            str(current.get("start_at") or "")
+                        )
+                        if (
+                            new_start is not None
+                            and (
+                                previous_start is None
+                                or abs(
+                                    (previous_start - new_start).total_seconds()
+                                )
+                                > 2.0
+                            )
+                        ):
+                            self._reset_usage_for_new_quota_boundary(
+                                current,
+                                current_live_signature,
+                            )
+                            if (
+                                quota_reconcile_since is None
+                                or new_start < quota_reconcile_since
+                            ):
+                                quota_reconcile_since = new_start
+                    if (
+                        previous_live_signature is not None
+                        and previous_live_signature != current_live_signature
+                        and isinstance(
+                            getattr(self, "_live_usage_overlay", None),
+                            dict,
+                        )
+                    ):
+                        quota_targets = self._live_usage_overlay.get("quota_windows")
+                        if isinstance(quota_targets, dict):
+                            provider_targets = quota_targets.get(provider)
+                            if not isinstance(provider_targets, dict):
+                                provider_key = account_display_key(provider)
+                                provider_targets = next(
+                                    (
+                                        targets
+                                        for label, targets in quota_targets.items()
+                                        if account_display_key(label) == provider_key
+                                        and isinstance(targets, dict)
+                                    ),
+                                    None,
+                                )
+                            if isinstance(provider_targets, dict):
+                                provider_targets.pop(window_key, None)
                     row[window_key] = current
 
             for provider, quota in accounts.items():
                 if not isinstance(quota, dict):
                     continue
                 provider_key = account_display_key(provider)
+                refreshed_providers.add(str(provider))
                 for row in raw_rows:
                     if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key:
-                        merge_account_windows(row, quota)
+                        merge_account_windows(row, quota, str(provider))
                         break
                 for row in top_rows:
                     if isinstance(row, dict) and account_display_key(row.get("name")) == provider_key:
-                        merge_account_windows(row, quota)
+                        merge_account_windows(row, quota, str(provider))
                         break
+            live_overlay = getattr(self, "_live_usage_overlay", None)
+            records = getattr(self, "_live_usage_event_records", {})
+            if isinstance(live_overlay, dict) and isinstance(records, dict):
+                for provider in refreshed_providers:
+                    provider_key = account_display_key(provider)
+                    for event in records.values():
+                        if (
+                            not isinstance(event, dict)
+                            or event.get("attribution_pending")
+                            or account_display_key(event.get("provider")) != provider_key
+                            or not isinstance(event.get("when"), datetime)
+                        ):
+                            continue
+                        self._record_live_quota_window_overlay(
+                            live_overlay,
+                            provider,
+                            event,
+                            event["when"],
+                        )
+                self._apply_live_quota_window_overlay(self.state)
             if quota_boundary_changed:
                 # The live watcher updates today's totals, but a changed quota
                 # boundary also requires rebuilding the 5h/7d Token and cost.
                 self._full_refresh_requested = True
+            if quota_reconcile_since is not None:
+                pending_since = getattr(
+                    self,
+                    "_live_quota_reconcile_since",
+                    None,
+                )
+                if (
+                    not isinstance(pending_since, datetime)
+                    or quota_reconcile_since < pending_since
+                ):
+                    self._live_quota_reconcile_since = quota_reconcile_since
+                self._live_usage_verification_pending = True
+                pending_latest = getattr(
+                    self,
+                    "_live_usage_verification_latest_when",
+                    None,
+                )
+                if not isinstance(pending_latest, datetime):
+                    self._live_usage_verification_latest_when = quota_reconcile_since
+                self._schedule_live_usage_reconcile(LIVE_USAGE_VERIFY_DELAY_MS)
+                self._persist_live_usage_checkpoint(force=True)
             self.state.updated_at = time.time()
             self._draw()
         finally:
@@ -13073,7 +14559,11 @@ class FloatingMonitorApp:
                 reconcile_live_overlay = bool(getattr(self, "_live_usage_overlay", None)) and not logs_busy and (
                     time.monotonic() - last_attempt >= FULL_USAGE_REFRESH_RETRY_SECONDS
                 )
-                if not attribution_started and (full_refresh_due or reconcile_live_overlay):
+                if (
+                    not attribution_started
+                    and not logs_busy
+                    and (full_refresh_due or reconcile_live_overlay)
+                ):
                     if self.refresh_async():
                         self._last_forced_full_refresh_at = time.monotonic()
         finally:

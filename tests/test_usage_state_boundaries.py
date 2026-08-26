@@ -889,6 +889,35 @@ class UsageSyncLabelTests(unittest.TestCase):
     def test_routine_cached_baseline_does_not_replace_normal_update_time(self) -> None:
         self.assertEqual(monitor.usage_sync_label({"state": "cached"}), "")
 
+    def test_timeout_with_recent_live_coverage_reports_queued_full_check(self) -> None:
+        sync = {
+            "state": "timeout",
+            "live_overlay_covers_cache": True,
+            "live_overlay_latest_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        self.assertTrue(monitor.usage_sync_has_live_coverage(sync))
+        self.assertEqual(
+            monitor.usage_sync_label(sync),
+            "\u5b9e\u65f6\u7edf\u8ba1\u4e2d / \u5168\u91cf\u6838\u5bf9\u6392\u961f",
+        )
+
+    def test_timeout_with_stale_live_coverage_keeps_warning(self) -> None:
+        sync = {
+            "state": "timeout",
+            "live_overlay_covers_cache": True,
+            "live_overlay_latest_at": (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=monitor.LIVE_USAGE_SYNC_FRESH_SECONDS + 1)
+            ).isoformat(),
+        }
+
+        self.assertFalse(monitor.usage_sync_has_live_coverage(sync))
+        self.assertEqual(
+            monitor.usage_sync_label(sync),
+            "\u8865\u5f55\u8d85\u65f6 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
+        )
+
     def test_sync_failures_still_show_a_warning(self) -> None:
         self.assertTrue(monitor.usage_sync_label({"state": "timeout"}))
         self.assertTrue(monitor.usage_sync_label({"state": "error"}))
@@ -1169,6 +1198,46 @@ class UsageHistoryIsolationTests(unittest.TestCase):
         self.assertEqual(state.today_tokens, 100_000)
         self.assertEqual(saved["tokens"], 1_000_000)
 
+    def test_midnight_rollover_archives_live_overlay_to_previous_day(self) -> None:
+        self.seed_history("local")
+        next_day = (date.fromisoformat(self.day) + timedelta(days=1)).isoformat()
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._current_day_key = self.day
+        app.client = MagicMock()
+        app.state = monitor.MonitorState(
+            usage_source="local",
+            today_requests=180,
+            today_tokens=1_800_000,
+            today_account_cost=18.0,
+            client_usage={
+                "date": self.day,
+                "providers": [
+                    {
+                        "name": "Codex local - account@example.com",
+                        "requests": 180,
+                        "tokens": 1_800_000,
+                        "cost": 18.0,
+                        "models": {"gpt-test": 1_800_000},
+                    }
+                ],
+            },
+        )
+        app._live_usage_overlay = {"tokens": 800_000}
+        app._clear_live_usage_checkpoint = MagicMock()
+        app._live_usage_rate_samples = []
+        app._account_range_user_selected = False
+
+        with patch.object(monitor, "today_key", return_value=next_day):
+            changed = app._handle_day_rollover()
+
+        saved = monitor.load_usage_history()["days"]
+        self.assertTrue(changed)
+        self.assertEqual(saved[self.day]["tokens"], 1_800_000)
+        self.assertEqual(saved[self.day]["requests"], 180)
+        self.assertEqual(saved[self.day]["providers"][0]["tokens"], 1_800_000)
+        self.assertNotIn(next_day, saved)
+        self.assertIsNone(app._live_usage_overlay)
+
     def test_claude_schema_upgrade_replaces_legacy_history_high_water(self) -> None:
         self.seed_history("local")
         state = monitor.MonitorState(
@@ -1354,7 +1423,7 @@ class AccountUsageSortTests(unittest.TestCase):
         self.assertEqual(ordered_5h[0]["name"], "current-light")
         self.assertEqual(ordered_7d[0]["name"], "current-light")
 
-    def test_today_sorts_by_tokens_but_30d_and_cycle_sort_by_recent_use(self) -> None:
+    def test_today_and_30d_sort_by_tokens_but_cycle_sorts_by_recent_use(self) -> None:
         rows = [
             {
                 "name": "recent-light",
@@ -1375,7 +1444,7 @@ class AccountUsageSortTests(unittest.TestCase):
         ordered_cycle = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "cycle"))
 
         self.assertEqual(ordered_today[0]["name"], "old-heavy")
-        self.assertEqual(ordered_30d[0]["name"], "recent-light")
+        self.assertEqual(ordered_30d[0]["name"], "old-heavy")
         self.assertEqual(ordered_cycle[0]["name"], "recent-light")
 
     def test_accounts_without_usage_time_sort_after_used_accounts(self) -> None:
@@ -1388,11 +1457,11 @@ class AccountUsageSortTests(unittest.TestCase):
             },
         ]
 
-        ordered = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "30d"))
+        ordered = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "cycle"))
 
         self.assertEqual([row["name"] for row in ordered], ["used", "never-used"])
 
-    def test_30d_history_uses_last_day_seen_when_exact_time_is_missing(self) -> None:
+    def test_30d_history_sorts_by_total_usage_when_exact_time_is_missing(self) -> None:
         recent_day = monitor.date_key(1)
         old_day = monitor.date_key(10)
         history = {
@@ -1433,7 +1502,7 @@ class AccountUsageSortTests(unittest.TestCase):
             rows = app._usage_range_providers("30d")
         ordered = sorted(rows, key=lambda row: monitor.account_usage_sort_key(row, "30d"))
 
-        self.assertEqual([row["name"] for row in ordered], ["recent-light", "old-heavy"])
+        self.assertEqual([row["name"] for row in ordered], ["old-heavy", "recent-light"])
 
     def test_window_only_accounts_are_hidden_only_from_today(self) -> None:
         row = {
@@ -1445,6 +1514,29 @@ class AccountUsageSortTests(unittest.TestCase):
         self.assertTrue(monitor.account_row_available_for_range(row, "5h"))
         self.assertTrue(monitor.account_row_available_for_range(row, "7d"))
         self.assertTrue(monitor.account_row_available_for_range(row, "cycle"))
+
+    def test_5h_quota_tab_excludes_unlimited_and_analysis_only_rows(self) -> None:
+        self.assertFalse(
+            monitor.account_has_5h_quota(
+                {
+                    "window_5h": {
+                        "quota_available": False,
+                        "quota_unlimited": True,
+                        "tokens": 123_456,
+                    }
+                }
+            )
+        )
+        self.assertFalse(
+            monitor.account_has_5h_quota(
+                {"window_5h": {"quota_available": False, "tokens": 123_456}}
+            )
+        )
+        self.assertTrue(
+            monitor.account_has_5h_quota(
+                {"window_5h": {"quota_available": True, "window_minutes": 300}}
+            )
+        )
 
     def test_cycle_quota_tab_requires_a_real_cycle_account(self) -> None:
         self.assertFalse(monitor.account_has_cycle_quota_window({"window_cycle": {}}))
@@ -4314,6 +4406,87 @@ class LatestRequestFallbackTests(unittest.TestCase):
         self.assertEqual(providers["Codex local - plus@example.com"]["tokens"], 1_000)
         self.assertNotIn(client_usage_export.API_SERVICE_AGGREGATE_LABEL, providers)
 
+    def test_live_catchup_scans_quota_boundary_but_summarizes_current_day(self) -> None:
+        quota_start = datetime(2026, 8, 25, 22, 17, 0)
+        day_start = datetime(2026, 8, 26, 0, 0, 0)
+        through = day_start + timedelta(hours=1)
+        provider = "Codex local - plus@example.com"
+        previous_day_event = client_usage_export.UsageEvent(
+            when=quota_start + timedelta(minutes=10),
+            model="gpt-test",
+            input_tokens=70,
+            cached_tokens=20,
+            output_tokens=10,
+            session_id="session-previous",
+        )
+        current_day_event = client_usage_export.UsageEvent(
+            when=day_start + timedelta(minutes=10),
+            model="gpt-test",
+            input_tokens=150,
+            cached_tokens=30,
+            output_tokens=20,
+            session_id="session-current",
+        )
+        events = [previous_day_event, current_day_event]
+
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(client_usage_export, "record_current_opencodex_account_snapshot"),
+            patch.object(
+                client_usage_export,
+                "scan_all_codex_events",
+                return_value=events,
+            ) as codex_scan,
+            patch.object(client_usage_export, "codex_speed_history", return_value=[]),
+            patch.object(client_usage_export, "current_codex_account_label", return_value=""),
+            patch.object(client_usage_export, "load_attribution_ledger", return_value={}),
+            patch.object(client_usage_export, "load_attribution_verdicts", return_value={}),
+            patch.object(client_usage_export, "scan_cockpit_codex_switch_markers", return_value=[]),
+            patch.object(client_usage_export, "load_account_timeline", return_value=[]),
+            patch.object(client_usage_export, "scan_cockpit_codex_account_markers", return_value=[]),
+            patch.object(client_usage_export, "scan_cockpit_codex_affinity_events", return_value=[]),
+            patch.object(
+                client_usage_export,
+                "reconcile_cockpit_request_usage_events",
+                return_value=events,
+            ),
+            patch.object(
+                client_usage_export,
+                "attribute_codex_events_by_account",
+                return_value={provider: events},
+            ),
+            patch.object(
+                client_usage_export,
+                "merge_missing_cockpit_account_events",
+                return_value=({provider: events}, 0),
+            ),
+            patch.object(
+                client_usage_export,
+                "resolve_api_service_event_accounts",
+                return_value=({provider: events}, {}, 0),
+            ),
+            patch.object(client_usage_export, "previous_active_session_account_labels", return_value={}),
+            patch.object(client_usage_export, "cockpit_codex_speed_by_label", return_value={}),
+            patch.object(client_usage_export, "scan_claude", return_value=client_usage_export.UsageBucket()),
+            patch.object(client_usage_export, "scan_grok_events", return_value=[]),
+        ):
+            root = Path(temporary_directory)
+            payload = client_usage_export.build_live_catchup_payload(
+                root,
+                root / ".codex" / "sessions",
+                root / "usage.json",
+                quota_start,
+                through,
+            )
+
+        self.assertEqual(codex_scan.call_args.args[2:4], (quota_start, through))
+        self.assertEqual(len(payload["events"]), 2)
+        self.assertEqual(payload["summary"]["tokens"], 200)
+        self.assertEqual(payload["summary"]["requests"], 1)
+        providers = {row["name"]: row for row in payload["providers"]}
+        self.assertEqual(providers[provider]["tokens"], 200)
+        self.assertEqual(providers[provider]["requests"], 1)
+
     def test_cockpit_zero_usage_failures_are_not_account_markers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -5422,6 +5595,67 @@ class LocalExportHighWaterTests(unittest.TestCase):
 
 
 class WindowSemanticsTests(unittest.TestCase):
+    def test_fresh_cockpit_backup_supplies_newer_plus_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup_dir = root / ".antigravity_cockpit" / "backups"
+            backup_dir.mkdir(parents=True)
+            now = datetime(2026, 8, 25, 15, 0, tzinfo=client_usage_export.LOCAL_TZ)
+            reset_at = int(
+                datetime(
+                    2026,
+                    9,
+                    1,
+                    10,
+                    5,
+                    37,
+                    tzinfo=client_usage_export.LOCAL_TZ,
+                ).timestamp()
+            )
+            backup = backup_dir / "cockpit_auto_backup_full_2026-08-25_14-48-55.json"
+            backup.write_text(
+                json.dumps(
+                    {
+                        "exported_at": "2026-08-25T06:48:55Z",
+                        "accounts": {
+                            "platforms": {
+                                "codex": {
+                                    "exported_data": [
+                                        {
+                                            "id": "pawns-id",
+                                            "email": "pawns@example.com",
+                                            "plan_type": "plus",
+                                            "quota": {
+                                                "hourly_percentage": 5,
+                                                "hourly_reset_time": reset_at,
+                                                "hourly_window_minutes": 10_080,
+                                                "hourly_window_present": True,
+                                                "weekly_percentage": 100,
+                                                "weekly_reset_time": None,
+                                                "weekly_window_present": False,
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            quota = client_usage_export.cockpit_backup_quota_by_label(root, now)
+
+        windows = quota["Codex local - pawns@example.com"]
+        self.assertEqual(windows["window_7d"]["remaining_percent"], 5.0)
+        self.assertEqual(windows["window_7d"]["utilization"], 95.0)
+        self.assertEqual(windows["window_7d"]["window_minutes"], 10_080)
+        self.assertTrue(windows["window_5h"]["quota_unlimited"])
+        self.assertEqual(
+            windows["window_7d"]["quota_transport"],
+            "cockpit-backup",
+        )
+
     def test_unlimited_5h_window_is_not_counted_as_quota_pressure(self) -> None:
         app = object.__new__(monitor.FloatingMonitorApp)
         app.state = monitor.MonitorState(
@@ -5448,6 +5682,39 @@ class WindowSemanticsTests(unittest.TestCase):
         self.assertFalse(rows[0]["has_quota"])
         self.assertTrue(rows[0]["windows"][0]["quota_unlimited"])
         self.assertFalse(rows[0]["windows"][0]["pressure_active"])
+
+    def test_budget_omits_confirmed_absent_pro_5h_window(self) -> None:
+        app = object.__new__(monitor.FloatingMonitorApp)
+        app.state = monitor.MonitorState(
+            top_accounts=[
+                {
+                    "name": "Codex local - pro@example.com",
+                    "tokens": 900,
+                    "requests": 3,
+                    "window_5h": {
+                        "tokens": 900,
+                        "requests": 3,
+                        "cost": 0.9,
+                        "quota_available": False,
+                        "quota_absent_confirmed": True,
+                    },
+                    "window_7d": {
+                        "tokens": 900,
+                        "requests": 3,
+                        "cost": 0.9,
+                        "quota_available": True,
+                        "remaining_percent": 87.0,
+                        "utilization": 13.0,
+                    },
+                }
+            ]
+        )
+
+        rows = app._budget_rows()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([window["label"] for window in rows[0]["windows"]], ["7d"])
+        self.assertTrue(rows[0]["has_quota"])
 
     def write_quota_account(
         self,
@@ -5716,6 +5983,55 @@ class WindowSemanticsTests(unittest.TestCase):
         assert quota is not None
         self.assertTrue(quota["window_5h"]["quota_unlimited"])
         self.assertEqual(quota["window_7d"]["remaining_percent"], 26.0)
+
+    def test_official_pro_7d_response_confirms_5h_absent(self) -> None:
+        checked_at = datetime(2026, 8, 26, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
+        quota = client_usage_export.official_quota_from_usage_response(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "limit_window_seconds": 7 * 24 * 60 * 60,
+                        "reset_at": checked_at.timestamp() + 6 * 24 * 60 * 60,
+                        "used_percent": 13,
+                    },
+                    "secondary_window": None,
+                },
+            },
+            checked_at,
+        )
+
+        assert quota is not None
+        self.assertFalse(quota["window_5h"]["quota_available"])
+        self.assertTrue(quota["window_5h"]["quota_absent_confirmed"])
+        self.assertEqual(quota["window_5h"]["quota_source"], "official-wham")
+        self.assertEqual(quota["window_7d"]["remaining_percent"], 87.0)
+
+    def test_official_absent_window_overrides_newer_sidecar_value(self) -> None:
+        current = {
+            "quota_available": True,
+            "quota_stale": False,
+            "quota_source": "sidecar-reserve",
+            "quota_snapshot_at": "2026-08-26T12:01:00+08:00",
+            "window_minutes": 300,
+            "remaining_percent": 87.0,
+            "utilization": 13.0,
+            "resets_at": "",
+            "quota_reset_unavailable": True,
+        }
+        official = {
+            "quota_available": False,
+            "quota_stale": False,
+            "quota_source": "official-wham",
+            "quota_snapshot_at": "2026-08-26T12:00:00+08:00",
+            "quota_absent_confirmed": True,
+        }
+
+        merged = client_usage_export.prefer_quota_window(current, official)
+
+        self.assertFalse(merged["quota_available"])
+        self.assertTrue(merged["quota_absent_confirmed"])
+        self.assertEqual(merged["quota_source"], "official-wham")
 
     def test_official_quota_empty_rate_limit_is_not_success(self) -> None:
         checked_at = datetime(2026, 7, 14, 12, 0, tzinfo=client_usage_export.LOCAL_TZ)
@@ -8464,6 +8780,58 @@ class CodexUsageFileWatcherTests(unittest.TestCase):
             self.assertEqual(watcher.poll_events(), [])
             self.assertTrue(watcher.token_count_changed)
 
+    def test_initial_checkpoint_cutoff_recovers_only_new_tail_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout-session.jsonl"
+
+            def token_row(timestamp: str, total_tokens: int) -> dict:
+                return {
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": total_tokens,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": total_tokens,
+                            },
+                            "total_token_usage": {
+                                "input_tokens": total_tokens,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                            },
+                        },
+                    },
+                }
+
+            rows = [
+                {"type": "session_meta", "payload": {}},
+                token_row("2026-08-24T10:00:00Z", 50),
+                token_row("2026-08-24T10:05:00Z", 75),
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            watcher = monitor.CodexUsageFileWatcher(
+                root,
+                initial_since=datetime.fromisoformat(
+                    "2026-08-24T10:02:00+00:00"
+                ),
+            )
+
+            recovered = watcher.poll_events()
+
+            self.assertEqual(
+                [event["total_tokens"] for event in recovered],
+                [75],
+            )
+            self.assertTrue(watcher.token_count_changed)
+            self.assertEqual(watcher.poll_events(), [])
+
     def test_live_event_carries_the_session_id_from_its_rollout_path(self) -> None:
         session_id = "019f54a2-9034-7651-a517-89989e6d6b1b"
         watcher = monitor.CodexUsageFileWatcher(Path("unused"))
@@ -8613,6 +8981,193 @@ class CodexUsageFileWatcherTests(unittest.TestCase):
                 events = watcher.poll_events()
             self.assertEqual([event["total_tokens"] for event in events], [400])
 
+    def test_new_non_fork_rollout_emits_immediately_when_metadata_is_known(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll_events()
+            today = datetime.now()
+            path = (
+                root
+                / f"{today.year:04d}"
+                / f"{today.month:02d}"
+                / f"{today.day:02d}"
+                / "rollout-new-non-fork.jsonl"
+            )
+            path.parent.mkdir(parents=True)
+            rows = [
+                {
+                    "timestamp": "2026-07-15T03:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "session-new"},
+                },
+                {
+                    "timestamp": "2026-07-15T03:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 90,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 10,
+                                "total_tokens": 100,
+                            },
+                            "total_token_usage": {
+                                "input_tokens": 90,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 10,
+                            },
+                        },
+                    },
+                },
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            events = watcher.poll_events()
+
+            self.assertEqual([event["total_tokens"] for event in events], [100])
+            self.assertFalse(watcher.reconciliation_needed)
+            self.assertNotIn(path, watcher._reconciliation_paths)
+
+    def test_new_fork_rollout_emits_only_rows_after_known_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll_events()
+            today = datetime.now()
+            path = (
+                root
+                / f"{today.year:04d}"
+                / f"{today.month:02d}"
+                / f"{today.day:02d}"
+                / "rollout-new-fork.jsonl"
+            )
+            path.parent.mkdir(parents=True)
+
+            def token_row(timestamp: str, total_tokens: int) -> dict:
+                return {
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": total_tokens - 10,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 10,
+                                "total_tokens": total_tokens,
+                            },
+                            "total_token_usage": {
+                                "input_tokens": total_tokens - 10,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 10,
+                            },
+                        },
+                    },
+                }
+
+            rows = [
+                {
+                    "timestamp": "2026-07-15T03:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "session-fork",
+                        "forked_from_id": "session-parent",
+                    },
+                },
+                token_row("2026-07-15T02:59:59Z", 1_000_000),
+                token_row("2026-07-15T03:00:03Z", 75),
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            events = watcher.poll_events()
+
+            self.assertEqual([event["total_tokens"] for event in events], [75])
+            self.assertFalse(watcher.reconciliation_needed)
+
+    def test_hot_file_capacity_covers_many_concurrent_sessions(self) -> None:
+        self.assertGreaterEqual(monitor.LIVE_USAGE_WATCH_HOT_FILE_LIMIT, 64)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            today = datetime.now()
+            day_root = (
+                root
+                / f"{today.year:04d}"
+                / f"{today.month:02d}"
+                / f"{today.day:02d}"
+            )
+            day_root.mkdir(parents=True)
+            paths: list[Path] = []
+            for index in range(24):
+                path = day_root / f"rollout-{index:02d}.jsonl"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-07-15T03:00:00Z",
+                            "type": "session_meta",
+                            "payload": {"id": f"session-{index:02d}"},
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                paths.append(path)
+            watcher = monitor.CodexUsageFileWatcher(root)
+            watcher.poll_events()
+            for index, path in enumerate(paths):
+                row = {
+                    "timestamp": f"2026-07-15T03:01:{index:02d}Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 90 + index,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 10,
+                                "total_tokens": 100 + index,
+                            },
+                            "total_token_usage": {
+                                "input_tokens": 90 + index,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 10,
+                            },
+                        },
+                    },
+                }
+                self.append_text(path, json.dumps(row) + "\n")
+
+            events = watcher.poll_events()
+
+            self.assertEqual(len(events), 24)
+            self.assertEqual(
+                {event["total_tokens"] for event in events},
+                set(range(100, 124)),
+            )
+
+    def test_hot_file_fallback_polling_rotates_across_the_full_set(self) -> None:
+        watcher = monitor.CodexUsageFileWatcher(Path("unused"))
+        tracked = {
+            Path(f"rollout-{index:02d}.jsonl")
+            for index in range(monitor.LIVE_USAGE_WATCH_HOT_POLL_LIMIT + 8)
+        }
+        watcher._hot_files = {
+            path: index for index, path in enumerate(sorted(tracked))
+        }
+
+        first = watcher._hot_poll_paths()
+        second = watcher._hot_poll_paths()
+
+        self.assertEqual(len(first), monitor.LIVE_USAGE_WATCH_HOT_POLL_LIMIT)
+        self.assertEqual(first | second, tracked)
+
     def test_marker_split_across_writes_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -8755,6 +9310,11 @@ class CodexUsageFileWatcherTests(unittest.TestCase):
             watcher.next_poll_interval_ms(170.0),
             monitor.LIVE_USAGE_WATCH_COLD_INTERVAL_MS,
         )
+        self.assertFalse(watcher.has_recent_activity(60.0))
+        watcher._activity_observed = True
+        watcher._last_activity_at = 100.0
+        with patch.object(monitor.time, "monotonic", return_value=105.0):
+            self.assertTrue(watcher.has_recent_activity(60.0))
 
     def test_new_rollout_reconciliation_waits_for_observation_window(self) -> None:
         watcher = monitor.CodexUsageFileWatcher(Path("unused"))
@@ -8900,6 +9460,32 @@ class LiveActiveSessionScanTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["provider"], "Codex local - account@example.com")
         self.assertEqual(rows[0]["activity_source"], "live-session-tail")
+
+    def test_direct_account_switch_overrides_stale_cached_session_account(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_session(root, "task_started")
+            with patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - current@example.com",
+            ):
+                rows = monitor.scan_live_codex_active_sessions(
+                    root,
+                    [
+                        {
+                            "session_id": self.SESSION_ID,
+                            "provider": "Codex local - previous@example.com",
+                            "model": "gpt-test",
+                        }
+                    ],
+                )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["provider"],
+            "Codex local - current@example.com",
+        )
 
     def test_unchanged_live_tail_is_not_read_twice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -10116,6 +10702,21 @@ class ManualRefreshTests(unittest.TestCase):
         self.assertEqual(app.client.clear_calls, 1)
         app._refresh_lock.release()
 
+    def test_manual_refresh_waits_for_live_catchup_export(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._refresh_lock = threading.Lock()
+        app._live_catchup_lock = threading.Lock()
+        app._live_catchup_lock.acquire()
+        app._refresh_pending = False
+        app._draw = lambda: None
+
+        started = app.refresh_async(force=True)
+
+        self.assertFalse(started)
+        self.assertTrue(app._refresh_pending)
+        self.assertFalse(app._refresh_lock.locked())
+        app._live_catchup_lock.release()
+
 
 class LiveUsageOverlayTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -10202,6 +10803,87 @@ class LiveUsageOverlayTests(unittest.TestCase):
         self.assertEqual(app.state.today_requests, 3)
         self.assertEqual(app.state.client_usage, original_client_usage)
 
+    def test_live_overlay_clears_timeout_presentation_only_when_it_covers_cache(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        latest = datetime.now(timezone.utc)
+        app.state.usage_sync = {
+            "state": "timeout",
+            "fresh": False,
+            "cache_used": True,
+        }
+        app.state.client_usage["scan_status"] = {
+            "through": (latest - timedelta(minutes=1)).isoformat(),
+        }
+        app._live_usage_overlay = {
+            "base_today_tokens": 100,
+            "base_today_requests": 2,
+            "base_today_cost": 0.0,
+            "tokens": 50,
+            "requests": 1,
+            "cost": 0.5,
+            "input_tokens": 30,
+            "cached_input_tokens": 10,
+            "output_tokens": 10,
+            "latest_when": latest,
+            "providers": {},
+            "base_hourly": app._live_hourly_snapshot(),
+            "hourly": {},
+        }
+
+        app._apply_live_usage_overlay(app.state)
+
+        self.assertTrue(
+            app.state.usage_sync["live_overlay_covers_cache"]
+        )
+        self.assertEqual(
+            app.state.usage_sync["live_overlay_latest_at"],
+            latest.astimezone(monitor.CN_TZ).isoformat(timespec="seconds"),
+        )
+        self.assertEqual(
+            monitor.usage_sync_label(app.state.usage_sync),
+            "\u5b9e\u65f6\u7edf\u8ba1\u4e2d / \u5168\u91cf\u6838\u5bf9\u6392\u961f",
+        )
+
+    def test_live_overlay_does_not_hide_timeout_before_cached_cutoff(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        latest = datetime.now(timezone.utc)
+        app.state.usage_sync = {
+            "state": "timeout",
+            "fresh": False,
+            "cache_used": True,
+        }
+        app.state.client_usage["scan_status"] = {
+            "through": latest.isoformat(),
+        }
+        app._live_usage_overlay = {
+            "base_today_tokens": 100,
+            "base_today_requests": 2,
+            "base_today_cost": 0.0,
+            "tokens": 50,
+            "requests": 1,
+            "cost": 0.5,
+            "input_tokens": 30,
+            "cached_input_tokens": 10,
+            "output_tokens": 10,
+            "latest_when": latest - timedelta(minutes=2),
+            "providers": {},
+            "base_hourly": app._live_hourly_snapshot(),
+            "hourly": {},
+        }
+
+        app._apply_live_usage_overlay(app.state)
+
+        self.assertNotIn(
+            "live_overlay_covers_cache",
+            app.state.usage_sync,
+        )
+        self.assertEqual(
+            monitor.usage_sync_label(app.state.usage_sync),
+            "\u8865\u5f55\u8d85\u65f6 / \u663e\u793a\u4e0a\u6b21\u6570\u636e",
+        )
+
     def test_live_event_updates_its_hourly_bucket_immediately(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
@@ -10267,7 +10949,10 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         self.assertEqual(app.state.today_tokens, 100 + first_total)
         self.assertTrue(app._live_usage_verification_pending)
-        self.assertEqual(app._live_usage_verification_pending_tokens, final_batch)
+        self.assertEqual(
+            app._live_usage_verification_pending_tokens,
+            monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS,
+        )
 
     def test_startup_historical_load_is_not_blocked_by_runtime_spike_guard(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -10678,6 +11363,250 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         self.assertEqual(provider, "")
         self.assertEqual(model, "gpt-test")
+
+    def test_direct_current_account_overrides_stale_session_account(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "older-session",
+                "provider": "Codex local - hyenas@example.com",
+                "model": "gpt-5.6-sol",
+            }
+        ]
+        app.state.active_accounts = [
+            {
+                "provider": "Codex local - hyenas@example.com",
+                "model": "gpt-5.6-sol",
+            }
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - pawns@example.com",
+        ):
+            provider, model = app._live_event_request_context(
+                {
+                    "session_id": "shared-session",
+                    "event_id": "new-event",
+                    "model": "gpt-5.6-sol",
+                }
+            )
+
+        self.assertEqual(provider, "Codex local - pawns@example.com")
+        self.assertEqual(model, "gpt-5.6-sol")
+
+    def test_direct_placeholder_model_falls_back_to_latest_confirmed_model(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "current-session",
+                "provider": "Codex local - pawns@example.com",
+                "model": "-",
+            }
+        ]
+        app.state.latest_request = {
+            "provider": "Codex local - pawns@example.com",
+            "model": "gpt-5.6-sol",
+        }
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - pawns@example.com",
+        ):
+            provider, model = app._live_event_request_context(
+                {
+                    "session_id": "current-session",
+                    "event_id": "new-event",
+                    "model": "-",
+                }
+            )
+
+        self.assertEqual(provider, "Codex local - pawns@example.com")
+        self.assertEqual(model, "gpt-5.6-sol")
+
+    def test_direct_placeholder_model_is_priced_before_live_overlay(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=0, requests=0)
+        app.state.client_usage["active_sessions"] = [
+            {
+                "session_id": "current-session",
+                "provider": "Codex local - pawns@example.com",
+                "model": "-",
+            }
+        ]
+        app.state.latest_request = {
+            "provider": "Codex local - pawns@example.com",
+            "model": "gpt-5.6-sol",
+        }
+        app._live_usage_overlay = None
+        event = self.event()
+        event.update(
+            {
+                "event_id": "placeholder-model-event",
+                "session_id": "current-session",
+                "model": "-",
+            }
+        )
+
+        with (
+            patch.object(
+                monitor,
+                "_current_codex_account_label",
+                return_value="Codex local - pawns@example.com",
+            ),
+            patch.object(
+                monitor,
+                "estimate_live_usage_cost_with_resolution",
+                return_value=(1.25, True),
+            ) as estimate,
+        ):
+            self.assertTrue(
+                app._record_live_usage_events(
+                    [event],
+                    animate=False,
+                    cockpit_markers=[],
+                )
+            )
+
+        estimate.assert_called_once_with(event, "gpt-5.6-sol")
+        self.assertEqual(event["model"], "gpt-5.6-sol")
+        self.assertEqual(event["unpriced_tokens"], 0)
+        target = app._live_usage_overlay["providers"][
+            "Codex local - pawns@example.com"
+        ]
+        self.assertEqual(target["models"], {"gpt-5.6-sol": 50})
+        self.assertAlmostEqual(target["cost"], 1.25)
+
+    def test_current_direct_account_leads_7d_after_live_activity_sync(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.active_accounts = [
+            {
+                "provider": "Codex local - current@example.com",
+                "current": 2,
+            }
+        ]
+        app.state.latest_account_name = "Codex local - previous@example.com"
+        app.state.latest_request = {
+            "provider": "Codex local - previous@example.com",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        app.state.top_accounts = [
+            {
+                "name": "previous@example.com",
+                "tokens": 500,
+                "requests": 5,
+                "latest_at": datetime.now(timezone.utc).isoformat(),
+                "active_now": True,
+                "is_latest": True,
+            },
+            {
+                "name": "current@example.com",
+                "tokens": 100,
+                "requests": 1,
+                "latest_at": (
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+                "active_now": False,
+                "is_latest": False,
+            },
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - current@example.com",
+        ):
+            app._synchronize_account_activity_flags(app.state)
+
+        rows = list(app.state.top_accounts)
+        rows.sort(key=lambda row: monitor.account_usage_sort_key(row, "7d"))
+        self.assertEqual(rows[0]["name"], "current@example.com")
+        self.assertTrue(rows[0]["active_now"])
+        self.assertTrue(rows[0]["is_latest"])
+        self.assertFalse(rows[1]["active_now"])
+        self.assertFalse(rows[1]["is_latest"])
+
+    def test_idle_direct_login_is_latest_but_not_marked_active(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.active_accounts = []
+        app.state.top_accounts = [
+            {
+                "name": "current@example.com",
+                "active_now": True,
+                "is_latest": False,
+            }
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - current@example.com",
+        ):
+            app._synchronize_account_activity_flags(app.state)
+
+        self.assertFalse(app.state.top_accounts[0]["active_now"])
+        self.assertTrue(app.state.top_accounts[0]["is_latest"])
+
+    def test_active_account_reuses_known_model_only_within_same_provider(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["providers"] = []
+        app.state.top_accounts = []
+        app._live_active_lock = threading.Lock()
+        app._live_active_lock.acquire()
+        app._observe_cockpit_usage_revision = MagicMock()
+        app._reconcile_pending_live_events_with_markers = MagicMock(
+            return_value=False
+        )
+        app._promote_pending_latest_account_from_sessions = MagicMock()
+        app._draw = MagicMock()
+        now = datetime.now(timezone.utc)
+        sessions = [
+            {
+                "session_id": "new-placeholder",
+                "provider": "Codex local - current@example.com",
+                "model": "-",
+                "latest_at": now.isoformat(),
+                "active": True,
+            },
+            {
+                "session_id": "known-model",
+                "provider": "Codex local - current@example.com",
+                "model": "gpt-5.6-sol",
+                "latest_at": (now - timedelta(seconds=1)).isoformat(),
+                "active": True,
+            },
+            {
+                "session_id": "other-provider",
+                "provider": "Codex local - other@example.com",
+                "model": "gpt-other",
+                "latest_at": now.isoformat(),
+                "active": True,
+            },
+        ]
+
+        with patch.object(
+            monitor,
+            "_current_codex_account_label",
+            return_value="Codex local - current@example.com",
+        ):
+            app._apply_live_active_sessions(sessions)
+
+        self.assertEqual(sessions[0]["model"], "gpt-5.6-sol")
+        self.assertEqual(sessions[2]["model"], "gpt-other")
+        current = next(
+            row
+            for row in app.state.active_accounts
+            if "current@example.com" in str(row.get("provider") or "")
+        )
+        self.assertEqual(current["model"], "gpt-5.6-sol")
+        self.assertFalse(app._live_active_lock.locked())
 
     def test_api_service_context_does_not_book_provisional_route_hint(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -11332,6 +12261,10 @@ class LiveUsageOverlayTests(unittest.TestCase):
             first._live_usage_overlay = None
             first._live_usage_seen_ids = {}
             first._last_live_checkpoint_write_at = float("-inf")
+            quota_reconcile_since = datetime.now(timezone.utc) - timedelta(
+                minutes=5
+            )
+            first._live_quota_reconcile_since = quota_reconcile_since
             event = self.event()
             event["event_id"] = "persisted-event-1"
             event["cost"] = 1.25
@@ -11350,11 +12283,501 @@ class LiveUsageOverlayTests(unittest.TestCase):
             self.assertEqual(restarted.state.today_tokens, 150)
             self.assertEqual(restarted.state.today_requests, 3)
             self.assertAlmostEqual(restarted.state.today_account_cost, 1.25)
+            self.assertEqual(
+                restarted._live_quota_reconcile_since,
+                quota_reconcile_since,
+            )
+            self.assertTrue(restarted._live_usage_verification_pending)
             summary = restarted._usage_range_summary("24h")
             hour = event["when"].astimezone(monitor.CN_TZ).hour
             bucket = next(row for row in summary["series"] if row["hour"] == hour)
             self.assertEqual(bucket["tokens"], 150)
             self.assertEqual(bucket["requests"], 3)
+
+    def test_live_checkpoint_restores_quota_window_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            start_at = now - timedelta(days=1)
+            reset_at = start_at + timedelta(days=7)
+
+            def quota_state() -> monitor.MonitorState:
+                state = self.state(tokens=100, requests=2)
+                state.client_usage["providers"] = [
+                    {
+                        "name": "Codex local - account@example.com",
+                        "window_7d": {
+                            "requests": 2,
+                            "tokens": 100,
+                            "input_tokens": 60,
+                            "cached_input_tokens": 30,
+                            "output_tokens": 10,
+                            "cost": 1.0,
+                            "models": {"gpt-5.6-sol": 100},
+                            "start_at": start_at.isoformat(),
+                            "end_at": (now - timedelta(seconds=10)).isoformat(),
+                            "quota_available": True,
+                            "window_minutes": 10_080,
+                            "resets_at": reset_at.isoformat(),
+                        },
+                    }
+                ]
+                state.top_accounts = []
+                return state
+
+            first = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            first.state = quota_state()
+            first._last_live_checkpoint_write_at = float("-inf")
+            first._live_usage_overlay = {
+                "base_today_tokens": 100,
+                "base_today_requests": 2,
+                "base_today_cost": 1.0,
+                "base_authoritative_tokens": 100,
+                "base_updated_at": "",
+                "usage_accounting_schema": 0,
+                "tokens": 50,
+                "requests": 1,
+                "cost": 0.25,
+                "unpriced_tokens": 0,
+                "unpriced_models": {},
+                "input_tokens": 20,
+                "cached_input_tokens": 20,
+                "output_tokens": 10,
+                "latest_when": now,
+                "providers": {},
+                "base_hourly": [],
+                "hourly": {},
+            }
+            first._record_live_quota_window_overlay(
+                first._live_usage_overlay,
+                "Codex local - account@example.com",
+                {
+                    "event_id": "persisted-quota-event",
+                    "model": "gpt-5.6-sol",
+                    "total_tokens": 50,
+                    "input_tokens": 40,
+                    "cached_tokens": 20,
+                    "output_tokens": 10,
+                    "cost": 0.25,
+                    "unpriced_tokens": 0,
+                },
+                now,
+            )
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                self.assertTrue(first._persist_live_usage_checkpoint(force=True))
+                restarted = monitor.FloatingMonitorApp.__new__(
+                    monitor.FloatingMonitorApp
+                )
+                restarted.state = quota_state()
+                restarted._live_usage_overlay = None
+                restarted._live_usage_seen_ids = {}
+                restarted._last_live_checkpoint_write_at = float("-inf")
+                restarted._live_quota_reconcile_since = None
+                restarted._live_usage_verification_pending = False
+                restarted._live_usage_verification_latest_when = None
+                self.assertTrue(restarted._restore_live_usage_checkpoint())
+
+            window = restarted.state.client_usage["providers"][0]["window_7d"]
+            self.assertEqual(window["tokens"], 150)
+            self.assertEqual(window["requests"], 3)
+            self.assertAlmostEqual(window["cost"], 1.25)
+            self.assertTrue(window["window_usage_live"])
+
+    def test_checkpoint_rebases_quota_delta_after_newer_authoritative_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            start_at = now - timedelta(days=1)
+            reset_at = start_at + timedelta(days=7)
+            provider = "Codex local - account@example.com"
+            first = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            first.state = self.state(tokens=100, requests=2)
+            first._last_live_checkpoint_write_at = float("-inf")
+            first._live_usage_overlay = {
+                "base_today_tokens": 100,
+                "base_today_requests": 2,
+                "base_today_cost": 1.0,
+                "base_authoritative_tokens": 100,
+                "base_updated_at": "",
+                "usage_accounting_schema": 0,
+                "tokens": 100,
+                "requests": 2,
+                "cost": 1.0,
+                "unpriced_tokens": 0,
+                "unpriced_models": {},
+                "input_tokens": 60,
+                "cached_input_tokens": 30,
+                "output_tokens": 10,
+                "latest_when": now,
+                "providers": {
+                    provider: {
+                        "base_tokens": 100,
+                        "base_requests": 2,
+                        "base_cost": 1.0,
+                        "base_input_tokens": 60,
+                        "base_cached_input_tokens": 30,
+                        "base_output_tokens": 10,
+                        "base_models": {"gpt-5.6-sol": 100},
+                        "tokens": 100,
+                        "requests": 2,
+                        "cost": 1.0,
+                        "input_tokens": 60,
+                        "cached_input_tokens": 30,
+                        "output_tokens": 10,
+                        "models": {"gpt-5.6-sol": 100},
+                        "replace_existing": True,
+                        "latest_when": now,
+                        "latest_model": "gpt-5.6-sol",
+                    }
+                },
+                "quota_windows": {
+                    provider: {
+                        "window_7d": {
+                            "signature": [10_080, reset_at.isoformat()],
+                            "start_at": start_at,
+                            "resets_at": reset_at,
+                            "base_through": now - timedelta(seconds=20),
+                            "base_tokens": 0,
+                            "base_requests": 0,
+                            "base_cost": 0.0,
+                            "tokens": 70,
+                            "requests": 2,
+                            "cost": 0.7,
+                            "models": {"gpt-5.6-sol": 70},
+                            "event_ids": {},
+                            "latest_when": now,
+                        }
+                    }
+                },
+                "base_hourly": [],
+                "hourly": {},
+            }
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                self.assertTrue(first._persist_live_usage_checkpoint(force=True))
+                restarted = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+                restarted.state = self.state(tokens=150, requests=3)
+                restarted.state.today_account_cost = 1.5
+                restarted.state.client_usage["providers"] = [
+                    {
+                        "name": provider,
+                        "tokens": 150,
+                        "requests": 3,
+                        "cost": 1.5,
+                        "input_tokens": 90,
+                        "cached_input_tokens": 45,
+                        "output_tokens": 15,
+                        "models": {"gpt-5.6-sol": 150},
+                        "window_7d": {
+                            "tokens": 150,
+                            "requests": 3,
+                            "cost": 1.5,
+                            "input_tokens": 90,
+                            "cached_input_tokens": 45,
+                            "output_tokens": 15,
+                            "models": {"gpt-5.6-sol": 150},
+                            "start_at": start_at.isoformat(),
+                            "end_at": (now - timedelta(seconds=5)).isoformat(),
+                            "quota_available": True,
+                            "window_minutes": 10_080,
+                            "resets_at": reset_at.isoformat(),
+                        },
+                    }
+                ]
+                restarted.state.top_accounts = []
+                restarted._live_usage_overlay = None
+                restarted._live_usage_seen_ids = {}
+                restarted._last_live_checkpoint_write_at = float("-inf")
+
+                self.assertTrue(restarted._restore_live_usage_checkpoint())
+
+            window = restarted.state.client_usage["providers"][0]["window_7d"]
+            self.assertEqual(restarted.state.today_tokens, 200)
+            self.assertEqual(window["tokens"], 200)
+            self.assertEqual(window["requests"], 4)
+            self.assertAlmostEqual(window["cost"], 2.0)
+            self.assertEqual(window["models"]["gpt-5.6-sol"], 200)
+
+    def test_quota_rebase_runs_when_daily_checkpoint_base_already_matches(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start_at = now - timedelta(days=1)
+        reset_at = start_at + timedelta(days=7)
+        provider = "Codex local - account@example.com"
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=150, requests=3)
+        app.state.client_usage["providers"] = [
+            {
+                "name": provider,
+                "tokens": 150,
+                "requests": 3,
+                "cost": 1.5,
+                "models": {"gpt-5.6-sol": 150},
+                "window_7d": {
+                    "tokens": 150,
+                    "requests": 3,
+                    "cost": 1.5,
+                    "models": {"gpt-5.6-sol": 150},
+                    "start_at": start_at.isoformat(),
+                    "end_at": (now - timedelta(seconds=5)).isoformat(),
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": reset_at.isoformat(),
+                },
+            }
+        ]
+        app.state.top_accounts = []
+        app._live_usage_overlay = {
+            "providers": {
+                provider: {
+                    "base_tokens": 150,
+                    "base_requests": 3,
+                    "base_cost": 1.5,
+                    "base_models": {"gpt-5.6-sol": 150},
+                    "tokens": 50,
+                    "requests": 1,
+                    "cost": 0.5,
+                    "models": {"gpt-5.6-sol": 50},
+                    "latest_when": now,
+                    "latest_model": "gpt-5.6-sol",
+                }
+            },
+            "quota_windows": {
+                provider: {
+                    "window_7d": {
+                        "signature": [10_080, reset_at.isoformat()],
+                        "base_through": now - timedelta(seconds=20),
+                        "base_tokens": 0,
+                        "tokens": 20,
+                        "models": {"gpt-5.6-sol": 20},
+                    }
+                }
+            },
+        }
+
+        app._rebase_restored_live_quota_windows(app._live_usage_overlay)
+        app._apply_live_quota_window_overlay(app.state)
+
+        window = app.state.client_usage["providers"][0]["window_7d"]
+        self.assertEqual(window["tokens"], 200)
+        self.assertEqual(window["requests"], 4)
+        self.assertAlmostEqual(window["cost"], 2.0)
+
+    def test_quota_rebase_repairs_missing_event_at_same_authoritative_cutoff(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start_at = now - timedelta(days=1)
+        reset_at = start_at + timedelta(days=7)
+        through = now - timedelta(seconds=5)
+        provider = "Codex local - account@example.com"
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=150, requests=3)
+        app.state.client_usage["providers"] = [
+            {
+                "name": provider,
+                "tokens": 150,
+                "requests": 3,
+                "cost": 1.5,
+                "models": {"gpt-5.6-sol": 150},
+                "window_7d": {
+                    "tokens": 150,
+                    "requests": 3,
+                    "cost": 1.5,
+                    "models": {"gpt-5.6-sol": 150},
+                    "start_at": start_at.isoformat(),
+                    "end_at": through.isoformat(),
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": reset_at.isoformat(),
+                },
+            }
+        ]
+        app.state.top_accounts = []
+        app._live_usage_overlay = {
+            "providers": {
+                provider: {
+                    "base_tokens": 150,
+                    "base_requests": 3,
+                    "base_cost": 1.5,
+                    "base_models": {"gpt-5.6-sol": 150},
+                    "tokens": 50,
+                    "requests": 1,
+                    "cost": 0.5,
+                    "models": {"gpt-5.6-sol": 50},
+                    "latest_when": now,
+                    "latest_model": "gpt-5.6-sol",
+                }
+            },
+            "quota_windows": {
+                provider: {
+                    "window_7d": {
+                        "signature": [10_080, reset_at.isoformat()],
+                        "base_through": through,
+                        "base_tokens": 150,
+                        "base_requests": 3,
+                        "base_cost": 1.5,
+                        "base_models": {"gpt-5.6-sol": 150},
+                        "tokens": 20,
+                        "requests": 0,
+                        "cost": 0.2,
+                        "models": {"gpt-5.6-sol": 20},
+                    }
+                }
+            },
+        }
+
+        app._rebase_restored_live_quota_windows(app._live_usage_overlay)
+        app._apply_live_quota_window_overlay(app.state)
+
+        window = app.state.client_usage["providers"][0]["window_7d"]
+        self.assertEqual(window["tokens"], 200)
+        self.assertEqual(window["requests"], 4)
+        self.assertAlmostEqual(window["cost"], 2.0)
+
+    def test_quota_rebase_seeds_stable_window_when_catchup_rows_miss_parallel_session(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start_at = now - timedelta(days=1)
+        reset_at = start_at + timedelta(days=7)
+        through = now - timedelta(minutes=10)
+        provider = "Codex local - account@example.com"
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=150, requests=3)
+        app.state.client_usage["providers"] = [
+            {
+                "name": provider,
+                "tokens": 150,
+                "requests": 3,
+                "cost": 1.5,
+                "input_tokens": 90,
+                "cached_input_tokens": 45,
+                "output_tokens": 15,
+                "models": {"gpt-5.6-sol": 150},
+                "window_7d": {
+                    "tokens": 150,
+                    "requests": 3,
+                    "cost": 1.5,
+                    "input_tokens": 90,
+                    "cached_input_tokens": 45,
+                    "output_tokens": 15,
+                    "models": {"gpt-5.6-sol": 150},
+                    "start_at": start_at.isoformat(),
+                    "end_at": through.isoformat(),
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": reset_at.isoformat(),
+                },
+            }
+        ]
+        app.state.top_accounts = []
+        app._live_usage_overlay = {
+            "providers": {
+                provider: {
+                    "replace_existing": True,
+                    "base_tokens": 200,
+                    "base_requests": 4,
+                    "base_cost": 2.0,
+                    "base_input_tokens": 120,
+                    "base_cached_input_tokens": 60,
+                    "base_output_tokens": 20,
+                    "base_models": {"gpt-5.6-sol": 200},
+                    "tokens": 0,
+                    "requests": 0,
+                    "cost": 0.0,
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "models": {},
+                    "latest_when": now,
+                    "latest_model": "gpt-5.6-sol",
+                }
+            },
+            # No event rows for this provider reached the catch-up payload, so
+            # the quota target has not been created yet.
+            "quota_windows": {},
+        }
+
+        app._rebase_restored_live_quota_windows(app._live_usage_overlay)
+        app._apply_live_quota_window_overlay(app.state)
+
+        window = app.state.client_usage["providers"][0]["window_7d"]
+        self.assertEqual(window["tokens"], 200)
+        self.assertEqual(window["requests"], 4)
+        self.assertAlmostEqual(window["cost"], 2.0)
+        self.assertEqual(window["models"], {"gpt-5.6-sol": 200})
+
+    def test_quota_rebase_removes_reassigned_event_from_absolute_provider(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start_at = now - timedelta(days=1)
+        reset_at = start_at + timedelta(days=7)
+        through = now - timedelta(seconds=5)
+        provider = "Codex local - account@example.com"
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=150, requests=3)
+        app.state.client_usage["providers"] = [
+            {
+                "name": provider,
+                "tokens": 150,
+                "requests": 3,
+                "cost": 1.5,
+                "models": {"gpt-5.6-sol": 150},
+                "window_7d": {
+                    "tokens": 150,
+                    "requests": 3,
+                    "cost": 1.5,
+                    "models": {"gpt-5.6-sol": 150},
+                    "start_at": start_at.isoformat(),
+                    "end_at": through.isoformat(),
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": reset_at.isoformat(),
+                },
+            }
+        ]
+        app.state.top_accounts = []
+        app._live_usage_overlay = {
+            "providers": {
+                provider: {
+                    "replace_existing": True,
+                    "base_tokens": 150,
+                    "base_requests": 3,
+                    "base_cost": 1.5,
+                    "base_models": {"gpt-5.6-sol": 150},
+                    "tokens": 50,
+                    "requests": 1,
+                    "cost": 0.5,
+                    "models": {"gpt-5.6-terra": 50},
+                    "latest_when": now,
+                    "latest_model": "gpt-5.6-terra",
+                }
+            },
+            "quota_windows": {
+                provider: {
+                    "window_7d": {
+                        "signature": [10_080, reset_at.isoformat()],
+                        "base_through": through,
+                        "base_tokens": 150,
+                        "base_requests": 3,
+                        "base_cost": 1.5,
+                        "base_models": {"gpt-5.6-sol": 150},
+                        "tokens": 70,
+                        "requests": 2,
+                        "cost": 0.7,
+                        "models": {"gpt-5.6-sol": 70},
+                    }
+                }
+            },
+        }
+
+        app._rebase_restored_live_quota_windows(app._live_usage_overlay)
+        app._apply_live_quota_window_overlay(app.state)
+
+        window = app.state.client_usage["providers"][0]["window_7d"]
+        self.assertEqual(window["tokens"], 200)
+        self.assertEqual(window["requests"], 4)
+        self.assertAlmostEqual(window["cost"], 2.0)
+        self.assertEqual(
+            window["models"],
+            {"gpt-5.6-sol": 150, "gpt-5.6-terra": 50},
+        )
 
     def test_schema_three_live_checkpoint_is_discarded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -11422,13 +12845,69 @@ class LiveUsageOverlayTests(unittest.TestCase):
             self.assertEqual(app.state.today_requests, 2)
             self.assertAlmostEqual(app.state.today_account_cost, 1.2)
 
+    def test_live_checkpoint_supplies_schema_when_authoritative_cache_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "schema": monitor.LIVE_USAGE_CHECKPOINT_SCHEMA,
+                        "usage_accounting_schema": 1,
+                        "date": monitor.today_key(),
+                        "overlay": {
+                            "usage_accounting_schema": 1,
+                            "base_today_tokens": 100,
+                            "base_today_requests": 2,
+                            "base_today_cost": 1.0,
+                            "tokens": 50,
+                            "requests": 1,
+                            "cost": 0.5,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            app.state = self.state(tokens=0, requests=0)
+            app.state.client_usage["usage_accounting_schema"] = 0
+            app.state.today_account_cost = 0.0
+            app._live_usage_overlay = None
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                self.assertTrue(app._restore_live_usage_checkpoint())
+
+            self.assertTrue(checkpoint.exists())
+            self.assertEqual(app.state.client_usage["usage_accounting_schema"], 1)
+            self.assertEqual(app.state.today_tokens, 150)
+            self.assertEqual(app.state.today_requests, 3)
+            self.assertAlmostEqual(app.state.today_account_cost, 1.5)
+
+    def test_live_history_write_is_throttled(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=150, requests=3)
+        app._last_live_history_write_at = float("-inf")
+
+        with patch.object(
+            monitor,
+            "update_usage_history",
+            return_value={"today_tokens": 150},
+        ) as update_history:
+            self.assertTrue(app._update_live_usage_history_if_due())
+            self.assertFalse(app._update_live_usage_history_if_due())
+
+        update_history.assert_called_once_with(app.state)
+        self.assertEqual(app.state.cost_history, {"today_tokens": 150})
+
     def test_second_precision_catchup_boundary_overlaps_same_second(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
-        app.state.latest_request = {
+        app.state.client_usage["latest_request"] = {
             "created_at": (datetime.now(monitor.CN_TZ) - timedelta(seconds=10))
             .replace(microsecond=0)
             .isoformat(timespec="seconds")
+        }
+        app.state.latest_request = {
+            "created_at": datetime.now(monitor.CN_TZ).isoformat(timespec="microseconds")
         }
         app.state.client_usage["updated_at"] = (
             datetime.now(monitor.CN_TZ) - timedelta(minutes=1)
@@ -11437,14 +12916,53 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         since = app._live_usage_catchup_since()
 
-        expected = monitor._parse_time(app.state.latest_request["created_at"]) - timedelta(
-            microseconds=1
-        )
+        expected = monitor._parse_time(
+            app.state.client_usage["latest_request"]["created_at"]
+        ) - timedelta(microseconds=1)
         self.assertEqual(since, expected)
         same_second_event = monitor._parse_time(
-            app.state.latest_request["created_at"]
+            app.state.client_usage["latest_request"]["created_at"]
         ) + timedelta(milliseconds=500)
         self.assertLess(since, same_second_event)
+
+    def test_quota_boundary_forces_catchup_before_newer_canonical_cutoff(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        now = datetime.now(monitor.CN_TZ)
+        boundary = now - timedelta(hours=2)
+        app.state.client_usage["latest_request"] = {
+            "created_at": (now - timedelta(seconds=10)).isoformat(
+                timespec="microseconds"
+            )
+        }
+        app.state.client_usage["updated_at"] = (
+            now - timedelta(seconds=5)
+        ).isoformat(timespec="microseconds")
+        app._live_usage_overlay = {
+            "catchup_through": now - timedelta(seconds=3),
+        }
+        app._live_quota_reconcile_since = boundary
+
+        since = app._live_usage_catchup_since()
+
+        self.assertEqual(since, boundary.astimezone(timezone.utc))
+
+    def test_previous_day_quota_boundary_is_not_clamped_to_today(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        now = datetime.now(monitor.CN_TZ)
+        boundary = datetime.combine(
+            now.date() - timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=monitor.CN_TZ,
+        ) + timedelta(hours=22)
+        app.state.client_usage["updated_at"] = now.isoformat(timespec="microseconds")
+        app._live_usage_overlay = {"catchup_through": now - timedelta(seconds=2)}
+        app._live_quota_reconcile_since = boundary
+
+        since = app._live_usage_catchup_since()
+
+        self.assertEqual(since, boundary.astimezone(timezone.utc))
 
     def test_monitor_and_exporter_use_the_same_live_event_id(self) -> None:
         when = datetime.now(monitor.CN_TZ).replace(microsecond=123000)
@@ -11511,6 +13029,141 @@ class LiveUsageOverlayTests(unittest.TestCase):
             self.assertAlmostEqual(app.state.today_account_cost, 2.5)
             self.assertFalse(app._live_usage_verification_pending)
             self.assertFalse(app._live_catchup_lock.locked())
+
+    def test_catchup_provider_totals_survive_checkpoint_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            provider_name = "Codex local - hyenas@example.com"
+            through = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+            first = monitor.FloatingMonitorApp.__new__(
+                monitor.FloatingMonitorApp
+            )
+            first.state = self.state(tokens=100, requests=1)
+            first.state.client_usage.update(
+                {
+                    "cost": 1.0,
+                    "models": {"gpt-old": 100},
+                    "providers": [
+                        {
+                            "name": provider_name,
+                            "tokens": 100,
+                            "requests": 1,
+                            "cost": 1.0,
+                            "models": {"gpt-old": 100},
+                        }
+                    ],
+                }
+            )
+            first.state.today_account_cost = 1.0
+            first.state.top_accounts = [
+                {
+                    "name": provider_name,
+                    "tokens": 100,
+                    "requests": 1,
+                    "cost": 1.0,
+                    "models": {"gpt-old": 100},
+                }
+            ]
+            first._live_usage_overlay = None
+            first._live_usage_seen_ids = {}
+            first._live_usage_event_records = {}
+            first._live_usage_verification_pending = False
+            first._live_usage_verification_latest_when = None
+            first._live_usage_verification_pending_tokens = 0
+            first._live_usage_rate_samples = []
+            first._last_live_checkpoint_write_at = float("-inf")
+            first._live_catchup_lock = threading.Lock()
+            first._live_catchup_lock.acquire()
+            first.closed = False
+            first._draw = lambda: None
+            payload = {
+                "through": through.isoformat(),
+                "events": [],
+                "summary": {
+                    "tokens": 400,
+                    "requests": 4,
+                    "cost": 4.0,
+                    "models": {"gpt-5.6-sol": 400},
+                    "input_tokens": 40,
+                    "cached_input_tokens": 350,
+                    "output_tokens": 10,
+                    "latest_at": through.isoformat(),
+                    "latest_model": "gpt-5.6-sol",
+                },
+                "providers": [
+                    {
+                        "name": provider_name,
+                        "tokens": 375,
+                        "requests": 3,
+                        "cost": 3.75,
+                        "models": {"gpt-5.6-sol": 375},
+                        "input_tokens": 35,
+                        "cached_input_tokens": 330,
+                        "output_tokens": 10,
+                        "latest_at": through.isoformat(),
+                        "latest_model": "gpt-5.6-sol",
+                    }
+                ],
+            }
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                first._apply_live_usage_catchup(payload)
+
+            first_provider = first.state.client_usage["providers"][0]
+            self.assertEqual(first_provider["tokens"], 375)
+            self.assertEqual(first_provider["models"], {"gpt-5.6-sol": 375})
+            persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+            persisted_provider = persisted["overlay"]["providers"][provider_name]
+            self.assertTrue(persisted_provider["replace_existing"])
+            self.assertEqual(persisted_provider["base_tokens"], 375)
+            self.assertEqual(
+                persisted_provider["base_models"],
+                {"gpt-5.6-sol": 375},
+            )
+
+            restored = monitor.FloatingMonitorApp.__new__(
+                monitor.FloatingMonitorApp
+            )
+            restored.state = self.state(tokens=150, requests=2)
+            restored.state.client_usage.update(
+                {
+                    "cost": 1.5,
+                    "providers": [
+                        {
+                            "name": provider_name,
+                            "tokens": 100,
+                            "requests": 1,
+                            "cost": 1.0,
+                            "models": {"gpt-old": 100},
+                        }
+                    ],
+                }
+            )
+            restored.state.today_account_cost = 1.5
+            restored.state.top_accounts = [
+                {
+                    "name": provider_name,
+                    "tokens": 100,
+                    "requests": 1,
+                    "cost": 1.0,
+                    "models": {"gpt-old": 100},
+                }
+            ]
+            restored._live_usage_overlay = None
+
+            with patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint):
+                self.assertTrue(restored._restore_live_usage_checkpoint())
+
+            restored_provider = restored.state.client_usage["providers"][0]
+            self.assertEqual(restored_provider["tokens"], 375)
+            self.assertEqual(restored_provider["requests"], 3)
+            self.assertAlmostEqual(restored_provider["cost"], 3.75)
+            self.assertEqual(
+                restored_provider["models"],
+                {"gpt-5.6-sol": 375},
+            )
+            self.assertEqual(restored.state.top_accounts[0]["tokens"], 375)
 
     def test_accounting_schema_upgrade_replaces_old_live_overlay_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -12058,6 +13711,38 @@ class LiveUsageOverlayTests(unittest.TestCase):
         app._draw.assert_called_once_with()
         self.assertFalse(app._live_usage_lock.locked())
 
+    def test_accumulated_unverified_tokens_schedule_reconciliation(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app._live_usage_overlay = {
+            "providers": {
+                "Codex local - account@example.com": {
+                    "tokens": monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS - 50,
+                }
+            }
+        }
+        app._live_usage_seen_ids = {}
+        app._live_usage_event_records = {}
+        app._live_usage_rate_samples = []
+        app._live_usage_verification_pending = False
+        app._live_usage_verification_latest_when = None
+        app._live_usage_verification_pending_tokens = 0
+        app._live_usage_lock = threading.Lock()
+        app._live_usage_lock.acquire()
+        app.closed = False
+        app._draw = MagicMock()
+        app._schedule_live_usage_reconcile = MagicMock(return_value=True)
+
+        app._apply_live_usage_change(True, [self.event()])
+
+        self.assertTrue(app._live_usage_verification_pending)
+        self.assertEqual(
+            app._live_usage_verification_pending_tokens,
+            monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS,
+        )
+        app._schedule_live_usage_reconcile.assert_called_once_with()
+        self.assertFalse(app._live_usage_lock.locked())
+
     def test_runtime_spike_verification_bypasses_normal_reconcile_cooldown(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.closed = False
@@ -12072,6 +13757,70 @@ class LiveUsageOverlayTests(unittest.TestCase):
         app._refresh_live_usage_catchup_async.assert_called_once_with()
         app._schedule_live_usage_reconcile.assert_not_called()
         self.assertFalse(app._live_reconcile_scheduled)
+
+    def test_runtime_verification_bypasses_busy_watcher_quiet_period(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.closed = False
+        app._live_reconcile_scheduled = True
+        app._last_live_reconcile_at = monitor.time.monotonic()
+        app._live_usage_verification_pending = True
+        watcher = monitor.CodexUsageFileWatcher.__new__(monitor.CodexUsageFileWatcher)
+        watcher.reconciliation_ready = MagicMock(return_value=False)
+        watcher.mark_reconciled = MagicMock()
+        app._live_usage_watcher = watcher
+        app._codex_logs_busy = MagicMock(return_value=True)
+        app._refresh_live_usage_catchup_async = MagicMock(return_value=True)
+        app._schedule_live_usage_reconcile = MagicMock(return_value=True)
+
+        app._run_live_usage_reconcile()
+
+        watcher.reconciliation_ready.assert_not_called()
+        watcher.mark_reconciled.assert_called_once_with()
+        app._refresh_live_usage_catchup_async.assert_called_once_with()
+        app._schedule_live_usage_reconcile.assert_not_called()
+
+    def test_busy_live_reconcile_defers_heavy_catchup(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.closed = False
+        app._live_reconcile_scheduled = True
+        app._last_live_reconcile_at = float("-inf")
+        app._live_usage_verification_pending = False
+        app._codex_logs_busy = MagicMock(return_value=True)
+        app._refresh_live_usage_catchup_async = MagicMock(return_value=True)
+        app._schedule_live_usage_reconcile = MagicMock(return_value=True)
+
+        app._run_live_usage_reconcile()
+
+        app._refresh_live_usage_catchup_async.assert_not_called()
+        app._schedule_live_usage_reconcile.assert_called_once_with()
+        self.assertFalse(app._live_reconcile_scheduled)
+
+    def test_busy_startup_defers_catchup_until_idle(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.closed = False
+        app._full_refresh_requested = False
+        app._codex_logs_busy = MagicMock(return_value=True)
+        app._refresh_live_usage_catchup_async = MagicMock(return_value=True)
+
+        app._start_initial_live_catchup()
+
+        app._refresh_live_usage_catchup_async.assert_not_called()
+        self.assertTrue(app._full_refresh_requested)
+
+    def test_live_catchup_waits_for_full_usage_export(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app._refresh_lock = threading.Lock()
+        app._refresh_lock.acquire()
+        app._live_catchup_lock = threading.Lock()
+        app._live_usage_catchup_since = MagicMock(
+            return_value=datetime.now(monitor.CN_TZ) - timedelta(seconds=1)
+        )
+
+        started = app._refresh_live_usage_catchup_async()
+
+        self.assertFalse(started)
+        self.assertFalse(app._live_catchup_lock.locked())
+        app._refresh_lock.release()
 
     def test_new_rollout_schedules_lightweight_reconciliation(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
@@ -12162,7 +13911,530 @@ class LiveUsageOverlayTests(unittest.TestCase):
         self.assertTrue(app._full_refresh_requested)
         self.assertFalse(app._quota_refresh_lock.locked())
 
-    def test_busy_auto_refresh_forces_stale_full_usage_snapshot(self) -> None:
+    def test_new_quota_boundary_removes_previous_cycle_usage_immediately(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        app.state.client_usage["providers"] = [
+            {
+                "name": "Codex local - account@example.com",
+                "window_7d": {
+                    "requests": 20,
+                    "tokens": 2_000_000,
+                    "cost": 2.0,
+                    "models": {"gpt-5.6-sol": 2_000_000},
+                    "start_at": "2026-08-10T12:00:00+08:00",
+                    "end_at": "2026-08-17T11:59:00+08:00",
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": "2026-08-17T12:00:00+08:00",
+                    "remaining_percent": 5.0,
+                    "utilization": 95.0,
+                },
+            }
+        ]
+        app.state.top_accounts = [
+            {
+                "name": "account@example.com",
+                "window_7d": {
+                    "requests": 20,
+                    "tokens": 2_000_000,
+                    "cost": 2.0,
+                    "models": {"gpt-5.6-sol": 2_000_000},
+                    "start_at": "2026-08-10T12:00:00+08:00",
+                    "end_at": "2026-08-17T11:59:00+08:00",
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": "2026-08-17T12:00:00+08:00",
+                    "remaining_percent": 5.0,
+                    "utilization": 95.0,
+                },
+            }
+        ]
+        app.closed = False
+        app._quota_refresh_lock = threading.Lock()
+        app._quota_refresh_lock.acquire()
+        app._live_usage_overlay = None
+        app._live_usage_event_records = {}
+        app._full_refresh_requested = False
+        app._schedule_live_usage_reconcile = MagicMock(return_value=True)
+        app._draw = lambda: None
+
+        app._apply_quota_snapshot(
+            {
+                "accounts": {
+                    "Codex local - account@example.com": {
+                        "window_7d": {
+                            "quota_available": True,
+                            "window_minutes": 10_080,
+                            "resets_at": "2026-08-24T12:00:00+08:00",
+                            "remaining_percent": 100.0,
+                            "utilization": 0.0,
+                            "quota_snapshot_at": "2026-08-17T12:00:05+08:00",
+                        }
+                    }
+                }
+            }
+        )
+
+        window = app.state.client_usage["providers"][0]["window_7d"]
+        self.assertEqual(window["tokens"], 0)
+        self.assertEqual(window["requests"], 0)
+        self.assertEqual(window["cost"], 0.0)
+        self.assertEqual(window["models"], {})
+        self.assertEqual(window["start_at"], "2026-08-17T12:00:00+08:00")
+        self.assertEqual(window["end_at"], "2026-08-17T12:00:00+08:00")
+        self.assertEqual(window["remaining_percent"], 100.0)
+        top_window = app.state.top_accounts[0]["window_7d"]
+        self.assertEqual(top_window["tokens"], 0)
+        self.assertEqual(top_window["remaining_percent"], 100.0)
+        self.assertEqual(top_window["resets_at"], "2026-08-24T12:00:00+08:00")
+        self.assertTrue(app._full_refresh_requested)
+        expected_start = monitor._parse_time("2026-08-17T12:00:00+08:00")
+        self.assertEqual(app._live_quota_reconcile_since, expected_start)
+        self.assertTrue(app._live_usage_verification_pending)
+        app._schedule_live_usage_reconcile.assert_called_once_with(
+            monitor.LIVE_USAGE_VERIFY_DELAY_MS
+        )
+
+    def test_new_quota_boundary_replays_events_before_quota_snapshot(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state()
+        provider = "Codex local - account@example.com"
+        app.state.client_usage["providers"] = [
+            {
+                "name": provider,
+                "window_7d": {
+                    "requests": 20,
+                    "tokens": 2_000_000,
+                    "cost": 2.0,
+                    "models": {"gpt-5.6-sol": 2_000_000},
+                    "start_at": "2026-08-10T12:00:00+08:00",
+                    "end_at": "2026-08-17T11:59:00+08:00",
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": "2026-08-17T12:00:00+08:00",
+                },
+            }
+        ]
+        app.state.top_accounts = []
+        app.closed = False
+        app._quota_refresh_lock = threading.Lock()
+        app._quota_refresh_lock.acquire()
+        app._live_usage_overlay = {}
+        app._full_refresh_requested = False
+        app._draw = lambda: None
+        first_when = datetime(2026, 8, 17, 12, 5, tzinfo=monitor.CN_TZ)
+        second_when = datetime(2026, 8, 17, 12, 15, tzinfo=monitor.CN_TZ)
+        app._live_usage_event_records = {
+            "first": {
+                "event_id": "first",
+                "provider": provider,
+                "when": first_when,
+                "model": "gpt-5.6-sol",
+                "total_tokens": 120,
+                "input_tokens": 100,
+                "cached_tokens": 40,
+                "output_tokens": 20,
+                "cost": 0.12,
+            },
+            "second": {
+                "event_id": "second",
+                "provider": provider,
+                "when": second_when,
+                "model": "gpt-5.6-sol",
+                "total_tokens": 230,
+                "input_tokens": 200,
+                "cached_tokens": 60,
+                "output_tokens": 30,
+                "cost": 0.23,
+            },
+        }
+
+        app._apply_quota_snapshot(
+            {
+                "accounts": {
+                    provider: {
+                        "window_7d": {
+                            "quota_available": True,
+                            "window_minutes": 10_080,
+                            "resets_at": "2026-08-24T12:00:00+08:00",
+                            "remaining_percent": 85.0,
+                            "utilization": 15.0,
+                            "quota_snapshot_at": "2026-08-17T12:20:00+08:00",
+                        }
+                    }
+                }
+            }
+        )
+
+        window = app.state.client_usage["providers"][0]["window_7d"]
+        self.assertEqual(window["tokens"], 350)
+        self.assertEqual(window["requests"], 2)
+        self.assertAlmostEqual(window["cost"], 0.35)
+        self.assertEqual(window["end_at"], "2026-08-17T12:15:00+08:00")
+        self.assertEqual(window["remaining_percent"], 85.0)
+
+    def test_forced_catchup_rebuilds_new_quota_cycle_from_local_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            provider = "Codex local - account@example.com"
+            through = datetime.now(timezone.utc).replace(microsecond=0)
+            new_start = through - timedelta(minutes=30)
+            new_reset = new_start + timedelta(days=7)
+            old_start = new_start - timedelta(days=7)
+            old_reset = new_start
+
+            app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            app.state = self.state(tokens=1_000, requests=10)
+            app.state.client_usage.update(
+                {
+                    "cost": 10.0,
+                    "models": {"gpt-5.6-sol": 1_000},
+                    "providers": [
+                        {
+                            "name": provider,
+                            "tokens": 1_000,
+                            "requests": 10,
+                            "cost": 10.0,
+                            "models": {"gpt-5.6-sol": 1_000},
+                            "window_7d": {
+                                "tokens": 50,
+                                "requests": 1,
+                                "cost": 0.5,
+                                "models": {"gpt-5.6-sol": 50},
+                                "start_at": new_start.isoformat(),
+                                "end_at": (new_start + timedelta(minutes=2)).isoformat(),
+                                "quota_available": True,
+                                "window_minutes": 10_080,
+                                "resets_at": new_reset.isoformat(),
+                                "remaining_percent": 90.0,
+                            },
+                        }
+                    ],
+                }
+            )
+            top_account = copy.deepcopy(app.state.client_usage["providers"][0])
+            top_account["name"] = "account@example.com"
+            app.state.top_accounts = [top_account]
+            app.state.today_account_cost = 10.0
+            app._live_usage_overlay = None
+            app._live_usage_seen_ids = {}
+            app._live_usage_event_records = {}
+            app._live_usage_event_aliases = {}
+            app._live_usage_reconciled_ids = {}
+            app._live_usage_verification_pending = True
+            app._live_usage_verification_latest_when = new_start
+            app._live_usage_verification_pending_tokens = 0
+            app._live_quota_reconcile_since = new_start
+            app._live_usage_rate_samples = []
+            app._last_live_checkpoint_write_at = float("-inf")
+            app._live_catchup_lock = threading.Lock()
+            app._live_catchup_lock.acquire()
+            app.closed = False
+            app.root = object()
+            app._draw = lambda: None
+
+            authoritative_usage = {
+                "tokens": 1_000,
+                "requests": 10,
+                "cost": 10.0,
+                "models": {"gpt-5.6-sol": 1_000},
+                "providers": [
+                    {
+                        "name": provider,
+                        "tokens": 1_000,
+                        "requests": 10,
+                        "cost": 10.0,
+                        "models": {"gpt-5.6-sol": 1_000},
+                        "window_7d": {
+                            "tokens": 800,
+                            "requests": 8,
+                            "cost": 8.0,
+                            "models": {"gpt-5.6-sol": 800},
+                            "start_at": old_start.isoformat(),
+                            "end_at": (old_reset - timedelta(seconds=1)).isoformat(),
+                            "quota_available": True,
+                            "window_minutes": 10_080,
+                            "resets_at": old_reset.isoformat(),
+                        },
+                    }
+                ],
+            }
+            rows = [
+                {
+                    "event_id": "new-cycle-1",
+                    "when": (new_start + timedelta(minutes=5)).isoformat(),
+                    "provider": provider,
+                    "model": "gpt-5.6-sol",
+                    "total_tokens": 120,
+                    "input_tokens": 100,
+                    "cached_tokens": 40,
+                    "output_tokens": 20,
+                    "cost": 1.2,
+                },
+                {
+                    "event_id": "new-cycle-2",
+                    "when": (new_start + timedelta(minutes=15)).isoformat(),
+                    "provider": provider,
+                    "model": "gpt-5.6-sol",
+                    "total_tokens": 230,
+                    "input_tokens": 200,
+                    "cached_tokens": 60,
+                    "output_tokens": 30,
+                    "cost": 2.3,
+                },
+            ]
+            payload = {
+                "since": new_start.isoformat(),
+                "through": through.isoformat(),
+                "events": rows,
+                "summary": {
+                    "tokens": 1_350,
+                    "requests": 12,
+                    "cost": 13.5,
+                    "models": {"gpt-5.6-sol": 1_350},
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 200,
+                    "output_tokens": 150,
+                    "latest_at": rows[-1]["when"],
+                    "latest_model": "gpt-5.6-sol",
+                },
+                "providers": [
+                    {
+                        "name": provider,
+                        "tokens": 1_350,
+                        "requests": 12,
+                        "cost": 13.5,
+                        "models": {"gpt-5.6-sol": 1_350},
+                        "input_tokens": 1_000,
+                        "cached_input_tokens": 200,
+                        "output_tokens": 150,
+                        "latest_at": rows[-1]["when"],
+                        "latest_model": "gpt-5.6-sol",
+                    }
+                ],
+            }
+
+            with (
+                patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint),
+                patch.object(
+                    monitor,
+                    "load_client_usage",
+                    return_value=authoritative_usage,
+                ),
+            ):
+                app._apply_live_usage_catchup(payload)
+
+            window = app.state.client_usage["providers"][0]["window_7d"]
+            self.assertEqual(window["tokens"], 350)
+            self.assertEqual(window["requests"], 2)
+            self.assertAlmostEqual(window["cost"], 3.5)
+            self.assertEqual(window["start_at"], new_start.astimezone(monitor.CN_TZ).isoformat(timespec="seconds"))
+            top_window = app.state.top_accounts[0]["window_7d"]
+            self.assertEqual(top_window["tokens"], 350)
+            self.assertEqual(top_window["requests"], 2)
+            self.assertAlmostEqual(top_window["cost"], 3.5)
+            self.assertEqual(
+                top_window["start_at"],
+                new_start.astimezone(monitor.CN_TZ).isoformat(timespec="seconds"),
+            )
+            self.assertIsNone(app._live_quota_reconcile_since)
+            self.assertFalse(app._live_usage_verification_pending)
+            self.assertFalse(app._live_catchup_lock.locked())
+
+    def test_catchup_started_after_quota_boundary_does_not_clear_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "live-checkpoint.json"
+            app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+            app.state = self.state(tokens=100, requests=2)
+            app._live_usage_overlay = None
+            app._live_usage_seen_ids = {}
+            app._live_usage_event_records = {}
+            app._live_usage_event_aliases = {}
+            app._live_usage_reconciled_ids = {}
+            app._live_usage_rate_samples = []
+            app._last_live_checkpoint_write_at = float("-inf")
+            app._live_catchup_lock = threading.Lock()
+            app._live_catchup_lock.acquire()
+            app.closed = False
+            app.root = object()
+            app._draw = lambda: None
+            boundary = datetime.now(timezone.utc) - timedelta(minutes=10)
+            through = datetime.now(timezone.utc)
+            app._live_quota_reconcile_since = boundary
+            app._live_usage_verification_pending = True
+            app._live_usage_verification_latest_when = boundary
+            app._live_usage_verification_pending_tokens = 0
+            app._schedule_live_usage_reconcile = MagicMock(return_value=True)
+            payload = {
+                "since": (boundary + timedelta(minutes=5)).isoformat(),
+                "through": through.isoformat(),
+                "events": [],
+                "summary": {
+                    "tokens": 100,
+                    "requests": 2,
+                    "cost": 0.0,
+                    "input_tokens": 60,
+                    "cached_input_tokens": 30,
+                    "output_tokens": 10,
+                },
+                "providers": [],
+            }
+
+            with (
+                patch.object(monitor, "LIVE_USAGE_CHECKPOINT_JSON", checkpoint),
+                patch.object(
+                    monitor,
+                    "load_client_usage",
+                    return_value=dict(app.state.client_usage),
+                ),
+            ):
+                app._apply_live_usage_catchup(payload)
+
+            self.assertEqual(app._live_quota_reconcile_since, boundary)
+            self.assertTrue(app._live_usage_verification_pending)
+            app._schedule_live_usage_reconcile.assert_called_once_with(
+                monitor.LIVE_USAGE_VERIFY_DELAY_MS
+            )
+            self.assertFalse(app._live_catchup_lock.locked())
+
+    def test_live_official_event_updates_matching_7d_quota_window(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=1_000, requests=2)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start_at = now - timedelta(days=1)
+        reset_at = start_at + timedelta(days=7)
+        window = {
+            "requests": 2,
+            "tokens": 1_000,
+            "input_tokens": 600,
+            "cached_input_tokens": 300,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 100,
+            "cost": 1.5,
+            "models": {"gpt-5.6-sol": 1_000},
+            "unpriced_tokens": 0,
+            "unpriced_models": {},
+            "start_at": start_at.isoformat(),
+            "end_at": (now - timedelta(seconds=10)).isoformat(),
+            "latest_at": (now - timedelta(seconds=10)).isoformat(),
+            "quota_available": True,
+            "quota_unlimited": False,
+            "window_minutes": 10_080,
+            "resets_at": reset_at.isoformat(),
+            "remaining_percent": 10.0,
+            "utilization": 90.0,
+        }
+        app.state.client_usage["providers"] = [
+            {
+                "name": "Codex local - hyenas@example.com",
+                "window_7d": copy.deepcopy(window),
+            }
+        ]
+        app.state.top_accounts = [
+            {
+                "name": "hyenas@example.com",
+                "window_7d": copy.deepcopy(window),
+            }
+        ]
+        app._live_usage_overlay = {
+            "base_today_tokens": 1_000,
+            "base_today_requests": 2,
+            "base_today_cost": 1.5,
+            "tokens": 0,
+            "requests": 0,
+            "cost": 0.0,
+            "providers": {},
+            "base_hourly": [],
+            "hourly": {},
+        }
+        event = {
+            "event_id": "hyenas-live-event",
+            "model": "gpt-5.6-sol",
+            "total_tokens": 50,
+            "input_tokens": 40,
+            "cached_tokens": 20,
+            "output_tokens": 10,
+            "cost": 0.25,
+            "unpriced_tokens": 0,
+        }
+
+        app._record_live_quota_window_overlay(
+            app._live_usage_overlay,
+            "Codex local - hyenas@example.com",
+            event,
+            now,
+        )
+        # An overlapping catch-up must remain idempotent.
+        app._record_live_quota_window_overlay(
+            app._live_usage_overlay,
+            "Codex local - hyenas@example.com",
+            event,
+            now,
+        )
+        app._apply_live_quota_window_overlay(app.state)
+
+        for row in (
+            app.state.client_usage["providers"][0],
+            app.state.top_accounts[0],
+        ):
+            live_window = row["window_7d"]
+            self.assertEqual(live_window["tokens"], 1_050)
+            self.assertEqual(live_window["requests"], 3)
+            self.assertEqual(live_window["input_tokens"], 620)
+            self.assertEqual(live_window["cached_input_tokens"], 320)
+            self.assertEqual(live_window["output_tokens"], 110)
+            self.assertAlmostEqual(live_window["cost"], 1.75)
+            self.assertEqual(live_window["models"]["gpt-5.6-sol"], 1_050)
+            self.assertEqual(live_window["remaining_percent"], 10.0)
+            self.assertTrue(live_window["window_usage_live"])
+
+    def test_external_or_out_of_window_event_does_not_enter_official_quota(self) -> None:
+        app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
+        app.state = self.state(tokens=1_000, requests=2)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start_at = now - timedelta(hours=1)
+        reset_at = start_at + timedelta(days=7)
+        app.state.client_usage["providers"] = [
+            {
+                "name": "Codex local - account@example.com",
+                "window_7d": {
+                    "tokens": 1_000,
+                    "requests": 2,
+                    "start_at": start_at.isoformat(),
+                    "end_at": (now - timedelta(seconds=10)).isoformat(),
+                    "quota_available": True,
+                    "window_minutes": 10_080,
+                    "resets_at": reset_at.isoformat(),
+                },
+            }
+        ]
+        app.state.top_accounts = []
+        overlay: dict = {}
+        base_event = {
+            "total_tokens": 50,
+            "input_tokens": 40,
+            "cached_tokens": 20,
+            "output_tokens": 10,
+            "cost": 0.25,
+        }
+
+        app._record_live_quota_window_overlay(
+            overlay,
+            "Codex local - account@example.com",
+            {**base_event, "event_id": "grok-event", "model": "xai/grok-4.6"},
+            now,
+        )
+        app._record_live_quota_window_overlay(
+            overlay,
+            "Codex local - account@example.com",
+            {**base_event, "event_id": "old-event", "model": "gpt-5.6-sol"},
+            start_at - timedelta(seconds=1),
+        )
+
+        self.assertNotIn("quota_windows", overlay)
+
+    def test_busy_auto_refresh_defers_stale_full_usage_snapshot(self) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
         app.state.usage_source = "local"
@@ -12183,8 +14455,8 @@ class LiveUsageOverlayTests(unittest.TestCase):
 
         app._schedule_auto_refresh()
 
-        app.refresh_async.assert_called_once_with()
-        self.assertGreater(app._last_forced_full_refresh_at, 0.0)
+        app.refresh_async.assert_not_called()
+        self.assertEqual(app._last_forced_full_refresh_at, float("-inf"))
         app.root.after.assert_called_once()
 
     def test_idle_without_pending_usage_does_not_repeat_full_export(self) -> None:
@@ -13360,6 +15632,68 @@ class OfflineHistoryCatchupTests(unittest.TestCase):
             "offline_sync": {
                 "state": "complete",
                 "last_successful_at": "2026-07-13T08:30:00+08:00",
+                "through": last_day.isoformat(),
+            },
+        }
+
+        targets = client_usage_export.offline_history_dates_to_reconcile(
+            history,
+            now,
+            max_days=31,
+        )
+
+        self.assertEqual(targets, [])
+
+    def test_yesterday_is_reconciled_even_after_today_history_is_written(self) -> None:
+        last_day = date(2026, 7, 12)
+        today = date(2026, 7, 13)
+        now = datetime(2026, 7, 13, 9, 0, 0)
+        history = {
+            "schema": 2,
+            "days": {
+                last_day.isoformat(): {
+                    **self.history_row(last_day, 100),
+                    "cockpit_usage_schema": client_usage_export.COCKPIT_USAGE_DEDUPE_SCHEMA,
+                    "usage_accounting_schema": client_usage_export.USAGE_ACCOUNTING_SCHEMA,
+                    "updated_at": "2026-07-12T23:59:39+08:00",
+                },
+                today.isoformat(): {
+                    **self.history_row(today, 50),
+                    "updated_at": "2026-07-13T08:30:00+08:00",
+                },
+            },
+            "offline_sync": {
+                "state": "complete",
+                "last_successful_at": "2026-07-12T08:30:00+08:00",
+                "through": "2026-07-11",
+            },
+        }
+
+        targets = client_usage_export.offline_history_dates_to_reconcile(
+            history,
+            now,
+            max_days=31,
+        )
+
+        self.assertEqual(targets, [last_day])
+
+    def test_yesterday_row_reconciled_after_midnight_is_not_scanned_again(self) -> None:
+        last_day = date(2026, 7, 12)
+        now = datetime(2026, 7, 13, 9, 0, 0)
+        history = {
+            "schema": 2,
+            "days": {
+                last_day.isoformat(): {
+                    **self.history_row(last_day, 100),
+                    "cockpit_usage_schema": client_usage_export.COCKPIT_USAGE_DEDUPE_SCHEMA,
+                    "usage_accounting_schema": client_usage_export.USAGE_ACCOUNTING_SCHEMA,
+                    "offline_reconciled_at": "2026-07-13T00:10:00+08:00",
+                },
+            },
+            "offline_sync": {
+                "state": "complete",
+                "last_successful_at": "2026-07-13T00:10:00+08:00",
+                "through": "2026-07-11",
             },
         }
 
@@ -14253,6 +16587,40 @@ class ClientUsageSyncStatusTests(unittest.TestCase):
             ):
                 usage = monitor.load_client_usage(run_export=False)
 
+        self.assertEqual(usage["schema"], 1)
+        self.assertEqual(usage["usage_accounting_schema"], 1)
+        self.assertEqual(usage["claude_usage_schema"], 2)
+        self.assertEqual(usage["cockpit_usage_schema"], 2)
+        self.assertEqual(usage["grok_usage_schema"], 1)
+        self.assertEqual(usage["opencodex_attribution_schema"], 1)
+
+    def test_previous_day_cache_preserves_schema_for_live_checkpoint_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export_path = root / "export.py"
+            usage_path = root / "usage.json"
+            export_path.write_text("# fixture", encoding="utf-8")
+            payload = self.payload(125)
+            payload.update(
+                {
+                    "date": (datetime.now(monitor.CN_TZ).date() - timedelta(days=1)).isoformat(),
+                    "schema": 1,
+                    "usage_accounting_schema": 1,
+                    "claude_usage_schema": 2,
+                    "cockpit_usage_schema": 2,
+                    "grok_usage_schema": 1,
+                    "opencodex_attribution_schema": 1,
+                }
+            )
+            usage_path.write_text(json.dumps(payload), encoding="utf-8")
+            with (
+                patch.object(monitor, "CLIENT_USAGE_EXPORT", export_path),
+                patch.object(monitor, "CLIENT_USAGE_JSON", usage_path),
+            ):
+                usage = monitor.load_client_usage(run_export=False)
+
+        self.assertEqual(usage["tokens"], 0)
+        self.assertTrue(usage["stale"])
         self.assertEqual(usage["schema"], 1)
         self.assertEqual(usage["usage_accounting_schema"], 1)
         self.assertEqual(usage["claude_usage_schema"], 2)

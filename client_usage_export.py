@@ -6046,9 +6046,18 @@ def official_quota_from_usage_response(
         (rate_limit.get("primary_window"), 5 * 60 * 60),
         (rate_limit.get("secondary_window"), seven_day_seconds),
     )
-    five_hour: dict[str, Any] = {"quota_available": False, "quota_stale": False}
-    seven_day: dict[str, Any] = {"quota_available": False, "quota_stale": False}
-    cycle: dict[str, Any] = {"quota_available": False, "quota_stale": False}
+    def absent_window() -> dict[str, Any]:
+        return {
+            "quota_available": False,
+            "quota_stale": False,
+            "quota_source": "official-wham",
+            "quota_snapshot_at": checked_at.isoformat(timespec="seconds"),
+            "quota_absent_confirmed": True,
+        }
+
+    five_hour: dict[str, Any] = absent_window()
+    seven_day: dict[str, Any] = absent_window()
+    cycle: dict[str, Any] = absent_window()
     short_window_present = False
     seven_day_present = False
     cycle_present = False
@@ -6156,6 +6165,33 @@ def prefer_quota_window(
     if current_window is None:
         return dict(incoming_window)
 
+    current_epoch = quota_window_snapshot_epoch(current_window, current_success)
+    incoming_epoch = quota_window_snapshot_epoch(incoming_window, incoming_success)
+    current_absent = bool(
+        current_window.get("quota_absent_confirmed")
+        and not current_window.get("quota_stale")
+        and quota_window_source_rank(current_window) >= 2
+    )
+    incoming_absent = bool(
+        incoming_window.get("quota_absent_confirmed")
+        and not incoming_window.get("quota_stale")
+        and quota_window_source_rank(incoming_window) >= 2
+    )
+    # A successful official response that omits a window is stronger evidence
+    # than a lower-tier sidecar value or an older official generation.
+    if incoming_absent and (
+        quota_window_source_rank(incoming_window)
+        > quota_window_source_rank(current_window)
+        or incoming_epoch >= current_epoch
+    ):
+        return dict(incoming_window)
+    if current_absent and (
+        quota_window_source_rank(current_window)
+        > quota_window_source_rank(incoming_window)
+        or current_epoch > incoming_epoch
+    ):
+        return dict(current_window)
+
     current_live = quota_window_is_live(current_window)
     incoming_live = quota_window_is_live(incoming_window)
     if current_live and not incoming_live:
@@ -6177,8 +6213,6 @@ def prefer_quota_window(
         if current_usable:
             return dict(current_window)
 
-    current_epoch = quota_window_snapshot_epoch(current_window, current_success)
-    incoming_epoch = quota_window_snapshot_epoch(incoming_window, incoming_success)
     if incoming_epoch > current_epoch and (incoming_usable or not current_usable):
         return dict(incoming_window)
     if current_epoch > incoming_epoch and (current_usable or not incoming_usable):
@@ -6450,6 +6484,129 @@ def cached_official_quota_by_label(
         if stale_quota is not None:
             result[label] = stale_quota
     return result
+
+
+def cockpit_backup_quota_by_label(
+    home: Path,
+    now: datetime | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Read a recent decrypted Cockpit backup when sidecar auth is unavailable."""
+    backup_dir = home / ".antigravity_cockpit" / "backups"
+    if not backup_dir.exists():
+        return {}
+    paths = sorted(
+        backup_dir.glob("cockpit_auto_backup_full_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    current = now or datetime.now(LOCAL_TZ)
+    current_local = (
+        current.astimezone(LOCAL_TZ).replace(tzinfo=None)
+        if current.tzinfo is not None
+        else current
+    )
+    for path in paths[:4]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        exported_at = parse_dt(payload.get("exported_at"))
+        if exported_at is None:
+            continue
+        age_seconds = (current_local - exported_at).total_seconds()
+        if age_seconds < -300 or age_seconds > max(
+            60,
+            COCKPIT_QUOTA_RESERVE_STALE_SECONDS,
+        ):
+            return {}
+        accounts = payload.get("accounts")
+        platforms = accounts.get("platforms") if isinstance(accounts, dict) else None
+        codex = platforms.get("codex") if isinstance(platforms, dict) else None
+        rows = codex.get("exported_data") if isinstance(codex, dict) else None
+        if not isinstance(rows, list):
+            continue
+        snapshot_at = exported_at.replace(tzinfo=LOCAL_TZ).isoformat(timespec="seconds")
+        result: dict[str, dict[str, dict[str, Any]]] = {}
+        for account in rows:
+            if not isinstance(account, dict):
+                continue
+            quota = account.get("quota")
+            if not isinstance(quota, dict):
+                continue
+            account_id = str(account.get("id") or "").strip()
+            label = cockpit_account_label(
+                account_id,
+                str(account.get("email") or ""),
+                str(account.get("api_provider_name") or account.get("name") or ""),
+            )
+            if not label:
+                continue
+            plan_type = str(
+                account.get("plan_type") or quota.get("plan_type") or ""
+            ).strip().lower()
+            primary_present = bool(quota.get("hourly_window_present"))
+            weekly_present = bool(quota.get("weekly_window_present"))
+            try:
+                primary_minutes = int(quota.get("hourly_window_minutes") or 5 * 60)
+            except (TypeError, ValueError):
+                primary_minutes = 5 * 60
+            if primary_minutes <= 0:
+                primary_minutes = 5 * 60
+            seven_day_minutes = 7 * 24 * 60
+            five_hour: dict[str, Any] = {
+                "quota_available": False,
+                "quota_stale": False,
+            }
+            seven_day: dict[str, Any] = {
+                "quota_available": False,
+                "quota_stale": False,
+            }
+            cycle: dict[str, Any] = {
+                "quota_available": False,
+                "quota_stale": False,
+            }
+            primary_is_7d = primary_present and primary_minutes == seven_day_minutes
+            if primary_present:
+                primary = quota_window_payload(
+                    quota.get("hourly_percentage"),
+                    quota.get("hourly_reset_time"),
+                    False,
+                    primary_minutes,
+                )
+                if primary_minutes < seven_day_minutes:
+                    five_hour = primary
+                elif primary_minutes == seven_day_minutes:
+                    seven_day = primary
+                else:
+                    cycle = primary
+            if weekly_present and not primary_is_7d:
+                seven_day = quota_window_payload(
+                    quota.get("weekly_percentage"),
+                    quota.get("weekly_reset_time"),
+                    False,
+                    seven_day_minutes,
+                )
+            if plan_type == "plus" and not (
+                primary_present and primary_minutes < seven_day_minutes
+            ) and (primary_is_7d or weekly_present):
+                five_hour = {
+                    "quota_available": False,
+                    "quota_stale": False,
+                    "quota_unlimited": True,
+                }
+            for window in (five_hour, seven_day, cycle):
+                window["quota_source"] = "official-wham"
+                window["quota_snapshot_at"] = snapshot_at
+                window["quota_transport"] = "cockpit-backup"
+            result[label] = {
+                "window_5h": five_hour,
+                "window_7d": seven_day,
+                "window_cycle": cycle,
+            }
+        return result
+    return {}
 
 
 def persist_quota_snapshots_by_account(
@@ -7094,6 +7251,13 @@ def cockpit_codex_quota_by_label(
                 result[label] = local_quota
             else:
                 result[label] = merge_quota_rows(result[label], local_quota)
+
+    backup_quota = cockpit_backup_quota_by_label(home)
+    for label, quota in backup_quota.items():
+        if label in result:
+            result[label] = merge_quota_rows(result[label], quota)
+        else:
+            result[label] = quota
 
     # Resolve every Cockpit-owned local source before using account credentials
     # for a direct official request. A future sidecar version can therefore add
@@ -11398,6 +11562,30 @@ def offline_history_dates_to_reconcile(
                 targets.add(cursor)
             cursor += timedelta(days=1)
 
+    previous_row = days.get(last_complete_day.isoformat())
+    if isinstance(previous_row, dict):
+        closed_at = datetime.combine(today, datetime.min.time())
+        reconciled_at = parse_dt(previous_row.get("offline_reconciled_at"))
+        offline_sync = history.get("offline_sync")
+        sync = offline_sync if isinstance(offline_sync, dict) else {}
+        synced_at = parse_dt(sync.get("last_successful_at"))
+        try:
+            synced_through = date.fromisoformat(str(sync.get("through") or ""))
+        except ValueError:
+            synced_through = None
+        row_reconciled_after_close = (
+            reconciled_at is not None and reconciled_at >= closed_at
+        )
+        completed_sync_covers_day = (
+            str(sync.get("state") or "") == "complete"
+            and synced_at is not None
+            and synced_at >= closed_at
+            and synced_through is not None
+            and synced_through >= last_complete_day
+        )
+        if not row_reconciled_after_close and not completed_sync_covers_day:
+            targets.add(last_complete_day)
+
     for key, row in days.items():
         try:
             parsed = date.fromisoformat(str(key))
@@ -13216,17 +13404,22 @@ def build_live_catchup_payload(
             "latest_request": {},
         }
 
-    day_start = datetime.combine(since.date(), datetime.min.time())
+    usage_day_start = datetime.combine(through.date(), datetime.min.time())
+    # A quota cycle may start before midnight even though the absolute totals
+    # in this payload must still describe today. Scan from the earlier quota
+    # boundary for window reconstruction, then filter provider totals back to
+    # the current calendar day below.
+    scan_start = min(since, usage_day_start)
     record_current_opencodex_account_snapshot(home, through)
     session_lifecycle: dict[str, SessionLifecycle] = {}
     codex_events = scan_all_codex_events(
         home,
         sessions_root,
-        day_start,
+        scan_start,
         through,
         session_lifecycle=session_lifecycle,
     )
-    speed_markers = codex_speed_history(home, day_start, through)
+    speed_markers = codex_speed_history(home, scan_start, through)
     apply_codex_speed_fallback(codex_events, speed_markers)
 
     current_label = current_codex_account_label(home)
@@ -13235,16 +13428,16 @@ def build_live_catchup_payload(
     # otherwise the monitor would flip between an aggregate label and a concrete
     # account between refreshes. It never archives, so it cannot decide anything.
     attribution_verdicts = load_attribution_verdicts()
-    markers = scan_cockpit_codex_switch_markers(home, day_start, through)
+    markers = scan_cockpit_codex_switch_markers(home, scan_start, through)
     markers.extend(load_account_timeline())
-    account_markers = scan_cockpit_codex_account_markers(home, day_start, through)
+    account_markers = scan_cockpit_codex_account_markers(home, scan_start, through)
     affinity_turn_starts = [
         turn_start
         for event in codex_events
         if (turn_start := api_service_event_turn_start(event)) is not None
-        and turn_start >= day_start - timedelta(days=1)
+        and turn_start >= scan_start - timedelta(days=1)
     ]
-    affinity_scan_start = min([day_start, *affinity_turn_starts])
+    affinity_scan_start = min([scan_start, *affinity_turn_starts])
     affinity_events = scan_cockpit_codex_affinity_events(
         home,
         affinity_scan_start,
@@ -13273,7 +13466,7 @@ def build_live_catchup_payload(
     attributed, _session_accounts, unresolved_events = resolve_api_service_event_accounts(
         raw_attributed,
         account_markers,
-        previous_active_session_account_labels(output_path, since.date()),
+        previous_active_session_account_labels(output_path, through.date()),
         affinity_events,
         attribution_verdicts,
         record_verdicts=False,
@@ -13284,8 +13477,21 @@ def build_live_catchup_payload(
         for label, meta in speed_by_account.items()
     }
 
+    daily_attributed = {
+        provider: [
+            event
+            for event in events
+            if usage_day_start <= event.when < through
+        ]
+        for provider, events in attributed.items()
+    }
+    daily_attributed = {
+        provider: events
+        for provider, events in daily_attributed.items()
+        if events
+    }
     provider_buckets = buckets_from_attributed_events(
-        attributed,
+        daily_attributed,
         cost_multiplier_by_label,
     )
     total = UsageBucket()
@@ -13296,11 +13502,19 @@ def build_live_catchup_payload(
     ):
         add_bucket(total, bucket)
         provider_totals.append(bucket_to_dict(provider, bucket))
-    claude = scan_claude(home / ".claude" / "projects", day_start, through)
+    claude = scan_claude(
+        home / ".claude" / "projects",
+        usage_day_start,
+        through,
+    )
     if claude.requests or claude.total_tokens or claude.cost:
         add_bucket(total, claude)
         provider_totals.append(bucket_to_dict("Claude local", claude))
-    grok_events = scan_grok_events(home / ".grok" / "sessions", day_start, through)
+    grok_events = scan_grok_events(
+        home / ".grok" / "sessions",
+        usage_day_start,
+        through,
+    )
     grok = bucket_from_grok_events(grok_events)
     if grok.requests or grok.total_tokens or grok.cost:
         add_bucket(total, grok)
