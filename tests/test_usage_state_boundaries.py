@@ -7022,7 +7022,7 @@ class WindowSemanticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             account_id = "codex_home_auth"
-            email = "hyenas-ingot.1a@icloud.com"
+            email = "quota-member@example.test"
             (root / ".codex").mkdir(parents=True)
             (root / ".codex" / "auth.json").write_text(
                 json.dumps(
@@ -7112,7 +7112,7 @@ class WindowSemanticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             account_id = "codex_c272c75c9bc64b31011c82626e40d006"
-            email = "hyenas-ingot.1a@icloud.com"
+            email = "quota-member@example.test"
             (root / ".codex").mkdir(parents=True)
             (root / ".codex" / ".cockpit_codex_auth.json").write_text(
                 json.dumps(
