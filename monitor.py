@@ -13167,6 +13167,12 @@ class FloatingMonitorApp:
             )
             if isinstance(target, dict)
         )
+        # Include unattributed live tokens without counting the provider
+        # breakdown a second time.
+        unverified_tokens = max(
+            unverified_tokens,
+            max(0, int(overlay.get("tokens") or 0)) if isinstance(overlay, dict) else 0,
+        )
         projected_unverified_tokens = unverified_tokens + batch_tokens
         verification_pending = bool(
             getattr(self, "_live_usage_verification_pending", False)

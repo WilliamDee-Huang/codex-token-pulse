@@ -10921,7 +10921,8 @@ class LiveUsageOverlayTests(unittest.TestCase):
         )
         self.assertEqual(app._live_usage_event_records, {})
 
-    def test_runtime_spike_guard_accumulates_several_batches_in_its_time_window(self) -> None:
+    @patch.object(monitor, "_current_codex_account_label", return_value="")
+    def test_runtime_spike_guard_accumulates_several_batches_in_its_time_window(self, _account_label) -> None:
         app = monitor.FloatingMonitorApp.__new__(monitor.FloatingMonitorApp)
         app.state = self.state()
         app._live_usage_overlay = None
