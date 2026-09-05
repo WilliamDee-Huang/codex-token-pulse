@@ -10933,16 +10933,21 @@ class LiveUsageOverlayTests(unittest.TestCase):
         app._live_usage_verification_pending_tokens = 0
         first_total = monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS // 2
         final_batch = monitor.LIVE_USAGE_VERIFY_THRESHOLD_TOKENS - first_total
+        first_events = self.events_with_total(first_total)
+        final_events = self.events_with_total(final_batch)
+        # Batch identity must not depend on the Windows wall clock resolution.
+        for event in final_events:
+            event["event_id"] = f"final-{event['event_id']}"
 
         self.assertTrue(
             app._record_live_usage_events(
-                self.events_with_total(first_total),
+                first_events,
                 animate=False,
             )
         )
         self.assertFalse(
             app._record_live_usage_events(
-                self.events_with_total(final_batch),
+                final_events,
                 animate=False,
             )
         )
