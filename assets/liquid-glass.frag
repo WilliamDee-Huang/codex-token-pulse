@@ -1,5 +1,5 @@
 #version 330
-// Windows approximation of curved glass; see docs/liquid-glass.md.
+// Polished curved glass: diffuse the transmitted background, keep reflections sharp.
 // Canvas ink is a separate premultiplied layer; desktop pixels never enter it.
 uniform sampler2D backdrop;
 uniform sampler2D softBackdrop;
@@ -58,19 +58,23 @@ vec3 lens(vec2 p, vec2 center, vec2 halfSize, float radius, float pressure, floa
     vec3 ray = refract(vec3(0,0,-1), normal, 1.0 / 1.46);
     vec2 displacement = ray.xy / max(-ray.z, .05) * height * thickness;
     vec2 sampleAt = center + local / 1.006 + displacement;
-    // The centre hides background text; the narrow rim retains optical detail.
-    float diffusion = mix(.70, 1.0, smoothstep(.05, .70, t));
+    // Diffusion belongs to the transmitted background, not the surface reflection.
+    float clearBevel = 1.0 - smoothstep(.5, 5.5, -d);
+    float diffusion = 1.0 - clearBevel * .92;
     vec3 c = mix(scatter(sampleAt, 1.3), softBackground(sampleAt), diffusion);
     float luma = dot(c, vec3(.2126,.7152,.0722));
     c = mix(vec3(luma), c, 1.04);
-    c = mix(c, tint, mix(.075, .24, darkTheme));
+    c = mix(c, tint, mix(.03, .24, darkTheme));
     vec2 lightPosition = clamp((pointer - center) / resolution, vec2(-.7), vec2(.7));
     vec3 light = normalize(vec3(-.55 + lightPosition.x*.4, -.72 + lightPosition.y*.4, .65));
     float facing = max(dot(gradient, normalize(light.xy)), 0.0);
-    float specular = pow(max(dot(normal, normalize(light + vec3(0,0,1))), 0.0), 26.0);
-    float rim = exp(-abs(d + .65)/.8);
-    float reflection = specular*.62 + rim*(.12 + pow(facing,3.0)*.56);
-    reflection += pow(1.0-normal.z,3.0)*(.025 + facing*.09);
+    // A narrow specular peak with a faint shoulder suggests a smooth surface.
+    // Its geometry and directional lighting remain independent of background blur.
+    float halfFacing = max(dot(normal, normalize(light + vec3(0,0,1))), 0.0);
+    float specular = pow(halfFacing, 112.0) * .86 + pow(halfFacing, 28.0) * .025;
+    float rim = exp(-pow((d + .8) / .55, 2.0));
+    float reflection = specular + rim * (.045 + pow(facing, 4.0) * .60);
+    reflection += pow(1.0-normal.z, 5.0) * (.02 + facing*.08);
     c = mix(c, vec3(1), clamp(reflection, 0.0, .82));
     c *= 1.0-exp(-abs(d+2.2)/1.2)*(1.0-facing)*.09;
     c += exp(-length(p-pointer)/85.0)*pressure*.06;
