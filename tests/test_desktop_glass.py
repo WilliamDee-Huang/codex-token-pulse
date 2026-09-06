@@ -66,6 +66,7 @@ class DesktopGlassTests(unittest.TestCase):
                        for v, weight in zip(values, (.2126, .7152, .0722)))
 
         ui = WorkspaceUI.__new__(WorkspaceUI)
+        ui.material_name = 'liquid'
         ui.desktop = SimpleNamespace(active=True)
         for palette in PALETTES.values():
             ui.palette, ui.BG, ui.TEXT = palette, palette.background, palette.text

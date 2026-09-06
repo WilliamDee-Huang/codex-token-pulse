@@ -111,6 +111,9 @@ class DesktopCompositor:
         self.error = ''
         self.frames = 0
         self.refraction = False
+        self.material = 'liquid'
+        self.blur_radius = 4.0
+        self.refraction_strength = 1.0
         self._optics = None
         self._optics_pending = None
         self._overlay = None
@@ -210,11 +213,15 @@ class DesktopCompositor:
             except OSError:
                 pass
             compositor = cls(root, canvas, on_failure)
-            compositor.set_refraction(material == 'liquid')
+            compositor.set_material(material)
             return compositor
         except (OSError, AttributeError, ImportError) as exc:
             logging.getLogger('tokenpulse.monitor.glass').warning('Desktop composition unavailable: %s', exc)
             return None
+
+    def set_material(self, material):
+        self.material = material
+        self.set_refraction(material == 'liquid')
 
     def set_refraction(self, enabled):
         self.display_frame = None
@@ -232,9 +239,9 @@ class DesktopCompositor:
                 self.refraction = True
             except (ImportError, OSError, RuntimeError) as exc:
                 logging.getLogger('tokenpulse.monitor.glass').warning('Curved material unavailable: %s', exc)
-        accent = self.Accent(0 if self.refraction else 3, 0, 0, 0)
+        accent = self.Accent(0 if self.refraction or self.material == 'opaque' else 3, 0, 0, 0)
         data = self.Composition(19, self.c.addressof(accent), self.c.sizeof(accent))
-        self.blur_enabled = bool(self.u.SetWindowCompositionAttribute(self.hwnd, self.c.byref(data))) and not self.refraction
+        self.blur_enabled = bool(self.u.SetWindowCompositionAttribute(self.hwnd, self.c.byref(data))) and accent.state == 3
         if self.refraction:
             self._optics_pending = self.root.after(16, self._poll_refraction)
         self.request_frame()
@@ -252,7 +259,8 @@ class DesktopCompositor:
             if previous:
                 self.u.SetThreadDpiAwarenessContext(previous)
         self._optics.submit(self._size, bounds, self._overlay, self.glass_tint, self.glass_dark,
-                            tuple(self.lenses.values())[:4], self.pointer)
+                            tuple(self.lenses.values())[:4], self.pointer,
+                            self.blur_radius, self.refraction_strength)
 
     def _poll_refraction(self):
         self._optics_pending = None

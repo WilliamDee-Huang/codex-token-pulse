@@ -61,6 +61,10 @@ class WorkspaceUI:
         self._appearance_path = api.APP_DIR / "monitor_appearance.json"
         self.theme_name = "silver"
         self.material_name = "liquid"
+        self.blur_radius = 4.0
+        self.refraction_strength = 1.0
+        self._slider_drag = None
+        self._sliders = {}
         self._light = self._light_target = 0.
         self._glass_cache = OrderedDict()
         self._glass_refs = {}
@@ -68,12 +72,15 @@ class WorkspaceUI:
         self._lens_drag = False
         self._control_press = False
         self._demo_position = None
+        self._demo_pressure = self._demo_released_at = 0.
         self._dock_stretch = 0.
         self._last_glass_frame = 0.
         try:
             saved = json.loads(self._appearance_path.read_text(encoding="utf-8"))
             self.theme_name = saved.get("theme") if saved.get("theme") in PALETTES else "silver"
-            self.material_name = saved.get('material', 'liquid') if saved.get('material', 'liquid') in {'liquid', 'alpha'} else 'liquid'
+            self.material_name = saved.get('material', 'liquid') if saved.get('material', 'liquid') in {'liquid', 'alpha', 'opaque'} else 'liquid'
+            self.blur_radius = self._bounded_setting(saved.get('blur', 4.), 4., 10.)
+            self.refraction_strength = self._bounded_setting(saved.get('refraction', 1.), 1., 2.)
             self.reduced_motion |= not saved.get("motion", True)
         except (OSError, ValueError, TypeError, AttributeError):
             pass
@@ -82,6 +89,10 @@ class WorkspaceUI:
         if self.desktop is None and api.Image is not None:
             self.desktop = DesktopCompositor.create(app.root, self.c, self._desktop_failed, self.material_name)
             app._desktop_compositor = self.desktop
+        self._apply_optics()
+        if self.material_name == 'opaque' and not (self.desktop and self.desktop.active):
+            app.WINDOW_ALPHA = 1.0
+            app.root.attributes('-alpha', 1.0)
         families = set(tkfont.families(root=app.root))
         display = "Segoe UI Semibold" if "Segoe UI Semibold" in families else "Segoe UI"
         specs = {
@@ -104,6 +115,10 @@ class WorkspaceUI:
         app.root.bind("<Tab>", lambda _e: self.move_focus(1))
         app.root.bind("<Shift-Tab>", lambda _e: self.move_focus(-1))
         app.root.bind("<Return>", lambda _e: self.activate_focus())
+        app.root.bind("<Left>", lambda _e: self.adjust_focus(-1))
+        app.root.bind("<Right>", lambda _e: self.adjust_focus(1))
+        app.root.bind("<Home>", lambda _e: self.adjust_focus(-1, endpoint=True))
+        app.root.bind("<End>", lambda _e: self.adjust_focus(1, endpoint=True))
         app.root.bind("<Destroy>", self._on_destroy, add="+")
         app.root.protocol("WM_DELETE_WINDOW", app.close_app)
         app.root.bind("<Escape>", self._dismiss_appearance, add="+")
@@ -121,9 +136,25 @@ class WorkspaceUI:
         self._glass_cache.clear()
         self._text_colors = {}
 
+    @staticmethod
+    def _bounded_setting(value, default, maximum):
+        try:
+            value = float(value)
+            return min(maximum, max(0., value)) if math.isfinite(value) else default
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    def _apply_optics(self):
+        if self.desktop:
+            self.desktop.blur_radius = self.blur_radius
+            self.desktop.refraction_strength = self.refraction_strength
+
     def _save_appearance(self):
         try:
-            self._appearance_path.write_text(json.dumps({"theme": self.theme_name, "motion": not self.reduced_motion, "material": self.material_name}), encoding="utf-8")
+            self._appearance_path.write_text(json.dumps({
+                "theme": self.theme_name, "motion": not self.reduced_motion, "material": self.material_name,
+                "blur": self.blur_radius, "refraction": self.refraction_strength,
+            }), encoding="utf-8")
         except OSError:
             pass
 
@@ -135,29 +166,46 @@ class WorkspaceUI:
         self._orbit_key = self._appearance_key = None
         self.c.configure(bg=self.m.Theme.transparent)
         self.a.root.attributes('-transparentcolor', self.m.Theme.transparent)
-        self.a.root.attributes('-alpha', self.a.WINDOW_ALPHA)
+        self.a.root.attributes('-alpha', 1.0 if self.material_name == 'opaque' else self.a.WINDOW_ALPHA)
         self.a.root.after_idle(self.a._draw)
 
     def _dismiss_appearance(self, _event=None):
         if self.appearance_open:
             self.appearance_open = False
             self._lens_drag = False
+            self._slider_drag = None
+            self._demo_pressure = self._demo_released_at = 0.
             self.a._draw()
             return "break"
 
     def _glass(self, name, x, y, width, height, radius, *, source=None, source_key=None, pressure=0.):
-        if self.desktop and self.desktop.active and self.desktop.refraction and name in {'dock', 'range'}:
+        pressure = 0. if self.reduced_motion else pressure
+        if name == 'demo':
+            stretch, squash = round(pressure * 14), round(pressure * 6)
+            x, y = x - stretch / 2, y + squash / 2
+            width, height = width + stretch, height - squash
+        if self.desktop and self.desktop.active and self.desktop.refraction:
+            radius = min(radius, width / 2, height / 2)
             self.desktop.lenses[name] = (x, y, width, height, radius, pressure)
             self.c.delete('liquid_' + name)
+            return
+        if self.material_name != 'liquid':
+            tag = 'liquid_' + name
+            self.c.delete(tag)
+            # Flat materials have no fabricated lens displacement.
+            self.box(x, y, x + width, y + height, self.PANEL, radius, self.LINE, tags=(tag,))
+            if name == 'demo':
+                self.text(x + width / 2, y + height / 2, 'Aa', 'value', self.SECONDARY, 'center', tags=(tag,))
             return
         if self.glass is None:
             return self.box(x, y, x + width, y + height, self.PANEL, radius, self.LINE)
         light = round(self._light * 6) / 6
         pressure = round(pressure * 6) / 6
-        key = (self.theme_name, self.a.WIDTH, self.a.HEIGHT, round(x), round(y), round(width), round(height), radius, light, pressure, source_key)
+        key = (self.theme_name, self.a.WIDTH, self.a.HEIGHT, round(x), round(y), round(width), round(height), radius, light, pressure, source_key, self.blur_radius, self.refraction_strength)
         if key not in self._glass_cache:
             picture = self.glass.render(source if source is not None else self._backdrop, x, y, width, height, radius,
-                                        self.palette, light=light, pressure=pressure)
+                                        self.palette, light=light, pressure=pressure,
+                                        blur_radius=self.blur_radius, strength=self.refraction_strength)
             if pressure:
                 # A small anisotropic deformation makes the pressure response
                 # visible without changing the control's hit target.
@@ -182,69 +230,101 @@ class WorkspaceUI:
     def appearance(self):
         l, r, t = self.left, self.right, self.top
         self.ring_geometry = None
+        self._sliders.clear()
         self.text(l, t + 4, "外观", "page_title")
-        self.text(l, t + 52, "选择喜欢的配色", "caption", self.MUTED)
+        self.text(l, t + 49, "配色", "caption", self.MUTED)
         self.button("appearance_done", r - 52, t + 6, r, t + 36, "完成", quiet=True)
-        top, row_h, gap = t + 86, (52 if self.small else 68), 10
-        cell_w = (r - l - gap) / 2
+        top, row_h, gap = t + 73, (34 if self.small else 42), 8
+        cell_w = (r - l - 2 * gap) / 3
         for index, (key, palette) in enumerate(PALETTES.items()):
-            x, y = l + index % 2 * (cell_w + gap), top + index // 2 * (row_h + gap)
+            x, y = l + index % 3 * (cell_w + gap), top + index // 3 * (row_h + gap)
             selected = self.theme_name == key
             name = "theme_" + key
             self.a._btn_rects[name] = (x, y, x + cell_w, y + row_h)
-            self.box(x, y, x + cell_w, y + row_h, self.PANEL, 15,
+            self.box(x, y, x + cell_w, y + row_h, self.PANEL, 12,
                      self.CYAN if selected or self.focused == name else self.LINE)
-            self.dot(x + 23, y + row_h / 2, 12, palette.background)
-            self.dot(x + 27, y + row_h / 2 + 3, 7, palette.wave)
-            self.text(x + 44, y + row_h / 2, palette.name, "caption", self.TEXT, "w")
-            if selected:
-                self.dot(x + cell_w - 15, y + row_h / 2, 2.5, self.CYAN)
-        demo_y = top + 3 * (row_h + gap) + 15
-        demo_h = 101 if self.small else 143
+            self.dot(x + 16, y + row_h / 2, 9, palette.background)
+            self.dot(x + 19, y + row_h / 2 + 2, 5, palette.wave)
+            self.text(x + 32, y + row_h / 2, palette.name, "caption", self.TEXT, "w")
+        material_y = self.bottom - 214
+        demo_y = top + 2 * row_h + gap + 12
+        demo_h = min(144, material_y - 30 - demo_y)
         self._demo_rect = (l, demo_y, r, demo_y + demo_h)
-        if self.glass is not None:
-            key = (self.a.WIDTH, self.a.HEIGHT, self.theme_name, demo_y, demo_h)
-            if getattr(self, "_appearance_key", None) != key:
-                from PIL import ImageFont
-                self._appearance_key = key
-                self._appearance_source = self._backdrop.copy()
-                s = self.glass.SCALE
-                d = self.m.ImageDraw.Draw(self._appearance_source)
-                d.rounded_rectangle((l * s, demo_y * s, r * s, (demo_y + demo_h) * s),
-                                    radius=19 * s, fill=self.PANEL)
-                for index in range(11):
-                    x = (l + 10 + index * (r - l - 20) / 10) * s
-                    d.line((x, (demo_y + 8) * s, x, (demo_y + demo_h - 8) * s), fill=self.LINE, width=1)
-                try:
-                    font = ImageFont.truetype("C:/Windows/Fonts/seguisb.ttf", (29 if self.small else 36) * s)
-                except OSError:
-                    font = ImageFont.load_default(size=30 * s)
-                d.text(((l + 23) * s, (demo_y + demo_h / 2) * s), "Token Pulse", font=font, fill=self.TEXT, anchor="lm")
-                self._appearance_preview = self.m.ImageTk.PhotoImage(
-                    self._appearance_source.crop((l * s, demo_y * s, r * s, (demo_y + demo_h) * s)).resize(
-                        (int(r - l), demo_h), self.m.Image.LANCZOS), master=self.c)
-            self.c.create_image(l, demo_y, image=self._appearance_preview, anchor="nw")
+        self.box(l, demo_y, r, demo_y + demo_h, '', 18, self.LINE)
+        live_glass = self.material_name == 'liquid' and self.desktop and self.desktop.active and self.desktop.refraction
+        if self.glass and (live_glass or self.material_name in {'alpha', 'opaque'}):
             px, py = self._demo_position or ((l + r) / 2, demo_y + demo_h / 2)
-            self._demo_position = (max(l + 60, min(r - 60, px)), max(demo_y + 30, min(demo_y + demo_h - 30, py)))
-            self.text(l, demo_y + demo_h + 5, "拖动透镜，预览玻璃质感", "caption", self.MUTED)
+            self._demo_position = (max(l + 64, min(r - 64, px)), max(demo_y + 28, min(demo_y + demo_h - 28, py)))
+            caption = {'liquid': '拖动透镜 · 实时桌面预览', 'alpha': '拖动预览 · 半透明，无折射',
+                       'opaque': '拖动预览 · 纯色，不透底'}[self.material_name]
         else:
-            self.text(l, demo_y + 25, "安装 Pillow 可启用玻璃材质", "caption", self.MUTED)
-        label = "玻璃动效  ·  关闭" if self.reduced_motion else "玻璃动效  ·  开启"
-        material = '曲面折射' if self.material_name == 'liquid' else '半透明'
-        if self.material_name == 'liquid' and not (self.desktop and self.desktop.refraction):
-            material += '（未启用）'
-        self.button('appearance_material', l, self.bottom - 58, r, self.bottom - 32,
-                    '窗口材质  ·  ' + material, quiet=True,
-                    tip='曲面折射会读取窗口后方画面，仅在内存中处理。\n需 Windows、Pillow、ModernGL 与可用 GPU。\n默认支持远程桌面与录屏，保留清晰文字。')
-        self.button("appearance_motion", l, self.bottom - 26, r, self.bottom, label, quiet=True)
+            self._demo_position = None
+            caption = {'alpha': '半透明材质 · 无曲面折射', 'opaque': '纯色材质 · 不透出桌面'}.get(self.material_name, '曲面折射暂不可用，已回退')
+            self.text((l + r) / 2, demo_y + demo_h / 2, 'Token Pulse', 'value', self.SECONDARY, 'center')
+        if self.material_name == 'alpha' and not (self.desktop and self.desktop.active):
+            caption = '半透明未启用 · 纯色回退'
+        self.text(l, demo_y + demo_h + 6, caption, 'caption', self.MUTED)
+        self.text(l, material_y, '窗口材质', 'caption', self.MUTED)
+        step = (r - l) / 3
+        for index, (key, label) in enumerate((('liquid', '曲面折射'), ('alpha', '半透明'), ('opaque', '纯色'))):
+            x = l + index * step
+            self.button('material_' + key, x, material_y + 23, x + step - (4 if index < 2 else 0),
+                        material_y + 55, label, selected=self.material_name == key)
+        self._appearance_slider('blur', '背景柔焦', self.bottom - 147, self.blur_radius / 10, f'{self.blur_radius * 10:.0f}%', bool(live_glass))
+        self._appearance_slider('refraction', '折射强度', self.bottom - 91, self.refraction_strength / 2, f'{self.refraction_strength * 100:.0f}%', bool(live_glass))
+        if not live_glass:
+            self.a._add_tooltip(l, self.bottom - 149, r, self.bottom - 43, '两项调节在曲面折射材质启用后生效，切换材质会保留数值。')
+        y = self.bottom - 35
+        self.a._btn_rects['appearance_motion'] = (l, y, r, self.bottom)
+        self.text(l, y, '交互动效 · ' + ('关闭' if self.reduced_motion else '开启'), 'body')
+        self.text(l, y + 20, '按压回弹与' + ('随光变化' if live_glass else '界面过渡'), 'caption', self.MUTED)
+        self.box(r - 57, y + 2, r, y + 30, self.LINE if self.reduced_motion else self.CYAN, 14,
+                 self.TEXT if self.focused == 'appearance_motion' else '')
+        self.dot(r - (43 if self.reduced_motion else 14), y + 16, 10, '#FFFFFF')
+
+    def _appearance_slider(self, name, label, y, fraction, value, enabled):
+        l, r = self.left, self.right
+        color = self.CYAN if enabled else self.MUTED
+        self.text(l, y, label, 'body', self.TEXT if enabled else self.MUTED)
+        self.text(r, y, value, 'data', color, 'ne')
+        x1, x2, cy = l + 10, r - 10, y + 31
+        self.box(x1, cy - 2, x2, cy + 2, self.LINE, 2)
+        x = x1 + (x2 - x1) * fraction
+        if x > x1:
+            self.box(x1, cy - 2, x, cy + 2, color if enabled else self.LINE, 2)
+        self.dot(x, cy + 1, 9, self.LINE)
+        self.dot(x, cy, 8, '#FFFFFF' if enabled else self.PANEL)
+        if self.focused == 'slider_' + name and enabled:
+            self.c.create_oval(x - 11, cy - 11, x + 11, cy + 11, outline=self.CYAN, width=1)
+        if enabled:
+            self._sliders[name] = (x1, cy - 14, x2, cy + 14)
+            self.a._btn_rects['slider_' + name] = (l, cy - 14, r, cy + 14)
+
+    def _set_slider(self, name, fraction, *, save=False):
+        fraction = min(1., max(0., fraction))
+        if name == 'blur':
+            self.blur_radius = round(fraction * 10, 1)
+        else:
+            self.refraction_strength = round(fraction * 40) / 20
+        self._apply_optics()
+        if save:
+            self._save_appearance()
+        self.a._draw()
+
+    def adjust_focus(self, direction, endpoint=False):
+        name = (self.focused or '').removeprefix('slider_')
+        if self.appearance_open and name in self._sliders:
+            fraction = self.blur_radius / 10 if name == 'blur' else self.refraction_strength / 2
+            fraction = float(direction > 0) if endpoint else fraction + direction * (.01 if name == 'blur' else .025)
+            self._set_slider(name, fraction, save=True)
+            return 'break'
 
     def _draw_following_lens(self):
         if not self.glass:
             return
-        if self.appearance_open:
+        if self.appearance_open and self._demo_position:
             x, y = self._demo_position
-            self._glass("demo", x - 57, y - 28, 114, 56, 28, source=self._appearance_source,
-                        source_key=self._appearance_key, pressure=.7 if self._lens_drag else 0.)
+            self._glass("demo", x - 57, y - 24, 114, 48, 24, pressure=self._demo_pressure)
         elif self.ring_geometry and self._ring_lens:
             x, y = self._ring_lens
             self._glass("hour", x - 23, y - 23, 46, 46, 23, source=self._orbit_source, source_key=self._orbit_key)
@@ -253,41 +333,67 @@ class WorkspaceUI:
 
     def pointer_press(self, x, y):
         self._control_press = False
+        if self.appearance_open:
+            for name, (l, t, r, b) in self._sliders.items():
+                if l - 10 <= x <= r + 10 and t <= y <= b:
+                    self._slider_drag = name
+                    self.focused = 'slider_' + name
+                    self._set_slider(name, (x - l) / (r - l))
+                    return True
         if self.appearance_open and self.glass and self._demo_position:
             px, py = self._demo_position
             if abs(x - px) <= 57 and abs(y - py) <= 28:
                 self._lens_drag = True
+                self._demo_pressure = 0. if self.reduced_motion else .85
+                self._demo_released_at = 0.
                 self._demo_drag_offset = (x - px, y - py)
+                self._follow_pointer_light(x, y)
                 self._draw_following_lens()
                 return True
         return False
 
     def pointer_drag(self, x, y):
+        if self._slider_drag:
+            l, _t, r, _b = self._sliders[self._slider_drag]
+            self._set_slider(self._slider_drag, (x - l) / (r - l))
+            return True
         if not self._lens_drag:
             return self._control_press
         l, t, r, b = self._demo_rect
         dx, dy = self._demo_drag_offset
-        self._demo_position = (max(l + 57, min(r - 57, x - dx)), max(t + 28, min(b - 28, y - dy)))
-        self._light_target = (x / self.a.WIDTH - .5) * 2
+        self._demo_position = (max(l + 64, min(r - 64, x - dx)), max(t + 28, min(b - 28, y - dy)))
+        self._follow_pointer_light(x, y)
         self._draw_following_lens()
         self._request_animation()
         return True
 
     def pointer_release(self):
         self._control_press = False
+        if self._slider_drag:
+            self._slider_drag = None
+            self._save_appearance()
         if self._lens_drag:
             self._lens_drag = False
+            if not self.reduced_motion:
+                self._demo_released_at = time.monotonic()
+                self._request_animation()
             self._draw_following_lens()
 
-    def pointer_motion(self, x, y):
-        if self.desktop and self.desktop.refraction and not self.reduced_motion:
-            self.desktop.pointer = (float(x), float(y))
-        if not self.glass:
+    def _follow_pointer_light(self, x, y):
+        if self.reduced_motion:
             return
-        if not self.reduced_motion:
-            self._light_target = (x / self.a.WIDTH - .5) * 2
+        if self.desktop and self.desktop.refraction:
+            self.desktop.pointer = (float(x), float(y))
+        if self.glass:
+            left, right = (self._demo_rect[0], self._demo_rect[2]) if self.appearance_open else (0, self.a.WIDTH)
+            self._light_target = max(-1., min(1., 2 * (x - left) / (right - left) - 1))
             if abs(self._light_target - self._light) > .02:
                 self._request_animation()
+
+    def pointer_motion(self, x, y):
+        self._follow_pointer_light(x, y)
+        if not self.glass:
+            return
         before = self._ring_lens
         self._ring_lens = None
         if self.ring_geometry and not self.appearance_open:
@@ -298,10 +404,14 @@ class WorkspaceUI:
                 radius = (inner + outer) / 2 + 3
                 self._ring_lens = (cx + math.cos(angle) * radius, cy + math.sin(angle) * radius)
         if self._ring_lens != before:
+            if self.desktop:
+                self.desktop.lenses.pop('hour', None)
             self._draw_following_lens()
 
     def pointer_leave(self):
         self._ring_lens = None
+        if self.desktop:
+            self.desktop.lenses.pop('hour', None)
         self.c.delete("liquid_hour")
 
     @staticmethod
@@ -319,7 +429,7 @@ class WorkspaceUI:
             return sum(v * weight for v, weight in zip(linear, (.2126, .7152, .0722)))
         background = self.BG
         desktop = getattr(self, 'desktop', None)
-        if desktop is not None and desktop.active:
+        if desktop is not None and desktop.active and self.material_name != 'opaque':
             # Keep labels legible on the darkest/lightest possible desktop.
             # This does not need screen capture or change the selected palette.
             opacity = (184 if self.palette.dark else 166) / 255
@@ -331,7 +441,7 @@ class WorkspaceUI:
             if (max(base, value) + .05) / (min(base, value) + .05) >= 4.5:
                 self._text_colors[color] = result
                 return result
-        if desktop is not None and desktop.active:
+        if desktop is not None and desktop.active and self.material_name != 'opaque':
             for amount in (.15, .3, .6, 1.):
                 result = self.blend(self.TEXT, '#FFFFFF' if self.palette.dark else '#000000', amount)
                 value = luminance(result)
@@ -371,7 +481,7 @@ class WorkspaceUI:
 
     def box(self, x1, y1, x2, y2, fill=None, radius=16, outline="", **kw):
         fill = fill if fill is not None else self.PANEL
-        if self.desktop is not None and self.desktop.active and fill == self.PANEL:
+        if self.desktop is not None and self.desktop.active and self.material_name != 'opaque' and fill == self.PANEL:
             fill = tuple(int(fill[i:i + 2], 16) for i in (1, 3, 5)) + (100 if self.desktop.refraction else 155,)
         return self.paint.rounded(x1, y1, x2, y2, fill,
                                   radius, outline, **kw)
@@ -407,15 +517,16 @@ class WorkspaceUI:
         m = self.m
         if m.Image is None:
             return None
-        desktop = self.desktop is not None and self.desktop.active
+        desktop = self.desktop is not None and self.desktop.active and self.material_name != 'opaque'
         curved = desktop and self.desktop.refraction
-        key = (width, height, self.theme_name, desktop, curved)
+        key = (width, height, self.theme_name, desktop, curved, self.material_name)
         if key in self._surface_cache:
             return self._surface_cache[key]
         self._surface_cache.clear()
         scale = self.glass.SCALE
         w, h = int(width * scale), int(height * scale)
-        self._backdrop = self.glass.backdrop(width, height, self.palette, desktop=desktop)
+        self._backdrop = (m.Image.new('RGBA', (w, h), self.BG) if self.material_name == 'opaque'
+                          else self.glass.backdrop(width, height, self.palette, desktop=desktop))
         if curved:
             # The GPU supplies the material. The Canvas holds foreground only.
             result = m.ImageTk.PhotoImage(m.Image.new('RGBA', (width, height)), master=self.c)
@@ -978,6 +1089,9 @@ class WorkspaceUI:
         if name in {"appearance", "appearance_done"}:
             self.appearance_open = name != "appearance_done" and not self.appearance_open
             self._demo_position = None
+            self._lens_drag = False
+            self._slider_drag = None
+            self._demo_pressure = self._demo_released_at = 0.
             self._ring_lens = None
             a._tooltip_text = ""
             a._draw()
@@ -989,13 +1103,36 @@ class WorkspaceUI:
             return True
         if name == "appearance_motion":
             self.reduced_motion = not self.reduced_motion or self._prefers_reduced_motion()
+            if self.reduced_motion:
+                if self._animation_id is not None:
+                    a.root.after_cancel(self._animation_id)
+                    self._animation_id = None
+                self._light = self._light_target = self._dock_stretch = 0.
+                self._demo_pressure = self._demo_released_at = 0.
+                self._pressed = None
+                self._press_until = self._number_started = 0.
+                self._nav_position = self._nav_target
+                if self.desktop:
+                    self.desktop.pointer = (0., 0.)
+            elif self.glass and self.appearance_open and self._demo_position:
+                self._demo_pressure = .85
+                self._demo_released_at = time.monotonic()
+                self._request_animation()
             self._save_appearance()
             a._draw()
             return True
-        if name == 'appearance_material':
-            self.material_name = 'alpha' if self.material_name == 'liquid' else 'liquid'
+        if name and name.startswith('material_') and name[9:] in {'liquid', 'alpha', 'opaque'}:
+            if self.material_name == name[9:]:
+                return True
+            self.material_name = name[9:]
+            self._lens_drag = False
+            self._slider_drag = None
+            self._demo_pressure = self._demo_released_at = 0.
             if self.desktop and self.desktop.active:
-                self.desktop.set_refraction(self.material_name == 'liquid')
+                self.desktop.set_material(self.material_name)
+            elif self.material_name == 'opaque':
+                a.WINDOW_ALPHA = 1.0
+                a.root.attributes('-alpha', 1.0)
             self._surface_cache.clear()
             self._glass_cache.clear()
             self._text_colors.clear()
@@ -1004,6 +1141,9 @@ class WorkspaceUI:
             return True
         if name in {"main_accounts", "main_stats", "main_library", "open_library", "open_timeline"}:
             self.appearance_open = False
+            self._lens_drag = False
+            self._slider_drag = None
+            self._demo_pressure = self._demo_released_at = 0.
             self._ring_lens = None
             self.library_open = name in {"main_library", "open_library"}
             if name == "open_timeline":
@@ -1039,6 +1179,8 @@ class WorkspaceUI:
         return "break"
 
     def activate_focus(self):
+        if (self.focused or '').startswith('slider_'):
+            return 'break'  # Arrow keys adjust sliders without starting a drag.
         box = self.a._btn_rects.get(self.focused)
         if box:
             x, y = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
@@ -1096,13 +1238,21 @@ class WorkspaceUI:
             else:
                 moving = True
         glass_dirty = bool(self._pressed and self._pressed.startswith("main_") and now < self._press_until)
+        if self._demo_released_at:
+            progress = 1. if self.reduced_motion else min(1., (now - self._demo_released_at) / .5)
+            self._demo_pressure = .85 * math.exp(-6.5 * progress) * math.cos(10 * progress) if progress < 1 else 0.
+            if progress == 1:
+                self._demo_released_at = 0.
+            else:
+                moving = True
+            glass_dirty = True
         if not self.reduced_motion and abs(self._light_target - self._light) > .015:
             self._light += (self._light_target - self._light) * .32
             moving = True
             glass_dirty = True
         elif self.reduced_motion:
             self._light = self._light_target = 0.
-        if glass_dirty and now - self._last_glass_frame >= .025:
+        if glass_dirty and (not moving or now - self._last_glass_frame >= .025):
             self._last_glass_frame = now
             pressure = max(0., (self._press_until - now) / .14) if (self._pressed or "").startswith("main_") else 0.
             self._glass("dock", 24, self.a.HEIGHT - 74, self.a.WIDTH - 48, 50, 25, pressure=pressure)

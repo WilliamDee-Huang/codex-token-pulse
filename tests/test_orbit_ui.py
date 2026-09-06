@@ -1,5 +1,6 @@
 """Exercise the new view against current monitor state, without account I/O."""
 import os
+import json
 import tempfile
 import time
 import tkinter as tk
@@ -113,6 +114,98 @@ class OrbitStateTests(unittest.TestCase):
 @unittest.skipUnless(os.name == 'nt', 'Windows UI smoke test')
 class OrbitWindowTests(unittest.TestCase):
     @unittest.skipIf(monitor.Image is None, 'Pillow is optional')
+    def test_motion_toggle_changes_preview_and_stops_all_lens_feedback(self):
+        with tempfile.TemporaryDirectory() as directory, preview_context(directory), \
+             patch.dict(os.environ, {'TOKEN_MONITOR_UI': 'orbit', 'TOKEN_MONITOR_DESKTOP_GLASS': '0',
+                                     'TOKEN_MONITOR_REDUCE_MOTION': '0'}), \
+             patch.object(WorkspaceUI, '_prefers_reduced_motion', return_value=False):
+            app = PreviewApp()
+            try:
+                app.root.update()
+                ui = app._workspace_ui
+                # Inspect the native lens geometry without depending on a CI GPU.
+                # Pixel changes are covered by the real shader tests.
+                ui.desktop = SimpleNamespace(active=True, refraction=True, lenses={}, pointer=(0., 0.))
+                ui.handle_button('appearance')
+                ui.handle_button('appearance_motion')
+                self.assertTrue(ui.reduced_motion)
+
+                def picture():
+                    rect = ui.desktop.lenses['demo']
+                    return SimpleNamespace(width=rect[2], height=rect[3], size=rect[2:4],
+                                           tobytes=lambda: rect)
+
+                def advance(now):
+                    if ui._animation_id is not None:
+                        app.root.after_cancel(ui._animation_id)
+                    with patch('monitor_ui.time.monotonic', return_value=now):
+                        ui._animate()
+
+                px, py = ui._demo_position
+                still = picture()
+                self.assertTrue(ui.pointer_press(px, py))
+                self.assertEqual(picture().tobytes(), still.tobytes())
+                self.assertTrue(ui.pointer_drag(px + 18, py))
+                self.assertEqual(ui._demo_position, (px + 18, py))
+                dragged = picture()
+                ui.pointer_release()
+                self.assertEqual(picture().tobytes(), dragged.tobytes())
+                self.assertIsNone(ui._animation_id)
+
+                # Enabling previews a visible release without requiring a hover-capable device.
+                with patch('monitor_ui.time.monotonic', return_value=100.):
+                    ui.handle_button('appearance_motion')
+                self.assertFalse(ui.reduced_motion)
+                self.assertGreaterEqual(picture().width - still.width, 10)
+                self.assertLess(picture().height, still.height)
+                self.assertIsNotNone(ui._animation_id)
+                advance(100.12)
+                self.assertLess(picture().width, still.width)
+                advance(100.6)
+                self.assertEqual(picture().size, still.size)
+                self.assertIsNone(ui._animation_id)
+
+                # Lighting actually changes the displayed pixels while the lens stays in place.
+                for i in range(16):
+                    ui.pointer_motion(ui._demo_rect[0], py)
+                    advance(101. + i * .04)
+                left_light = ui.desktop.pointer
+                for i in range(16):
+                    ui.pointer_motion(ui._demo_rect[2], py)
+                    advance(102. + i * .04)
+                self.assertNotEqual(ui.desktop.pointer, left_light)
+
+                with patch('monitor_ui.time.monotonic', return_value=104.):
+                    ui.pointer_press(*ui._demo_position)
+                    ui.pointer_release()
+                self.assertGreater(picture().width, still.width)
+                timer = ui._animation_id
+                ui.handle_button('appearance_motion')
+                self.assertEqual(picture().size, still.size)
+                self.assertIsNone(ui._animation_id)
+                self.assertNotIn(timer, app.root.tk.splitlist(app.root.tk.call('after', 'info')))
+                disabled = picture().tobytes()
+                ui.pointer_motion(ui._demo_rect[0], py)
+                ui.pointer_press(*ui._demo_position)
+                ui.pointer_release()
+                advance(105.)
+                self.assertEqual(picture().tobytes(), disabled)
+                self.assertIsNone(ui._animation_id)
+                settings = json.loads(Path(directory, 'monitor_appearance.json').read_text(encoding='utf-8'))
+                self.assertEqual(settings, {'theme': ui.theme_name, 'motion': False, 'material': ui.material_name,
+                                            'blur': 4., 'refraction': 1.})
+
+                # Windows accessibility settings also disable the enable-preview pulse.
+                with patch.object(WorkspaceUI, '_prefers_reduced_motion', return_value=True):
+                    ui.handle_button('appearance_motion')
+                self.assertTrue(ui.reduced_motion)
+                self.assertEqual(picture().tobytes(), disabled)
+                self.assertIsNone(ui._animation_id)
+            finally:
+                app._workspace_ui.desktop = None
+                app.close_app()
+
+    @unittest.skipIf(monitor.Image is None, 'Pillow is optional')
     def test_tooltip_panel_erases_earlier_ink_in_native_layers(self):
         with tempfile.TemporaryDirectory() as directory, preview_context(directory), \
              patch.dict(os.environ, {'TOKEN_MONITOR_UI': 'orbit', 'TOKEN_MONITOR_DESKTOP_GLASS': '1',
@@ -128,13 +221,16 @@ class OrbitWindowTests(unittest.TestCase):
                 canvas.delete('all')
                 canvas.create_text(160, 200, text='MMMM', fill='white', font=('Segoe UI', -60))
                 native.present()
-                _base, before = native._capture_layers()
+                # Match present()'s guard: idle paints must not interrupt the two mattes.
+                with patch.object(native, '_painting', True):
+                    _base, before = native._capture_layers()
                 area = (110, 190, 210, 220)
                 self.assertGreater(before.getchannel('A').crop(area).getextrema()[1], 0)
                 canvas.create_rectangle(80, 150, 240, 250, fill='#26304A', outline='',
                                         tags=('refraction_occluder',))
                 canvas.create_text(90, 158, anchor='nw', text='TIP', fill='white', font=('Segoe UI', -12))
-                _base, after = native._capture_layers()
+                with patch.object(native, '_painting', True):
+                    _base, after = native._capture_layers()
                 self.assertEqual(after.getchannel('A').crop(area).getextrema(), (0, 0))
                 self.assertGreater(after.getchannel('A').crop((85, 155, 120, 175)).getextrema()[1], 0)
             finally:

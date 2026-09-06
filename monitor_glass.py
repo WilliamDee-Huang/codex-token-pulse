@@ -112,8 +112,8 @@ class GlassRenderer:
                        fill=mix(palette.background, "#FFFFFF", .2 if palette.dark else .85), width=s)
         return self._retain(self._surfaces, key, image, 6)
 
-    def _geometry(self, width, height, radius):
-        key = (width, height, radius)
+    def _geometry(self, width, height, radius, strength=1.):
+        key = (width, height, radius, strength)
         if key in self._meshes:
             self._meshes.move_to_end(key)
             return self._meshes[key]
@@ -133,7 +133,7 @@ class GlassRenderer:
             term = eta * normal_z - math.sqrt(1 - eta * eta * (1 - normal_z * normal_z))
             lateral = term * slope * normal_z
             vertical = -eta + term * normal_z
-            shift = (7 + 22 * surface ** .25) * lateral / -vertical
+            shift = (7 + 22 * surface ** .25) * lateral / -vertical * strength
             return x + nx * shift * s + pad, y + ny * shift * s + pad
 
         step, mesh = 6, []
@@ -170,20 +170,21 @@ class GlassRenderer:
         shape = (mesh, mask, highlights, opposite)
         return self._retain(self._meshes, key, shape, 28)
 
-    def render(self, source, x, y, width, height, radius, palette, light=0., pressure=0.):
+    def render(self, source, x, y, width, height, radius, palette, light=0., pressure=0.,
+               blur_radius=4., strength=1.):
         s, pad = self.SCALE, 12 * self.SCALE
         width, height = max(4, int(round(width))), max(4, int(round(height)))
         radius = round(min(radius, width / 2, height / 2), 1)
-        mesh, mask, first, second = self._geometry(width, height, radius)
+        mesh, mask, first, second = self._geometry(width, height, radius, strength)
         xx, yy, w, h = int(round(x * s)), int(round(y * s)), width * s, height * s
         crop = source.crop((xx - pad, yy - pad, xx + w + pad, yy + h + pad)).convert("RGBA")
         lens = crop.transform((w, h), Image.Transform.MESH, mesh, Image.Resampling.BICUBIC)
-        # Keep refraction visible: only a fraction of a pixel of scattering.
-        lens = lens.filter(ImageFilter.GaussianBlur(.32 * s))
+        # Diffuse only transmission; highlights are applied afterwards.
+        lens = lens.filter(ImageFilter.GaussianBlur(blur_radius * s)) if blur_radius else lens
         tint = Image.new("RGBA", (w, h), (235, 246, 255, 15 if palette.dark else 29))
         lens.alpha_composite(tint)
         lens.alpha_composite(Image.blend(first, second, max(0., min(1., .3 + light * .22))))
-        if pressure:
+        if pressure > 0:
             glow = Image.new("RGBA", (w, h), (255, 255, 255, round(min(1., pressure) * 19)))
             lens.alpha_composite(glow)
         lens.putalpha(ImageChops.multiply(lens.getchannel('A'), mask))

@@ -11,6 +11,7 @@ uniform vec2 textureOffset;
 uniform vec2 pointer;
 uniform vec3 tint;
 uniform float darkTheme;
+uniform float refractionStrength;
 uniform int lensCount;
 uniform vec4 lenses[4];
 uniform vec2 lensShape[4];
@@ -57,7 +58,7 @@ vec3 lens(vec2 p, vec2 center, vec2 halfSize, float radius, float pressure, floa
     vec3 normal = normalize(vec3(gradient * slope, 1.0));
     vec3 ray = refract(vec3(0,0,-1), normal, 1.0 / 1.46);
     vec2 displacement = ray.xy / max(-ray.z, .05) * height * thickness;
-    vec2 sampleAt = center + local / 1.006 + displacement;
+    vec2 sampleAt = center + local / (1.0 + .006 * refractionStrength) + displacement * refractionStrength;
     // Diffusion belongs to the transmitted background, not the surface reflection.
     float clearBevel = 1.0 - smoothstep(.5, 5.5, -d);
     float diffusion = 1.0 - clearBevel * .92;

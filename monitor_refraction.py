@@ -67,9 +67,10 @@ class DesktopRefraction:
             self.close()
             raise OSError(self.error or 'GPU material initialization timed out')
 
-    def submit(self, size, rect, overlay, tint, dark, lenses, pointer):
+    def submit(self, size, rect, overlay, tint, dark, lenses, pointer,
+               blur_radius=BACKGROUND_BLUR_SIGMA, refraction_strength=1.0):
         with self._lock:
-            self._request = (size, rect, overlay, tint, dark, lenses, pointer)
+            self._request = (size, rect, overlay, tint, dark, lenses, pointer, blur_radius, refraction_strength)
 
     def result(self):
         with self._lock:
@@ -126,7 +127,7 @@ class DesktopRefraction:
                 if not self.u.IsWindowVisible(self.hwnd):
                     self._stop.wait(.25)
                     continue
-                size, rect, overlay, tint, dark, lenses, pointer = request
+                size, rect, overlay, tint, dark, lenses, pointer, blur_radius, refraction_strength = request
                 w, h = size
                 left, top, right, bottom = rect
                 pw, ph, pad = right-left, bottom-top, 32
@@ -183,12 +184,12 @@ class DesktopRefraction:
                 blur_program['targetSize'] = blur_size
                 context.viewport = (0, 0, *blur_size)
                 # Sample in physical coordinates, retaining the same softness at each DPI.
-                blur_program['sigma'] = BACKGROUND_BLUR_SIGMA * pw/w * blur_size[0]/background.width
+                blur_program['sigma'] = blur_radius * pw/w * blur_size[0]/background.width
                 blur_program['stepUV'] = (1.0/blur_size[0], 0.0)
                 background.use(0)
                 blur_horizontal.use()
                 blur_vao.render(vertices=3)
-                blur_program['sigma'] = BACKGROUND_BLUR_SIGMA * ph/h * blur_size[1]/background.height
+                blur_program['sigma'] = blur_radius * ph/h * blur_size[1]/background.height
                 blur_program['stepUV'] = (0.0, 1.0/blur_size[1])
                 blur_horizontal.color_attachments[0].use(0)
                 blur_vertical.use()
@@ -199,6 +200,7 @@ class DesktopRefraction:
                 program['pointer'] = pointer
                 program['tint'] = tint
                 program['darkTheme'] = float(dark)
+                program['refractionStrength'] = refraction_strength
                 program['lensCount'] = len(lenses)
                 rectangles = [value for lens in lenses for value in lens[:4]] + [0.] * (16-len(lenses)*4)
                 shapes = [value for lens in lenses for value in lens[4:]] + [0.] * (8-len(lenses)*2)
@@ -207,7 +209,9 @@ class DesktopRefraction:
                 background.use(0)
                 ink.use(1)
                 canvas_base.use(2)
-                blur_vertical.color_attachments[0].use(3)
+                # Zero softness samples the full-resolution source, avoiding the
+                # half-size blur buffer's resampling even when sigma is zero.
+                (blur_vertical.color_attachments[0] if blur_radius > 0 else background).use(3)
                 framebuffer.use()
                 context.viewport = (0, 0, w, h)
                 vao.render(vertices=3)
